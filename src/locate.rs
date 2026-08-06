@@ -90,6 +90,44 @@ fn is_file(p: &Path) -> bool {
     p.is_file()
 }
 
+/// Locate `embarch-api`: the same order as `locate_core` minus the
+/// Windows-side cases, since the API always runs where the *source* is —
+/// which, on the WSL2 split, is this side of the boundary.
+pub fn locate_api() -> Option<Located> {
+    if let Some(raw) = std::env::var_os("EMBARCH_API_BIN") {
+        return Some(Located {
+            path: PathBuf::from(raw),
+            found_by: FoundBy::EnvVar,
+            windows_exe_from_wsl2: false,
+        });
+    }
+    next_to_me("embarch-api").or_else(|| on_path("embarch-api"))
+}
+
+fn next_to_me(stem: &str) -> Option<Located> {
+    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    let sibling = dir.join(native_name(stem));
+    is_file(&sibling).then_some(Located {
+        path: sibling,
+        found_by: FoundBy::NextToMe,
+        windows_exe_from_wsl2: false,
+    })
+}
+
+fn on_path(stem: &str) -> Option<Located> {
+    let path_var = std::env::var("PATH").ok()?;
+    let name = native_name(stem);
+    path_dirs(&path_var, cfg!(windows))
+        .into_iter()
+        .map(|dir| dir.join(&name))
+        .find(|c| is_file(c))
+        .map(|path| Located {
+            path,
+            found_by: FoundBy::Path,
+            windows_exe_from_wsl2: false,
+        })
+}
+
 /// Locate `embarch-core`, in the precedence order design.md §3 decision 7
 /// specifies: an explicit override, then what `setup` recorded, then the copy
 /// shipped alongside this binary, then `PATH`, then — under WSL2 only — the
@@ -116,29 +154,8 @@ pub fn locate_core(saved: Option<&Path>, under_wsl2: bool) -> Option<Located> {
         });
     }
 
-    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(Path::to_path_buf)) {
-        let sibling = dir.join(native_name("embarch-core"));
-        if is_file(&sibling) {
-            return Some(Located {
-                path: sibling,
-                found_by: FoundBy::NextToMe,
-                windows_exe_from_wsl2: false,
-            });
-        }
-    }
-
-    if let Ok(path_var) = std::env::var("PATH") {
-        let name = native_name("embarch-core");
-        for dir in path_dirs(&path_var, cfg!(windows)) {
-            let candidate = dir.join(&name);
-            if is_file(&candidate) {
-                return Some(Located {
-                    path: candidate,
-                    found_by: FoundBy::Path,
-                    windows_exe_from_wsl2: false,
-                });
-            }
-        }
+    if let Some(found) = next_to_me("embarch-core").or_else(|| on_path("embarch-core")) {
+        return Some(found);
     }
 
     if under_wsl2 {

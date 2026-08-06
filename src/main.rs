@@ -3,11 +3,12 @@
 //! Design doc: ../embarch-doc/embarch-umbrella/design.md
 //! Execution plan: ../embarch-doc/embarch-umbrella/milestone-6.md
 //!
-//! Implemented so far: topology detection (§3.2), `setup` (§3.3), `up`/
-//! `down`, and enough of `status` to be useful. `init` and `doctor` parse and
-//! then report themselves unimplemented rather than pretending to work.
+//! Implemented so far: topology detection (§3.2), `setup` (§3.3), `init`,
+//! `up`/`down`, and enough of `status` to be useful. `doctor` parses and then
+//! reports itself unimplemented rather than pretending to work.
 
 mod env;
+mod init;
 mod locate;
 mod probe;
 mod setup;
@@ -114,7 +115,7 @@ async fn main() {
         Command::Setup { host, port } => {
             std::process::exit(setup::setup(host.as_deref(), port).await);
         }
-        Command::Init { .. } => ("init", "milestone-6.md §3.4"),
+        Command::Init { uninstall } => std::process::exit(init::init(uninstall)),
         Command::Doctor { .. } => ("doctor", "milestone-6.md §3.4, design.md §5"),
         Command::Up { foreground } => std::process::exit(setup::up(foreground)),
         Command::Down => std::process::exit(setup::down()),
