@@ -3,12 +3,15 @@
 //! Design doc: ../embarch-doc/embarch-umbrella/design.md
 //! Execution plan: ../embarch-doc/embarch-umbrella/milestone-6.md
 //!
-//! Implemented so far: topology detection (§3.2) and enough of `status`
-//! (§3.4) to exercise it. Every other command parses and then reports itself
-//! unimplemented rather than pretending to work.
+//! Implemented so far: topology detection (§3.2), `setup` (§3.3), `up`/
+//! `down`, and enough of `status` to be useful. `init` and `doctor` parse and
+//! then report themselves unimplemented rather than pretending to work.
 
 mod env;
+mod locate;
 mod probe;
+mod setup;
+mod state;
 mod topology;
 
 use clap::{Parser, Subcommand};
@@ -37,8 +40,18 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// One-time per-machine setup: detect the topology, install Core as a
-    /// service, ensure the token exists, put both binaries on PATH.
-    Setup,
+    /// service that starts at boot, and record what it found.
+    ///
+    /// Does not edit your PATH — it prints the line to add instead.
+    Setup {
+        /// Core is on another machine at this host. Skips any local install.
+        #[arg(long)]
+        host: Option<String>,
+
+        /// Core's port.
+        #[arg(long, default_value_t = DEFAULT_CORE_PORT)]
+        port: u16,
+    },
 
     /// Integrate the firmware repo in the current directory: scaffold
     /// `embarch/embarch.toml`, register the MCP server, exclude locally.
@@ -75,9 +88,14 @@ enum Command {
     },
 
     /// Fallback: start Core when it isn't already a running service.
-    Up,
+    Up {
+        /// Run Core in this terminal instead of as a service. Blocks until
+        /// Ctrl-C; useful for watching Core's own logs.
+        #[arg(long)]
+        foreground: bool,
+    },
 
-    /// Fallback: stop a Core started by `up`.
+    /// Fallback: stop the running Core service, leaving it installed.
     Down,
 }
 
@@ -93,11 +111,13 @@ async fn main() {
         Command::Status { json, host, port } => {
             std::process::exit(status(json, host.as_deref(), port).await);
         }
-        Command::Setup => ("setup", "milestone-6.md §3.3"),
+        Command::Setup { host, port } => {
+            std::process::exit(setup::setup(host.as_deref(), port).await);
+        }
         Command::Init { .. } => ("init", "milestone-6.md §3.4"),
         Command::Doctor { .. } => ("doctor", "milestone-6.md §3.4, design.md §5"),
-        Command::Up => ("up", "milestone-6.md §3.4, design.md §3 decisions 4/7"),
-        Command::Down => ("down", "milestone-6.md §3.4, design.md §3 decisions 4/7"),
+        Command::Up { foreground } => std::process::exit(setup::up(foreground)),
+        Command::Down => std::process::exit(setup::down()),
     };
 
     eprintln!("embarch {what}: not implemented yet — see ../embarch-doc/embarch-umbrella/{plan}");
