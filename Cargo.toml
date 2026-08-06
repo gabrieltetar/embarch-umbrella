@@ -16,8 +16,12 @@ path = "src/main.rs"
 [dependencies]
 anyhow = "1.0.103"
 clap = { version = "4.6.2", features = ["derive"] }
+# rustls rather than native-tls, matching embarch-api: no system OpenSSL
+# dependency, so this stays trivially buildable wherever Core happens to run.
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
+serde_json = "1.0.150"
+tokio = { version = "1.53.0", features = ["macros", "rt", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = "0.3.23"
-# Expected next, when there's behavior to need them (milestone-6.md §3.2–§3.4):
-# reqwest (rustls, no native-tls) for the /status candidate race, serde +
-# serde_json for `--json` output, toml for writing embarch-api's config.
+# Expected next: toml (+ serde derive) for writing embarch-api's config,
+# when `init` lands (milestone-6.md §3.4).
