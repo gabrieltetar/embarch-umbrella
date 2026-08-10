@@ -4,15 +4,18 @@
 //! Execution plan: ../embarch-doc/embarch-umbrella/milestone-6.md
 //!
 //! Implemented so far: topology detection (§3.2), `setup` (§3.3), `init`,
-//! `up`/`down`, and enough of `status` to be useful. `doctor` parses and then
-//! reports itself unimplemented rather than pretending to work.
+//! `up`/`down`, `doctor` (§3.4), and enough of `status` to be useful. §3.7
+//! (release CI) and §3.8 (dogfooding the guide) are what remains.
 
+mod config;
+mod doctor;
 mod env;
 mod init;
 mod locate;
 mod probe;
 mod setup;
 mod state;
+mod token;
 mod topology;
 
 use clap::{Parser, Subcommand};
@@ -108,21 +111,16 @@ async fn main() {
 
     let cli = Cli::parse();
 
-    let (what, plan) = match cli.command {
-        Command::Status { json, host, port } => {
-            std::process::exit(status(json, host.as_deref(), port).await);
-        }
-        Command::Setup { host, port } => {
-            std::process::exit(setup::setup(host.as_deref(), port).await);
-        }
-        Command::Init { uninstall } => std::process::exit(init::init(uninstall)),
-        Command::Doctor { .. } => ("doctor", "milestone-6.md §3.4, design.md §5"),
-        Command::Up { foreground } => std::process::exit(setup::up(foreground)),
-        Command::Down => std::process::exit(setup::down()),
+    let code = match cli.command {
+        Command::Status { json, host, port } => status(json, host.as_deref(), port).await,
+        Command::Setup { host, port } => setup::setup(host.as_deref(), port).await,
+        Command::Init { uninstall } => init::init(uninstall),
+        Command::Doctor { json } => doctor::doctor(json).await,
+        Command::Up { foreground } => setup::up(foreground),
+        Command::Down => setup::down(),
     };
 
-    eprintln!("embarch {what}: not implemented yet — see ../embarch-doc/embarch-umbrella/{plan}");
-    std::process::exit(EXIT_FAILURE);
+    std::process::exit(code);
 }
 
 /// Find Core and report where it is. Returns the process exit code.

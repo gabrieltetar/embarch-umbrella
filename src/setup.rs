@@ -74,22 +74,29 @@ async fn make_plan(host: Option<&str>, port: u16) -> Plan {
         };
     }
 
-    // Nothing running yet, so infer where Core *should* live. Under WSL2 the
-    // whole point of the split is that the probe is a Windows USB device, so
-    // a Windows-side binary means Core belongs there — not in the guest.
-    let class = if host.is_some() {
-        TopologyClass::Remote
-    } else if core.as_ref().is_some_and(|c| c.windows_exe_from_wsl2) {
-        TopologyClass::WslHost
-    } else {
-        TopologyClass::Local
-    };
+    // Nothing running yet, so infer where Core *should* live.
+    let class = infer_class(host, core.as_ref());
 
     Plan {
         class,
         host: host.map(str::to_string).or(saved.host),
         core,
         already_running: false,
+    }
+}
+
+/// Infer where Core belongs when nothing has answered a probe yet. Under
+/// WSL2 the whole point of the split is that the probe is a Windows USB
+/// device, so a locatable Windows-side binary means Core belongs there — not
+/// in the guest. Shared with `doctor` (design.md §5 check 2) so the two
+/// commands never disagree about which class an unreachable Core "should" be.
+pub fn infer_class(host: Option<&str>, core: Option<&Located>) -> TopologyClass {
+    if host.is_some() {
+        TopologyClass::Remote
+    } else if core.is_some_and(|c| c.windows_exe_from_wsl2) {
+        TopologyClass::WslHost
+    } else {
+        TopologyClass::Local
     }
 }
 
@@ -205,7 +212,7 @@ pub async fn setup(host: Option<&str>, port: u16) -> i32 {
 
 /// `/mnt/c/foo/bar.exe` back into `C:\foo\bar.exe`, for a command the user
 /// will paste into a Windows shell rather than a WSL2 one.
-fn windows_display_path(p: &std::path::Path) -> String {
+pub fn windows_display_path(p: &std::path::Path) -> String {
     let s = p.to_string_lossy();
     if let Some(rest) = s.strip_prefix("/mnt/") {
         let mut chars = rest.chars();
@@ -356,6 +363,31 @@ mod tests {
         // Not an oversight: there's no shared filesystem, so the token is
         // copied by hand (design.md §6).
         assert_eq!(token_path_for(TopologyClass::Remote, false), None);
+    }
+
+    #[test]
+    fn infer_class_prefers_an_explicit_host() {
+        let windows_core = Located {
+            path: PathBuf::from("/mnt/c/Program Files/embarch/embarch-core.exe"),
+            found_by: crate::locate::FoundBy::WindowsConventionalDir,
+            windows_exe_from_wsl2: true,
+        };
+        assert_eq!(infer_class(Some("bench.local"), Some(&windows_core)), TopologyClass::Remote);
+    }
+
+    #[test]
+    fn infer_class_follows_a_locatable_windows_binary() {
+        let windows_core = Located {
+            path: PathBuf::from("/mnt/c/Program Files/embarch/embarch-core.exe"),
+            found_by: crate::locate::FoundBy::WindowsConventionalDir,
+            windows_exe_from_wsl2: true,
+        };
+        assert_eq!(infer_class(None, Some(&windows_core)), TopologyClass::WslHost);
+    }
+
+    #[test]
+    fn infer_class_defaults_to_local() {
+        assert_eq!(infer_class(None, None), TopologyClass::Local);
     }
 
     #[test]
