@@ -12,6 +12,7 @@ mod doctor;
 mod env;
 mod init;
 mod locate;
+mod manifest;
 mod probe;
 mod setup;
 mod state;
