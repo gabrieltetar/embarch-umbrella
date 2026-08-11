@@ -146,23 +146,80 @@ fn binary_version(path: &Path) -> Option<String> {
     String::from_utf8(output.stdout).ok().map(|s| s.trim().to_string())
 }
 
+/// Compare each component's real `--version` output against a suite
+/// manifest's recorded tag, when both a manifest and a real version are
+/// available. `None` for a component means "nothing to say" (manifest
+/// absent, or that binary's `--version` didn't resolve) rather than a
+/// mismatch — check_binaries decides what silence means.
+fn manifest_mismatches(m: &crate::manifest::Manifest, c_ver: Option<&str>, a_ver: Option<&str>) -> Vec<String> {
+    let mut mismatches = Vec::new();
+    // Umbrella can check its own version against the manifest with no
+    // subprocess at all — it's this binary's own compiled-in Cargo version.
+    let self_ver = format!("embarch {}", env!("CARGO_PKG_VERSION"));
+    if !crate::manifest::agrees(&m.components.embarch, &self_ver) {
+        mismatches.push(format!("embarch: manifest says {}, this binary is {self_ver}", m.components.embarch));
+    }
+    if let Some(v) = c_ver {
+        if !crate::manifest::agrees(&m.components.embarch_core, v) {
+            mismatches.push(format!("embarch-core: manifest says {}, binary says {v}", m.components.embarch_core));
+        }
+    }
+    if let Some(v) = a_ver {
+        if !crate::manifest::agrees(&m.components.embarch_api, v) {
+            mismatches.push(format!("embarch-api: manifest says {}, binary says {v}", m.components.embarch_api));
+        }
+    }
+    mismatches
+}
+
 fn check_binaries(core: Option<&Located>, api: Option<&Located>) -> Check {
     match (core, api) {
         (Some(c), Some(a)) => {
-            let c_ver = binary_version(&c.path).unwrap_or_else(|| "version unknown".to_string());
-            let a_ver = binary_version(&a.path).unwrap_or_else(|| "version unknown".to_string());
-            check(
-                1,
-                "binaries found",
-                Status::Pass,
-                format!(
-                    "embarch-core: {} ({c_ver}); embarch-api: {} ({a_ver}). Version-vs-suite-manifest \
-                     comparison isn't available yet — the manifest ships with milestone-6.md §3.7's \
-                     release CI, which hasn't landed.",
-                    c.path.display(),
-                    a.path.display()
+            let c_ver = binary_version(&c.path);
+            let a_ver = binary_version(&a.path);
+            let c_display = c_ver.as_deref().unwrap_or("version unknown");
+            let a_display = a_ver.as_deref().unwrap_or("version unknown");
+            let found = format!(
+                "embarch-core: {} ({c_display}); embarch-api: {} ({a_display})",
+                c.path.display(),
+                a.path.display()
+            );
+
+            let manifest = crate::manifest::find_next_to_me().and_then(|p| crate::manifest::load(&p));
+            match manifest {
+                None => check(
+                    1,
+                    "binaries found",
+                    Status::Pass,
+                    format!(
+                        "{found}. No suite manifest next to this binary — either not installed from a \
+                         suite archive (milestone-6.md §3.7), or a per-repo/debug build; \
+                         version-vs-manifest comparison skipped."
+                    ),
                 ),
-            )
+                Some(m) => {
+                    let mismatches = manifest_mismatches(&m, c_ver.as_deref(), a_ver.as_deref());
+                    if mismatches.is_empty() {
+                        check(
+                            1,
+                            "binaries found",
+                            Status::Pass,
+                            format!("{found}. Matches suite manifest v{} ({}).", m.suite_version, m.target),
+                        )
+                    } else {
+                        with_fix(
+                            check(
+                                1,
+                                "binaries found",
+                                Status::Fail,
+                                format!("{found}. Suite manifest v{} mismatch: {}", m.suite_version, mismatches.join("; ")),
+                            ),
+                            "reinstall from a matching suite archive, so all three binaries come from the \
+                             same release",
+                        )
+                    }
+                }
+            }
         }
         _ => with_fix(
             check(

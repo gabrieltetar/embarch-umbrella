@@ -1,0 +1,104 @@
+# Assembles the suite release archive: `embarch-<version>-<target>.{tar.gz,zip}`
+# carrying all three binaries from one already-tagged release of each
+# component (embarch-umbrella/design.md §3 decision 14). This is what the
+# user guide links to — the per-repo releases (release.yml, here and in
+# embarch-core/embarch-api) exist for developers working on one component,
+# not for a new engineer's first download.
+#
+# Deliberately manual (workflow_dispatch) rather than chained automatically
+# off any one component's tag push: the three repos release independently,
+# and a suite release is a decision about which three versions form a
+# version-tested set together, not a mechanical consequence of any single
+# push. See milestone-6.md §3.7.
+name: Assemble suite release
+
+on:
+  workflow_dispatch:
+    inputs:
+      suite_version:
+        description: "Suite version to publish, e.g. 0.1.0 (no leading v)"
+        required: true
+      core_tag:
+        description: "embarch-core release tag to pull in, e.g. v0.1.0"
+        required: true
+      api_tag:
+        description: "embarch-api release tag to pull in, e.g. v0.1.0"
+        required: true
+      umbrella_tag:
+        description: "embarch-umbrella release tag to pull in, e.g. v0.1.0"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-pc-windows-msvc
+          - x86_64-unknown-linux-gnu
+          - aarch64-unknown-linux-gnu
+          - aarch64-apple-darwin
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - name: Download embarch-core
+        run: gh release download "${{ inputs.core_tag }}" -R gabrieltetar/embarch-core -p "embarch-core-${{ matrix.target }}.*" -D core
+
+      - name: Download embarch-api
+        run: gh release download "${{ inputs.api_tag }}" -R gabrieltetar/embarch-api -p "embarch-api-${{ matrix.target }}.*" -D api
+
+      - name: Download embarch
+        run: gh release download "${{ inputs.umbrella_tag }}" -R gabrieltetar/embarch-umbrella -p "embarch-${{ matrix.target }}.*" -D umbrella
+
+      # Each per-repo archive contains one directory (its own package step's
+      # `name`) holding just that component's binary. Unpacked here without
+      # that wrapping directory, so all three binaries land flat, side by
+      # side, in the same directory init.rs's locate.rs sibling-lookup
+      # already expects them in.
+      - name: Assemble
+        shell: bash
+        run: |
+          set -euo pipefail
+          name="embarch-${{ inputs.suite_version }}-${{ matrix.target }}"
+          mkdir -p "dist/${name}"
+          for dir in core api umbrella; do
+            archive=$(ls "$dir"/*.tar.gz "$dir"/*.zip 2>/dev/null | head -n1)
+            case "$archive" in
+              *.zip) unzip -j -o "$archive" -d "dist/${name}" ;;
+              *.tar.gz) tar xzf "$archive" -C "dist/${name}" --strip-components=1 ;;
+              *) echo "no release asset found for target ${{ matrix.target }} in $dir" >&2; exit 1 ;;
+            esac
+          done
+
+          cat > "dist/${name}/embarch-manifest.json" <<EOF
+          {
+            "suite_version": "${{ inputs.suite_version }}",
+            "target": "${{ matrix.target }}",
+            "components": {
+              "embarch": "${{ inputs.umbrella_tag }}",
+              "embarch-core": "${{ inputs.core_tag }}",
+              "embarch-api": "${{ inputs.api_tag }}"
+            }
+          }
+          EOF
+
+          cd dist
+          if [[ "${{ matrix.target }}" == *windows* ]]; then
+            7z a "${name}.zip" "${name}" >/dev/null
+            echo "ASSET=dist/${name}.zip" >> "$GITHUB_ENV"
+          else
+            tar czf "${name}.tar.gz" "${name}"
+            echo "ASSET=dist/${name}.tar.gz" >> "$GITHUB_ENV"
+          fi
+
+      - name: Publish suite release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: suite-v${{ inputs.suite_version }}
+          name: "EmbArch suite v${{ inputs.suite_version }}"
+          files: ${{ env.ASSET }}
+          fail_on_unmatched_files: true
