@@ -63,10 +63,19 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          shopt -s nullglob
           name="embarch-${{ inputs.suite_version }}-${{ matrix.target }}"
           mkdir -p "dist/${name}"
           for dir in core api umbrella; do
-            archive=$(ls "$dir"/*.tar.gz "$dir"/*.zip 2>/dev/null | head -n1)
+            # Each target only ever has one of .tar.gz/.zip. `ls a.tar.gz
+            # b.zip` still exits non-zero when only one glob matches (it
+            # prints the hit but also complains about the miss on stderr),
+            # and pipefail turns that into a false failure even though the
+            # pipeline's real output was correct — caught for real running
+            # this workflow the first time (milestone-6.md §3.8). nullglob
+            # plus a plain array sidesteps `ls`/`head` entirely.
+            candidates=("$dir"/*.tar.gz "$dir"/*.zip)
+            archive="${candidates[0]:-}"
             case "$archive" in
               *.zip) unzip -j -o "$archive" -d "dist/${name}" ;;
               *.tar.gz) tar xzf "$archive" -C "dist/${name}" --strip-components=1 ;;
