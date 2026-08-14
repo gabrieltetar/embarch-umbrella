@@ -23,34 +23,36 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Deserialize)]
 struct BoardYml {
     board: BoardSection,
-    #[serde(default)]
-    revision: Option<RevisionSection>,
 }
 
 #[derive(Debug, Deserialize)]
 struct BoardSection {
     #[serde(default)]
     socs: Vec<SocSection>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SocSection {
+    /// Nested under `board:`, not a sibling top-level key — confirmed
+    /// against the real healthband repo's `board.yml` files. An earlier
+    /// version of this module assumed a top-level `revision:` key instead,
+    /// which silently discarded every real board's revision data instead of
+    /// erroring — a real bug, found and fixed in `embarch-api/src/zephyr.rs`
+    /// first (its `list_targets` surfaced it directly), then here too.
     #[serde(default)]
-    cpuclusters: Vec<CpuClusterSection>,
-    #[serde(default)]
-    variants: Vec<VariantSection>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CpuClusterSection {
-    #[serde(default)]
-    variants: Vec<VariantSection>,
+    revision: Option<RevisionSection>,
 }
 
 // Only the count of variants matters here (unlike embarch-api's zephyr.rs,
-// which needs each one's name to assemble a real board qualifier) — an
-// empty struct still deserializes a `{name: ...}` YAML mapping fine, serde
-// just ignores the field it doesn't ask for.
+// which needs each one's name and cpucluster to assemble a real board
+// qualifier) — an empty struct still deserializes a `{name: ..., cpucluster:
+// ...}` YAML mapping fine, serde just ignores the fields it doesn't ask for.
+// (Confirmed against the real repo: `cpucluster` lives on each variant, not
+// on a separate nesting level above it — irrelevant here since only the
+// count matters, but worth noting since embarch-api/src/zephyr.rs had to
+// model it for real.)
+#[derive(Debug, Deserialize)]
+struct SocSection {
+    #[serde(default)]
+    variants: Vec<VariantSection>,
+}
+
 #[derive(Debug, Deserialize)]
 struct VariantSection {}
 
@@ -96,13 +98,7 @@ pub fn count_valid_targets(source_path: &Path) -> usize {
     let mut count = 0;
     for board in &boards {
         for soc in &board.yml.board.socs {
-            if soc.cpuclusters.is_empty() {
-                count += count_for_variants(board, &soc.variants, &apps);
-            } else {
-                for cluster in &soc.cpuclusters {
-                    count += count_for_variants(board, &cluster.variants, &apps);
-                }
-            }
+            count += count_for_variants(board, &soc.variants, &apps);
         }
     }
     count
@@ -110,7 +106,7 @@ pub fn count_valid_targets(source_path: &Path) -> usize {
 
 fn count_for_variants(board: &BoardDef, variants: &[VariantSection], apps: &[String]) -> usize {
     let variant_count = variants.len().max(1);
-    let revisions = candidate_revisions(&board.yml.revision);
+    let revisions = candidate_revisions(&board.yml.board.revision);
 
     let revision_count = if revisions.is_empty() {
         // No revision section at all -> one implicit revision, always backed
@@ -128,7 +124,7 @@ fn count_for_variants(board: &BoardDef, variants: &[VariantSection], apps: &[Str
         // real repo might have the overlay for one variant but not
         // another, at the same revision), which is an accepted
         // approximation for a doctor pass/fail signal.
-        let default_revision = board.yml.revision.as_ref().and_then(|r| r.default.as_deref());
+        let default_revision = board.yml.board.revision.as_ref().and_then(|r| r.default.as_deref());
         revisions
             .iter()
             .filter(|r| Some(r.as_str()) == default_revision || revision_file_exists(&board.dir, r))
@@ -293,11 +289,11 @@ board:
   name: roadrunner
   socs:
     - name: nrf54l15
-      cpuclusters:
-        - name: cpuapp
-          variants:
-            - name: os_5led
-            - name: os_3led
+      variants:
+        - name: os_5led
+          cpucluster: cpuapp
+        - name: os_3led
+          cpucluster: cpuapp
 "#,
         )
         .unwrap();
