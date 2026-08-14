@@ -485,7 +485,20 @@ fn check_build_commands(projects: &[ProjectConfig]) -> Check {
 
     let mut unresolved = Vec::new();
     for p in projects {
-        let Some(program) = p.build_command.first() else {
+        if p.is_zephyr_west() {
+            // design.md §3 decision 17: a zephyr-west project has no
+            // build_command at all — west_binary is the equivalent
+            // executable-on-PATH preflight.
+            let Some(west) = p.west_binary.as_ref().and_then(|w| w.to_str()) else {
+                unresolved.push(format!("{}: west_binary is not set", p.name));
+                continue;
+            };
+            if resolve_program(west, &p.source_path).is_none() {
+                unresolved.push(format!("{}: west_binary `{west}` not found on PATH or at that path", p.name));
+            }
+            continue;
+        }
+        let Some(program) = p.build_command.as_ref().and_then(|c| c.first()) else {
             unresolved.push(format!("{}: build_command is empty", p.name));
             continue;
         };
@@ -499,32 +512,49 @@ fn check_build_commands(projects: &[ProjectConfig]) -> Check {
     } else {
         with_fix(
             check(7, "build_command[0] resolves to an executable", Status::Fail, unresolved.join("; ")),
-            "install the missing tool, or fix build_command in embarch/embarch.toml",
+            "install the missing tool, or fix build_command/west_binary in embarch/embarch.toml",
         )
     }
 }
 
-// ---- check 8: chip placeholder ----------------------------------------------
+// ---- check 8: chip placeholder / live target discovery -----------------------
 
 const CHIP_PLACEHOLDER: &str = "CHANGE-ME";
 
+/// For a `discovery = "static"` project: `chip` isn't still `init`'s
+/// placeholder. For a `discovery = "zephyr-west"` project (`design.md` §3
+/// decision 17): there's nowhere for a placeholder to live at all — `chip`
+/// is resolved per call — so this checks the thing that actually matters
+/// instead, that at least one live-discovered target is file-backing-valid,
+/// i.e. `boards/`/`app/` aren't empty or broken.
 fn check_chip(projects: &[ProjectConfig]) -> Check {
     if projects.is_empty() {
-        return check(8, "chip is not still a placeholder", Status::Warn, "no projects configured");
+        return check(8, "chip resolvable (static: not a placeholder; zephyr-west: a real target exists)", Status::Warn, "no projects configured");
     }
-    let placeholders: Vec<&str> = projects
-        .iter()
-        .filter(|p| p.chip == CHIP_PLACEHOLDER)
-        .map(|p| p.name.as_str())
-        .collect();
 
-    if placeholders.is_empty() {
-        check(8, "chip is not still a placeholder", Status::Pass, format!("{} project(s) checked", projects.len()))
+    let mut problems = Vec::new();
+    for p in projects {
+        if p.is_zephyr_west() {
+            let count = crate::zephyr::count_valid_targets(&p.source_path);
+            if count == 0 {
+                problems.push(format!(
+                    "{}: no valid targets found under boards/ + app/ — run `embarch-api list-targets {}` for detail",
+                    p.name, p.name
+                ));
+            }
+        } else if p.chip.as_deref() == Some(CHIP_PLACEHOLDER) {
+            problems.push(format!("{}: chip still CHANGE-ME", p.name));
+        }
+    }
+
+    if problems.is_empty() {
+        check(8, "chip resolvable (static: not a placeholder; zephyr-west: a real target exists)", Status::Pass, format!("{} project(s) checked", projects.len()))
     } else {
         with_fix(
-            check(8, "chip is not still a placeholder", Status::Fail, format!("still CHANGE-ME for: {}", placeholders.join(", "))),
-            "cargo install probe-rs-tools && probe-rs chip list | grep -i <your soc>, then set `chip` \
-             in embarch/embarch.toml",
+            check(8, "chip resolvable (static: not a placeholder; zephyr-west: a real target exists)", Status::Fail, problems.join("; ")),
+            "static: cargo install probe-rs-tools && probe-rs chip list | grep -i <your soc>, then set \
+             `chip` in embarch/embarch.toml. zephyr-west: confirm boards/*/*.yml and app/*/CMakeLists.txt \
+             exist and declare at least one real, file-backed target.",
         )
     }
 }
@@ -554,7 +584,26 @@ fn check_artifact_paths(projects: &[ProjectConfig]) -> Check {
     let mut fix = None;
 
     for p in projects {
-        let resolved = p.resolved_artifact_path();
+        if p.is_zephyr_west() {
+            // design.md §3 decision 17: artifact_path and artifact_path_for_core
+            // are both computed together, per call, from the same resolved
+            // build dir — there's nothing stored to compare here. All this
+            // check can verify ahead of time is that the WSL2 UNC-path
+            // translation itself would succeed for this repo, when it applies.
+            if under_wsl2 && current_distro.is_none() {
+                notes.push(format!("{}: under WSL2 but WSL_DISTRO_NAME is unset — artifact_path_for_core can't be computed at call time", p.name));
+                worst = Status::Fail;
+            } else {
+                notes.push(format!("{}: ok — computed per call, nothing to compare ahead of time", p.name));
+            }
+            continue;
+        }
+
+        let Some(resolved) = p.resolved_artifact_path() else {
+            notes.push(format!("{}: no artifact_path configured", p.name));
+            worst = Status::Fail;
+            continue;
+        };
         if !resolved.exists() {
             notes.push(format!("{}: no artifact at {} yet (build it first)", p.name, resolved.display()));
             if worst == Status::Pass {
@@ -817,11 +866,13 @@ mod tests {
         ProjectConfig {
             name: name.to_string(),
             source_path: PathBuf::from("/repo"),
+            discovery: config::Discovery::Static,
             build_cwd: None,
-            build_command: vec!["west".to_string(), "build".to_string()],
-            artifact_path: PathBuf::from("build/zephyr/zephyr.hex"),
-            chip: chip.to_string(),
+            build_command: Some(vec!["west".to_string(), "build".to_string()]),
+            artifact_path: Some(PathBuf::from("build/zephyr/zephyr.hex")),
+            chip: Some(chip.to_string()),
             artifact_path_for_core: None,
+            west_binary: None,
         }
     }
 }
