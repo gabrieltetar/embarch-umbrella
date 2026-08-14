@@ -18,6 +18,7 @@ mod setup;
 mod state;
 mod token;
 mod topology;
+mod zephyr;
 
 use clap::{Parser, Subcommand};
 

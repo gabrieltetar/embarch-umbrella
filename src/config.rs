@@ -41,20 +41,45 @@ impl CoreConfig {
     }
 }
 
+/// Mirrors `embarch-api/src/config.rs`'s `Discovery` (`embarch-api/design.md`
+/// §3 decision 12) — another liftable copy, per this file's own header note.
+#[derive(Debug, Default, Deserialize, PartialEq, Eq, Clone, Copy)]
+#[serde(rename_all = "kebab-case")]
+pub enum Discovery {
+    #[default]
+    Static,
+    ZephyrWest,
+}
+
 #[derive(Debug, Deserialize)]
 pub struct ProjectConfig {
     pub name: String,
     pub source_path: PathBuf,
     #[serde(default)]
+    pub discovery: Discovery,
+    #[serde(default)]
     pub build_cwd: Option<PathBuf>,
-    pub build_command: Vec<String>,
-    pub artifact_path: PathBuf,
-    pub chip: String,
+    /// Present for `discovery = "static"`; absent for `discovery =
+    /// "zephyr-west"`, where it's assembled per call by `embarch-api`
+    /// instead (`embarch-api/design.md` §3 decision 12).
+    #[serde(default)]
+    pub build_command: Option<Vec<String>>,
+    #[serde(default)]
+    pub artifact_path: Option<PathBuf>,
+    #[serde(default)]
+    pub chip: Option<String>,
     #[serde(default)]
     pub artifact_path_for_core: Option<String>,
+    /// Only meaningful for `discovery = "zephyr-west"`.
+    #[serde(default)]
+    pub west_binary: Option<PathBuf>,
 }
 
 impl ProjectConfig {
+    pub fn is_zephyr_west(&self) -> bool {
+        self.discovery == Discovery::ZephyrWest
+    }
+
     pub fn build_dir(&self) -> PathBuf {
         match &self.build_cwd {
             Some(cwd) => self.source_path.join(cwd),
@@ -62,8 +87,10 @@ impl ProjectConfig {
         }
     }
 
-    pub fn resolved_artifact_path(&self) -> PathBuf {
-        self.build_dir().join(&self.artifact_path)
+    /// Only meaningful for `discovery = "static"` — a `zephyr-west`
+    /// project's artifact path is resolved per call, not stored.
+    pub fn resolved_artifact_path(&self) -> Option<PathBuf> {
+        self.artifact_path.as_ref().map(|p| self.build_dir().join(p))
     }
 }
 
@@ -111,10 +138,10 @@ mod tests {
         let config = Config::load_from_path(&path).unwrap();
         assert!(config.core.is_auto());
         assert_eq!(config.projects.len(), 1);
-        assert_eq!(config.projects[0].chip, "CHANGE-ME");
+        assert_eq!(config.projects[0].chip.as_deref(), Some("CHANGE-ME"));
         assert_eq!(
             config.projects[0].resolved_artifact_path(),
-            PathBuf::from("/repo/build/zephyr/zephyr.hex")
+            Some(PathBuf::from("/repo/build/zephyr/zephyr.hex"))
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -137,6 +164,25 @@ mod tests {
 
         let config = Config::load_from_path(&path).unwrap();
         assert_eq!(config.projects[0].build_dir(), PathBuf::from("/repo/app/fw"));
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn zephyr_west_project_parses_without_static_fields() {
+        let raw = "[core]\nbase_url = \"auto\"\n\n[[projects]]\nname = \"fw\"\nsource_path = \"/repo\"\ndiscovery = \"zephyr-west\"\nwest_binary = \"west\"\n";
+        let dir = std::env::temp_dir().join(format!(
+            "embarch-umbrella-config-test-zw-{:?}",
+            std::thread::current().id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("embarch.toml");
+        std::fs::write(&path, raw).unwrap();
+
+        let config = Config::load_from_path(&path).unwrap();
+        assert!(config.projects[0].is_zephyr_west());
+        assert_eq!(config.projects[0].chip, None);
+        assert_eq!(config.projects[0].resolved_artifact_path(), None);
 
         std::fs::remove_dir_all(&dir).ok();
     }

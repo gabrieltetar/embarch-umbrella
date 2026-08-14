@@ -178,6 +178,45 @@ pub struct Scaffold {
     pub warnings: Vec<String>,
 }
 
+/// Build the config text for a `discovery = "zephyr-west"` project
+/// (design.md §3 decision 17, `embarch-api/design.md` §3 decision 12): no
+/// `build_command`/`chip`/`artifact_path`/`artifact_path_for_core` — those
+/// are resolved live, per call, by `embarch-api` instead.
+pub fn render_zephyr_west_config(
+    name: &str,
+    source_path: &Path,
+    west_binary: &str,
+    build_dir_root: &str,
+) -> String {
+    format!(
+        "# Written by `embarch init`. Local to this clone — excluded via\n\
+         # .git/info/exclude, so nothing tracked by this repo was modified.\n\
+         \n\
+         [core]\n\
+         # Not an address: Core is found at first use, every time. Don't replace\n\
+         # this with an IP — under WSL2 that IP changes on every restart.\n\
+         base_url = \"auto\"\n\
+         \n\
+         [[projects]]\n\
+         name = {name:?}\n\
+         source_path = {source:?}\n\
+         # Zephyr/west detected here (boards/*/*.yml + app/*/CMakeLists.txt): board,\n\
+         # chip, and artifact path are resolved live, per call, instead of stored —\n\
+         # see `embarch-api list-targets {name}` and embarch-api/design.md §3 decision 12.\n\
+         discovery = \"zephyr-west\"\n\
+         west_binary = {west_binary:?}\n\
+         # Per-target subdirectories are computed under this, never shared between\n\
+         # distinct (board, variant, revision, app) targets.\n\
+         build_dir_root = {build_dir_root:?}\n\
+         flash_format = \"hex\"\n\
+         build_timeout_secs = 900\n",
+        name = name,
+        source = source_path.to_string_lossy(),
+        west_binary = west_binary,
+        build_dir_root = build_dir_root,
+    )
+}
+
 /// Build the config text for a repo.
 ///
 /// Pure: everything it needs is already resolved by the caller, so the
@@ -331,10 +370,80 @@ pub fn init(uninstall: bool) -> i32 {
         .map(|n| n.to_string_lossy().to_string())
         .unwrap_or_else(|| "firmware".to_string());
     let mut warnings = Vec::new();
+    let build_dir_rel = "embarch/build";
+    let build_info = repo.join("build").join("build_info.yml");
+
+    // design.md §3 decision 17: a repo shaped like a real Zephyr/west
+    // project (several boards/variants/revisions worth discovering live,
+    // not one to guess) gets the minimal discovery = "zephyr-west" schema
+    // instead of a single hand-picked board — `embarch init`'s old behavior
+    // silently picked the wrong one of several real boards in the
+    // healthband repo, with no signal a choice had even been made.
+    if crate::zephyr::looks_zephyr_west_shaped(&repo) {
+        println!("Detected a Zephyr/west project (boards/*/*.yml + app/*/CMakeLists.txt).");
+        let west_binary = std::fs::read_to_string(&build_info)
+            .ok()
+            .and_then(|y| parse_west_command(&y))
+            .and_then(|cmd| split_argv(&cmd).into_iter().next())
+            .unwrap_or_else(|| {
+                warnings.push(format!(
+                    "no {} found, so west_binary defaults to `west` (found on PATH) — set it to the \
+                     exact binary this repo's build uses if that's wrong (e.g. a workspace venv path).",
+                    build_info.display()
+                ));
+                "west".to_string()
+            });
+
+        let scaffold = Scaffold {
+            toml: render_zephyr_west_config(&name, &repo, &west_binary, build_dir_rel),
+            warnings,
+        };
+
+        if let Err(e) = std::fs::create_dir_all(&embarch_dir) {
+            eprintln!("could not create {}: {e}", embarch_dir.display());
+            return 1;
+        }
+        if let Err(e) = std::fs::write(&config_path, &scaffold.toml) {
+            eprintln!("could not write {}: {e}", config_path.display());
+            return 1;
+        }
+        println!("Wrote {}", config_path.display());
+
+        match add_to_git_exclude(&repo) {
+            Ok(true) => println!("Excluded embarch/ via .git/info/exclude (nothing tracked changed)"),
+            Ok(false) => println!("embarch/ was already excluded"),
+            Err(e) => println!("Could not update .git/info/exclude: {e:#}"),
+        }
+
+        print!("Registering the MCP server for this repo... ");
+        match locate::locate_api() {
+            Some(api) => {
+                if register_mcp(&api.path, &config_path) {
+                    println!("done");
+                }
+            }
+            None => println!(
+                "\n  embarch-api not found — register it once you have it:\n    \
+                 claude mcp add {MCP_SERVER_NAME} -- <path to embarch-api> --config {}",
+                config_path.display()
+            ),
+        }
+
+        println!("\n{} has no chip/build_command to edit — both are resolved live, per call.", config_path.display());
+        for w in &scaffold.warnings {
+            println!("  - {w}");
+        }
+        println!(
+            "\nThen: `embarch status`, `embarch-api --config {} list-targets {name}` to see what's \
+             buildable, and `embarch-api --config {} build {name} --board <board> [--variant <v>] \
+             [--revision <r>] [--app <a>]`.",
+            config_path.display(),
+            config_path.display()
+        );
+        return 0;
+    }
 
     // Derive the build command from what west actually ran, when it can.
-    let build_info = repo.join("build").join("build_info.yml");
-    let build_dir_rel = "embarch/build";
     let build_command = match std::fs::read_to_string(&build_info)
         .ok()
         .and_then(|y| parse_west_command(&y))
