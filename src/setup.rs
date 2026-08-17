@@ -10,7 +10,8 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
-use crate::locate::{self, Located};
+use crate::install;
+use crate::locate::{self, FoundBy, Located};
 use crate::state::{self, State};
 use crate::topology::{self, TopologyClass};
 use crate::{env, probe};
@@ -109,10 +110,57 @@ fn run(program: &std::path::Path, args: &[&str]) -> Result<bool> {
     Ok(status.success())
 }
 
-pub async fn setup(host: Option<&str>, port: u16) -> i32 {
-    let plan = make_plan(host, port).await;
+/// Copy this platform's binaries to the canonical location and make sure
+/// `PATH` includes it (decision 28), from wherever the currently-running
+/// `embarch` binary sits — the unpacked release archive. Printed regardless
+/// of outcome, since a failure here (e.g. no writable `HOME`/`LOCALAPPDATA`)
+/// shouldn't silently abort the rest of `setup`.
+fn install_this_platform() -> Option<install::InstallReport> {
+    let source_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    match install::install(&source_dir) {
+        Ok(report) => {
+            if report.copied.is_empty() {
+                println!("\nNothing to install: no suite binaries found next to this one.");
+            } else {
+                println!("\nInstalled to {}:", report.bin_dir.display());
+                for path in &report.copied {
+                    println!("  {}", path.display());
+                }
+                if report.path_changed {
+                    println!("Added {} to your PATH (new shells will see it).", report.bin_dir.display());
+                } else {
+                    println!("PATH already includes {}.", report.bin_dir.display());
+                }
+            }
+            Some(report)
+        }
+        Err(e) => {
+            println!("\nCould not install to the canonical location: {e:#}");
+            None
+        }
+    }
+}
 
-    println!("Topology: {}", plan.class.as_str());
+pub async fn setup(host: Option<&str>, port: u16) -> i32 {
+    let install_report = install_this_platform();
+    let mut plan = make_plan(host, port).await;
+
+    // locate_core's PATH lookup can't see a PATH change this same run just
+    // made (a running process's own environment doesn't retroactively
+    // update) — so for a same-machine Core, fall back to the copy this run
+    // itself just installed rather than reporting "not found" on a machine
+    // that's actually now fully set up. Not applicable to wsl-host/remote:
+    // those need the real Windows-side or remote binary, not this local copy.
+    if plan.core.is_none() && plan.class == TopologyClass::Local {
+        if let Some(report) = &install_report {
+            let candidate = report.bin_dir.join(locate::native_name("embarch-core"));
+            if candidate.is_file() {
+                plan.core = Some(Located { path: candidate, found_by: FoundBy::JustInstalled, windows_exe_from_wsl2: false });
+            }
+        }
+    }
+
+    println!("\nTopology: {}", plan.class.as_str());
     match &plan.core {
         Some(c) => println!("embarch-core: {} ({})", c.path.display(), c.found_by.as_str()),
         None => println!("embarch-core: not found"),
@@ -196,18 +244,62 @@ pub async fn setup(host: Option<&str>, port: u16) -> i32 {
         Err(e) => println!("Could not save state: {e:#}"),
     }
 
-    // PATH is left alone on purpose (locate.rs's header). Say so, and give
-    // the one line rather than editing someone's shell config for them.
-    if let Some(dir) = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf())) {
-        println!(
-            "\nTo run `embarch`, `embarch-core` and `embarch-api` from anywhere, add this to your \
-             shell profile (setup does not edit it for you):\n  export PATH=\"{}:$PATH\"",
-            dir.display()
-        );
-    }
-
     println!("\nNext: `embarch status` to confirm, then `embarch init` in a firmware repo.");
     0
+}
+
+/// Reverse `setup`: stop and unregister the Core service (best-effort — a
+/// `wsl-host`/`remote` Core can't be controlled from here, same constraint
+/// `up`/`down` already have), remove the machine-wide token file, and undo
+/// decision 28's install (canonical binaries + `PATH` additions).
+pub fn uninstall() -> i32 {
+    let under_wsl2 = env::under_wsl2();
+    let saved = state::load();
+    let core = locate::locate_core(saved.core_exe.as_deref(), under_wsl2);
+
+    match &core {
+        Some(c) if !c.windows_exe_from_wsl2 => {
+            println!("Stopping and uninstalling the embarch-core service...");
+            match run(&c.path, &["uninstall"]) {
+                Ok(true) => println!("Service uninstalled."),
+                Ok(false) | Err(_) => {
+                    println!("Could not uninstall the service — this may need elevation:\n  sudo \"{}\" uninstall", c.path.display());
+                }
+            }
+        }
+        Some(c) => {
+            println!(
+                "Core is on the Windows side. In an **elevated Windows** shell, run:\n  \"{}\" uninstall",
+                windows_display_path(&c.path)
+            );
+        }
+        None => println!("embarch-core not found — skipping service uninstall."),
+    }
+
+    let class = saved.topology.as_deref().and_then(topology_class_from_str).unwrap_or(TopologyClass::Local);
+    if let Some(token) = token_path_for(class, cfg!(windows)) {
+        match std::fs::remove_file(&token) {
+            Ok(()) => println!("Removed token file: {}", token.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => println!("Could not remove token file {}: {e}", token.display()),
+        }
+    }
+
+    match install::uninstall() {
+        Ok(()) => println!("Removed the canonical install directory and PATH additions."),
+        Err(e) => println!("Could not fully undo the install: {e:#}"),
+    }
+
+    0
+}
+
+fn topology_class_from_str(s: &str) -> Option<TopologyClass> {
+    match s {
+        "local" => Some(TopologyClass::Local),
+        "wsl-host" => Some(TopologyClass::WslHost),
+        "remote" => Some(TopologyClass::Remote),
+        _ => None,
+    }
 }
 
 /// `/mnt/c/foo/bar.exe` back into `C:\foo\bar.exe`, for a command the user

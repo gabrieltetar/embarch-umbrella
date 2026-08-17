@@ -11,6 +11,7 @@ mod config;
 mod doctor;
 mod env;
 mod init;
+mod install;
 mod locate;
 mod manifest;
 mod probe;
@@ -46,9 +47,8 @@ struct Cli {
 #[derive(Subcommand)]
 enum Command {
     /// One-time per-machine setup: detect the topology, install Core as a
-    /// service that starts at boot, and record what it found.
-    ///
-    /// Does not edit your PATH — it prints the line to add instead.
+    /// service that starts at boot, copy the suite's binaries to a
+    /// canonical location, and add it to PATH.
     Setup {
         /// Core is on another machine at this host. Skips any local install.
         #[arg(long)]
@@ -57,6 +57,11 @@ enum Command {
         /// Core's port.
         #[arg(long, default_value_t = DEFAULT_CORE_PORT)]
         port: u16,
+
+        /// Reverse a prior `setup`: uninstall the Core service, remove the
+        /// token file, and undo the canonical install + PATH additions.
+        #[arg(long)]
+        uninstall: bool,
     },
 
     /// Integrate the firmware repo in the current directory: scaffold
@@ -115,7 +120,13 @@ async fn main() {
 
     let code = match cli.command {
         Command::Status { json, host, port } => status(json, host.as_deref(), port).await,
-        Command::Setup { host, port } => setup::setup(host.as_deref(), port).await,
+        Command::Setup { host, port, uninstall } => {
+            if uninstall {
+                setup::uninstall()
+            } else {
+                setup::setup(host.as_deref(), port).await
+            }
+        }
         Command::Init { uninstall } => init::init(uninstall),
         Command::Doctor { json } => doctor::doctor(json).await,
         Command::Up { foreground } => setup::up(foreground),

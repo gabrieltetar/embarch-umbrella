@@ -4,27 +4,32 @@
 //! (design.md §1) — so "where is `embarch-core`" is a question it has to
 //! answer before it can do almost anything.
 //!
-//! **`setup` deliberately does not modify `PATH`.** The suite release ships
-//! all three binaries in one archive (design.md §3 decision 14), so the
-//! sibling-of-myself lookup below finds them with no environment surgery at
-//! all — and editing someone's shell rc or the Windows registry to add a
-//! directory is invasive, easy to get wrong per shell, and awkward to undo.
-//! `setup` prints the one line to add instead, and leaves the choice to the
-//! operator. (Refinement of design.md §3 decision 3's "put both binaries on
-//! PATH", recorded 2026-08-05.)
+//! **`setup` now installs for real (design.md §3 decision 28).** It copies
+//! the suite's binaries to a canonical per-user location and mutates `PATH`
+//! for real (`install.rs`) — reversing the 2026-08-05 refinement that used
+//! to live here (never edit `PATH`, find `embarch-core` as a sibling of
+//! `embarch` instead). That sibling-lookup mechanism (`next_to_me`) is gone
+//! from the resolution chain below entirely: it was found misreporting which
+//! binary was actually in play for a `wsl-host` topology (design.md §10,
+//! 2026-08-17), and `install.rs`'s copy step is now the only place "look at
+//! my own directory" logic remains — a one-time install source, not an
+//! ongoing lookup.
 
 use std::path::{Path, PathBuf};
 
-/// How a binary was found — worth reporting, because "the one next to me" and
-/// "some other copy on your PATH" produce very different debugging stories
-/// when versions disagree.
+/// How a binary was found — worth reporting, because different sources
+/// produce very different debugging stories when versions disagree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FoundBy {
     EnvVar,
     SavedState,
-    NextToMe,
     Path,
     WindowsConventionalDir,
+    /// The canonical copy `setup` just installed, this same run (`install.rs`,
+    /// decision 28) — used only as a same-process fallback, since a `PATH`
+    /// change this run just made isn't visible to this run's own environment
+    /// until a new shell starts.
+    JustInstalled,
 }
 
 impl FoundBy {
@@ -32,9 +37,9 @@ impl FoundBy {
         match self {
             FoundBy::EnvVar => "EMBARCH_CORE_EXE",
             FoundBy::SavedState => "recorded by setup",
-            FoundBy::NextToMe => "next to the embarch binary",
             FoundBy::Path => "PATH",
-            FoundBy::WindowsConventionalDir => "conventional Windows install directory",
+            FoundBy::WindowsConventionalDir => "Windows install directory",
+            FoundBy::JustInstalled => "just installed here",
         }
     }
 }
@@ -59,8 +64,10 @@ pub fn native_name(stem: &str) -> String {
     }
 }
 
-/// Where a Windows-side install would conventionally put `embarch-core.exe`,
-/// as seen from a WSL2 guest.
+/// Fixed, conventional Windows install locations for `embarch-core.exe`, as
+/// seen from a WSL2 guest — a fallback for a copy installed some other way
+/// than decision 28's canonical per-user location (see
+/// `windows_localappdata_core_path`, tried first).
 ///
 /// Pure and separate so the list is reviewable and testable without a
 /// Windows filesystem mounted. Deliberately short: guessing at a developer's
@@ -74,6 +81,43 @@ pub fn windows_conventional_core_paths() -> Vec<PathBuf> {
     .iter()
     .map(PathBuf::from)
     .collect()
+}
+
+/// Decision 28's real canonical Windows install location
+/// (`%LOCALAPPDATA%\embarch\bin\embarch-core.exe`), resolved from a WSL2
+/// guest. `%LOCALAPPDATA%` is per-user, and WSL2 has no direct view of the
+/// Windows username to derive this path by hand — so, same technique
+/// `token.rs` already uses for the machine-wide `%ProgramData%` case, shell
+/// out to Windows for the real value and translate it to its `/mnt/c` form.
+/// `None` on any failure (no `cmd.exe`/`wslpath`, unexpected output) — the
+/// caller falls through to `windows_conventional_core_paths` either way.
+#[cfg(unix)]
+pub fn windows_localappdata_core_path() -> Option<PathBuf> {
+    let local_appdata = windows_env_var_via_shellout("LOCALAPPDATA")?;
+    let mnt_root = translate_windows_path_to_wsl(&local_appdata)?;
+    Some(mnt_root.join("embarch").join("bin").join("embarch-core.exe"))
+}
+
+#[cfg(unix)]
+fn windows_env_var_via_shellout(name: &str) -> Option<String> {
+    let output = std::process::Command::new("cmd.exe").args(["/C", "echo", &format!("%{name}%")]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let trimmed = text.trim();
+    (!trimmed.is_empty() && !trimmed.contains('%')).then(|| trimmed.to_string())
+}
+
+#[cfg(unix)]
+fn translate_windows_path_to_wsl(win_path: &str) -> Option<PathBuf> {
+    let output = std::process::Command::new("wslpath").args(["-u", win_path]).output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8(output.stdout).ok()?;
+    let trimmed = text.trim();
+    trimmed.starts_with('/').then(|| PathBuf::from(trimmed))
 }
 
 /// Split a `PATH` value into directories, honoring the platform separator.
@@ -92,7 +136,9 @@ fn is_file(p: &Path) -> bool {
 
 /// Locate `embarch-api`: the same order as `locate_core` minus the
 /// Windows-side cases, since the API always runs where the *source* is —
-/// which, on the WSL2 split, is this side of the boundary.
+/// which, on the WSL2 split, is this side of the boundary. `PATH` is enough
+/// once `setup` (decision 28) has run; before that, `EMBARCH_API_BIN` is the
+/// escape hatch.
 pub fn locate_api() -> Option<Located> {
     if let Some(raw) = std::env::var_os("EMBARCH_API_BIN") {
         return Some(Located {
@@ -101,17 +147,7 @@ pub fn locate_api() -> Option<Located> {
             windows_exe_from_wsl2: false,
         });
     }
-    next_to_me("embarch-api").or_else(|| on_path("embarch-api"))
-}
-
-fn next_to_me(stem: &str) -> Option<Located> {
-    let dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    let sibling = dir.join(native_name(stem));
-    is_file(&sibling).then_some(Located {
-        path: sibling,
-        found_by: FoundBy::NextToMe,
-        windows_exe_from_wsl2: false,
-    })
+    on_path("embarch-api")
 }
 
 fn on_path(stem: &str) -> Option<Located> {
@@ -128,10 +164,11 @@ fn on_path(stem: &str) -> Option<Located> {
         })
 }
 
-/// Locate `embarch-core`, in the precedence order design.md §3 decision 7
-/// specifies: an explicit override, then what `setup` recorded, then the copy
-/// shipped alongside this binary, then `PATH`, then — under WSL2 only — the
-/// conventional Windows install directories.
+/// Locate `embarch-core`, in the precedence order design.md §3 decisions 7
+/// and 28 specify: an explicit override, then what `setup` recorded, then
+/// `PATH` (populated for real by `setup`'s install step once decision 28 has
+/// run), then — under WSL2 only — the real canonical Windows location, then
+/// the older fixed conventional directories as a last resort.
 pub fn locate_core(saved: Option<&Path>, under_wsl2: bool) -> Option<Located> {
     if let Some(raw) = std::env::var_os("EMBARCH_CORE_EXE") {
         let path = PathBuf::from(raw);
@@ -154,11 +191,17 @@ pub fn locate_core(saved: Option<&Path>, under_wsl2: bool) -> Option<Located> {
         });
     }
 
-    if let Some(found) = next_to_me("embarch-core").or_else(|| on_path("embarch-core")) {
+    if let Some(found) = on_path("embarch-core") {
         return Some(found);
     }
 
     if under_wsl2 {
+        #[cfg(unix)]
+        if let Some(path) = windows_localappdata_core_path() {
+            if is_file(&path) {
+                return Some(Located { path, found_by: FoundBy::WindowsConventionalDir, windows_exe_from_wsl2: true });
+            }
+        }
         for candidate in windows_conventional_core_paths() {
             if is_file(&candidate) {
                 return Some(Located {
