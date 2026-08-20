@@ -141,8 +141,9 @@ fn install_this_platform() -> Option<install::InstallReport> {
     }
 }
 
-pub async fn setup(host: Option<&str>, port: u16) -> i32 {
+pub async fn setup(host: Option<&str>, port: u16, dev_bench_repo: Option<&std::path::Path>) -> i32 {
     let install_report = install_this_platform();
+    let previously_saved = state::load();
     let mut plan = make_plan(host, port).await;
 
     // locate_core's PATH lookup can't see a PATH change this same run just
@@ -225,6 +226,13 @@ pub async fn setup(host: Option<&str>, port: u16) -> i32 {
         }
     }
 
+    let dev_bench_repo_path = dev_bench_repo
+        .map(std::path::Path::to_path_buf)
+        .or(previously_saved.dev_bench_repo_path);
+    if let Some(p) = &dev_bench_repo_path {
+        println!("\ndev-bench checkout for `doctor` check 13: {}", p.display());
+    }
+
     let saved = State {
         schema_version: state::STATE_SCHEMA_VERSION,
         topology: Some(plan.class.as_str().to_string()),
@@ -234,6 +242,7 @@ pub async fn setup(host: Option<&str>, port: u16) -> i32 {
             .as_ref()
             .filter(|c| c.windows_exe_from_wsl2)
             .map(|c| c.path.clone()),
+        dev_bench_repo_path,
     };
     match state::save(&saved) {
         Ok(()) => {

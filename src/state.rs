@@ -31,6 +31,14 @@ pub struct State {
     /// `/mnt/c` (locate.rs).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub core_exe: Option<PathBuf>,
+    /// Local `embarch-dev-bench` checkout, for `doctor` check 13's
+    /// `git describe`-vs-`HelloAck.firmware_version` staleness check
+    /// (design.md §3 decision 19, `embarch-dev-bench/design.md` §3 decision
+    /// 25). Set by `setup --dev-bench-repo <path>`; unlike `core_exe`, not
+    /// something re-detection can rediscover on its own — a git checkout can
+    /// live anywhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dev_bench_repo_path: Option<PathBuf>,
 }
 
 /// Resolve the config directory from environment values.
@@ -143,6 +151,7 @@ mod tests {
             topology: Some("wsl-host".into()),
             host: None,
             core_exe: Some(PathBuf::from("/mnt/c/embarch/embarch-core.exe")),
+            dev_bench_repo_path: None,
         };
         let text = toml::to_string_pretty(&state).unwrap();
         // Match the key, not the substring — `topology = "wsl-host"` contains

@@ -21,6 +21,8 @@ mod token;
 mod topology;
 mod zephyr;
 
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
 use topology::{winner, Attempt, ProbeOutcome, DEFAULT_CORE_PORT};
@@ -62,6 +64,13 @@ enum Command {
         /// token file, and undo the canonical install + PATH additions.
         #[arg(long)]
         uninstall: bool,
+
+        /// Local `embarch-dev-bench` checkout, for `doctor` check 13's
+        /// stale-firmware detection (design.md §3 decision 19). Saved to
+        /// state; omit on a later `setup` run to leave a previously-saved
+        /// path unchanged.
+        #[arg(long)]
+        dev_bench_repo: Option<PathBuf>,
     },
 
     /// Integrate the firmware repo in the current directory: scaffold
@@ -120,11 +129,11 @@ async fn main() {
 
     let code = match cli.command {
         Command::Status { json, host, port } => status(json, host.as_deref(), port).await,
-        Command::Setup { host, port, uninstall } => {
+        Command::Setup { host, port, uninstall, dev_bench_repo } => {
             if uninstall {
                 setup::uninstall()
             } else {
-                setup::setup(host.as_deref(), port).await
+                setup::setup(host.as_deref(), port, dev_bench_repo.as_deref()).await
             }
         }
         Command::Init { uninstall } => init::init(uninstall),
