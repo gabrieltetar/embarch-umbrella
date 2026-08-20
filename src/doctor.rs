@@ -1,8 +1,8 @@
-//! `embarch doctor` — design.md §5's twelve checks, each pass/warn/fail plus
-//! a fix line for anything short of a pass. milestone-6.md §3.4.
+//! `embarch doctor` — design.md §5's thirteen checks, each pass/warn/fail
+//! plus a fix line for anything short of a pass. milestone-6.md §3.4.
 //!
 //! Ordered the same as design.md §5's table, and largely dependency-ordered
-//! too: checks 4/5/12 need check 3's winning candidate, checks 7-9 need
+//! too: checks 4/5/12/13 need check 3's winning candidate, checks 7-9 need
 //! check 6's config. When a prerequisite check didn't pass, the checks that
 //! depend on it report themselves `Warn`-skipped rather than re-deriving (or
 //! silently repeating) the same failure — the exit code still reflects the
@@ -729,6 +729,131 @@ async fn check_dev_bench(probe: &CoreProbe, authed: Option<&AuthedStatus>, confi
     }
 }
 
+// ---- check 13: stale dev-bench firmware ------------------------------------
+
+/// Where the local `embarch-dev-bench` checkout lives, for check 13's
+/// `git describe`. `EMBARCH_DEV_BENCH_REPO_PATH` overrides whatever `setup
+/// --dev-bench-repo` saved (`state.rs`'s `dev_bench_repo_path`, decision 19's
+/// "machine-level setup state" field) — same override-beats-saved-state
+/// convention `EMBARCH_CORE_EXE`/`EMBARCH_DEV_BENCH_PORT` already use
+/// elsewhere in this suite.
+/// Pure: `env_override` beats `saved.dev_bench_repo_path` — split out from
+/// [`dev_bench_repo_path`] so the precedence is testable without mutating
+/// real process env vars (same split `state.rs`'s `config_dir`/
+/// `config_dir_from` already uses).
+fn dev_bench_repo_path_from(env_override: Option<&str>, saved: &state::State) -> Option<PathBuf> {
+    env_override.map(PathBuf::from).or_else(|| saved.dev_bench_repo_path.clone())
+}
+
+fn dev_bench_repo_path(saved: &state::State) -> Option<PathBuf> {
+    dev_bench_repo_path_from(std::env::var("EMBARCH_DEV_BENCH_REPO_PATH").ok().as_deref(), saved)
+}
+
+/// `git describe --always --dirty --abbrev=8` against `repo_path` — the same
+/// invocation `embarch-dev-bench/app/CMakeLists.txt` runs at build time to
+/// produce `HelloAck.firmware_version`, so a matching value here means
+/// "this checkout, built and flashed as-is."
+fn git_describe(repo_path: &Path) -> Result<String, String> {
+    let output = Command::new("git")
+        .args(["describe", "--always", "--dirty", "--abbrev=8"])
+        .current_dir(repo_path)
+        .output()
+        .map_err(|e| format!("could not run git in {}: {e}", repo_path.display()))?;
+    if !output.status.success() {
+        return Err(format!(
+            "git describe failed in {}: {}",
+            repo_path.display(),
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// `embarch-dev-bench/design.md` §3 decision 25 /
+/// `embarch-umbrella/design.md` §3 decision 19: compares the currently
+/// flashed dev-bench's `HelloAck.firmware_version` (over `GET
+/// /dev-bench/hello`, `embarch-core/design.md`'s handshake-only endpoint —
+/// no `Study` involved) against `git describe` run against whichever local
+/// `embarch-dev-bench` checkout is configured. A mismatch means "you changed
+/// dev-bench firmware and haven't reflashed it," caught here instead of as a
+/// confusing mid-study failure.
+async fn check_firmware_version(
+    probe: &CoreProbe,
+    authed: Option<&AuthedStatus>,
+    config: Option<&Config>,
+    saved: &state::State,
+) -> Check {
+    const N: u8 = 13;
+    const NAME: &str = "dev-bench firmware matches the local checkout";
+
+    let Some(base_url) = &probe.winner_base_url else {
+        return check(N, NAME, Status::Warn, "skipped — Core isn't reachable (see check 3)");
+    };
+    if authed.is_none() {
+        return check(N, NAME, Status::Warn, "skipped — no authenticated status (see check 4)");
+    }
+    let Some(repo_path) = dev_bench_repo_path(saved) else {
+        return check(
+            N,
+            NAME,
+            Status::Warn,
+            "skipped — no embarch-dev-bench checkout configured",
+        );
+    };
+
+    let local_version = match git_describe(&repo_path) {
+        Ok(v) => v,
+        Err(e) => {
+            return with_fix(
+                check(N, NAME, Status::Warn, format!("could not compute local git describe: {e}")),
+                format!("confirm {} is a valid embarch-dev-bench git checkout", repo_path.display()),
+            );
+        }
+    };
+
+    let (token_cfg, token_env) = config
+        .map(|c| (c.core.token.clone(), c.core.token_env.clone()))
+        .unwrap_or((None, None));
+    let token = match crate::token::resolve_token(token_cfg, token_env) {
+        Ok(t) => t,
+        Err(_) => return check(N, NAME, Status::Warn, "skipped — could not resolve token"),
+    };
+
+    match authed_get(base_url, "/dev-bench/hello", &token).await {
+        Ok((200, body)) => {
+            let firmware_version = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("firmware_version").and_then(|s| s.as_str()).map(str::to_string));
+            match firmware_version {
+                Some(remote) if remote == local_version => {
+                    check(N, NAME, Status::Pass, format!("firmware_version '{remote}' matches {}", repo_path.display()))
+                }
+                Some(remote) => with_fix(
+                    check(
+                        N,
+                        NAME,
+                        Status::Fail,
+                        format!(
+                            "dev-bench reports firmware_version '{remote}', but {} is at '{local_version}'",
+                            repo_path.display()
+                        ),
+                    ),
+                    format!(
+                        "rebuild and reflash dev-bench from {}: `west build -b <board> app && west flash` \
+                         (or, for a board using embarch-core's native flashing support, `embarch-api flash`)",
+                        repo_path.display()
+                    ),
+                ),
+                None => check(N, NAME, Status::Warn, format!("unexpected /dev-bench/hello response: {body}")),
+            }
+        }
+        Ok((404, _)) => check(N, NAME, Status::Pass, "not plugged in (expected if you have no bench)"),
+        Ok((409, body)) => check(N, NAME, Status::Warn, format!("skipped — dev-bench is busy: {body}")),
+        Ok((status, body)) => check(N, NAME, Status::Warn, format!("HTTP {status}: {body}")),
+        Err(e) => check(N, NAME, Status::Warn, e),
+    }
+}
+
 // ---- driver ------------------------------------------------------------------
 
 pub async fn doctor(json: bool) -> i32 {
@@ -757,9 +882,11 @@ pub async fn doctor(json: bool) -> i32 {
     let check10 = check_mcp(config_path.as_deref(), api.as_ref());
     let check11 = check_schema_version();
     let check12 = check_dev_bench(&core_probe, authed.as_ref(), config.as_ref()).await;
+    let check13 = check_firmware_version(&core_probe, authed.as_ref(), config.as_ref(), &saved).await;
 
     let checks = vec![
         check1, check2, check3, check4, check5, check6, check7, check8, check9, check10, check11, check12,
+        check13,
     ];
 
     let any_fail = checks.iter().any(|c| c.status == Status::Fail);
@@ -805,6 +932,92 @@ fn render_json(checks: &[Check], any_fail: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    fn tempdir() -> TempDir {
+        let mut base = std::env::temp_dir();
+        base.push(format!(
+            "embarch-umbrella-doctor-test-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&base).unwrap();
+        TempDir(base)
+    }
+
+    fn git(dir: &Path, args: &[&str]) {
+        let status = Command::new("git").args(args).current_dir(dir).status().unwrap();
+        assert!(status.success(), "git {args:?} failed in {}", dir.display());
+    }
+
+    fn init_repo(dir: &Path) {
+        git(dir, &["init", "-q"]);
+        git(dir, &["config", "user.email", "test@example.com"]);
+        git(dir, &["config", "user.name", "test"]);
+        std::fs::write(dir.join("f.txt"), "1").unwrap();
+        git(dir, &["add", "f.txt"]);
+        git(dir, &["commit", "-q", "-m", "first"]);
+    }
+
+    #[test]
+    fn dev_bench_repo_path_env_override_beats_saved_state() {
+        let saved = state::State { dev_bench_repo_path: Some(PathBuf::from("/saved/path")), ..Default::default() };
+        assert_eq!(
+            dev_bench_repo_path_from(Some("/env/path"), &saved),
+            Some(PathBuf::from("/env/path"))
+        );
+    }
+
+    #[test]
+    fn dev_bench_repo_path_falls_back_to_saved_state_with_no_override() {
+        let saved = state::State { dev_bench_repo_path: Some(PathBuf::from("/saved/path")), ..Default::default() };
+        assert_eq!(dev_bench_repo_path_from(None, &saved), Some(PathBuf::from("/saved/path")));
+    }
+
+    #[test]
+    fn dev_bench_repo_path_is_none_when_neither_is_set() {
+        assert_eq!(dev_bench_repo_path_from(None, &state::State::default()), None);
+    }
+
+    #[test]
+    fn git_describe_matches_the_same_invocation_dev_bench_builds_with() {
+        let dir = tempdir();
+        init_repo(dir.path());
+        let described = git_describe(dir.path()).unwrap();
+        // No tag exists, so `--always` falls back to the abbreviated commit
+        // hash — exactly what embarch-dev-bench/app/CMakeLists.txt embeds as
+        // APP_FIRMWARE_VERSION for an untagged checkout.
+        assert!(!described.is_empty());
+        assert!(!described.contains("dirty"));
+    }
+
+    #[test]
+    fn git_describe_flags_an_uncommitted_change_as_dirty() {
+        let dir = tempdir();
+        init_repo(dir.path());
+        std::fs::write(dir.path().join("f.txt"), "2").unwrap();
+        let described = git_describe(dir.path()).unwrap();
+        assert!(described.ends_with("-dirty"));
+    }
+
+    #[test]
+    fn git_describe_errors_outside_a_git_checkout() {
+        let dir = tempdir();
+        assert!(git_describe(dir.path()).is_err());
+    }
 
     #[test]
     fn unc_round_trips_with_wsl_unc_path() {
