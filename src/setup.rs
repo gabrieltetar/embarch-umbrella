@@ -10,11 +10,12 @@ use std::process::Command;
 
 use anyhow::{Context, Result};
 
+use embarch_topology::software::TopologyClass;
+
+use crate::env;
 use crate::install;
 use crate::locate::{self, FoundBy, Located};
 use crate::state::{self, State};
-use crate::topology::{self, TopologyClass};
-use crate::{env, probe};
 
 /// Where `embarch-core` writes its machine-wide token file, as seen from
 /// here (embarch-token.md §3.1). Pure so the WSL2 translation is testable.
@@ -49,26 +50,17 @@ struct Plan {
 
 async fn make_plan(host: Option<&str>, port: u16) -> Plan {
     let under_wsl2 = env::under_wsl2();
-    let gateway = if under_wsl2 {
-        env::default_gateway()
-    } else {
-        None
-    };
     let saved = state::load();
     let core = locate::locate_core(saved.core_exe.as_deref(), under_wsl2);
 
-    // If Core is already up, it has already answered the question.
-    let candidates = topology::candidates(under_wsl2, gateway.as_deref(), host, port);
-    let client = reqwest::Client::new();
-    let client = &client;
-    let attempts = topology::resolve(&candidates, move |url| async move {
-        probe::probe_core(client, &url).await
-    })
-    .await;
+    // If Core is already up, it has already answered the question
+    // (embarch-topology/design.md decisions 2, 3: live, in-process, every
+    // call — no local mirrored topology.rs/env.rs/probe.rs any more).
+    let resolved = embarch_topology::software::resolve_software_topology(port, host, None).await;
 
-    if let Some(found) = topology::winner(&attempts) {
+    if let Some(found) = resolved.winner {
         return Plan {
-            class: found.candidate.class,
+            class: found.class,
             host: host.map(str::to_string).or(saved.host),
             core,
             already_running: true,
