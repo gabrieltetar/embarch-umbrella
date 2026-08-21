@@ -15,7 +15,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 
 fn default_core_port() -> u16 {
-    crate::topology::DEFAULT_CORE_PORT
+    embarch_topology::software::DEFAULT_CORE_PORT
 }
 
 #[derive(Debug, Deserialize)]

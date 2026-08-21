@@ -11,12 +11,13 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use embarch_topology::software::{self as topology, ProbeOutcome, TopologyClass};
+
 use crate::config::{self, Config, ProjectConfig};
+use crate::env;
 use crate::locate::{self, Located};
 use crate::setup;
 use crate::state;
-use crate::topology::{self, ProbeOutcome, TopologyClass};
-use crate::{env, probe};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Status {
@@ -80,45 +81,27 @@ struct CoreProbe {
 /// discovery. Every real config in the suite uses `"auto"` today, but
 /// `doctor` diagnosing a Core other than the one a declared `base_url`
 /// actually names would be worse than the extra branch this avoids.
-fn declared_candidate(config: Option<&Config>) -> Option<topology::Candidate> {
+fn declared_base_url(config: Option<&Config>) -> Option<&str> {
     let core = &config?.core;
     if core.is_auto() {
         return None;
     }
-    let base_url = core.base_url.trim_end_matches('/').to_string();
-    let class = if base_url.contains("127.0.0.1") || base_url.contains("localhost") {
-        TopologyClass::Local
-    } else {
-        TopologyClass::Remote
-    };
-    Some(topology::Candidate { class, base_url })
-}
-
-async fn resolve_candidates(candidates: &[topology::Candidate]) -> CoreProbe {
-    let client = reqwest::Client::new();
-    let client = &client;
-    let attempts = topology::resolve(candidates, move |url| async move {
-        probe::probe_core(client, &url).await
-    })
-    .await;
-
-    let winner = topology::winner(&attempts);
-    CoreProbe {
-        winner_base_url: winner.map(|a| a.candidate.base_url.clone()),
-        winner_class: winner.map(|a| a.candidate.class),
-        attempts,
-    }
+    Some(core.base_url.trim_end_matches('/'))
 }
 
 async fn probe_topology(config: Option<&Config>, host: Option<&str>, port: u16) -> CoreProbe {
-    if let Some(declared) = declared_candidate(config) {
-        return resolve_candidates(std::slice::from_ref(&declared)).await;
+    // embarch-topology/design.md decisions 2, 3: live, in-process, every
+    // call — `doctor` still wants a probe result even for a declared
+    // `base_url` (unlike embarch-api's `core_client.rs`, which trusts a
+    // declared address outright), so this always passes through the crate's
+    // one probing implementation rather than short-circuiting locally.
+    let resolved =
+        topology::resolve_software_topology(port, host, declared_base_url(config)).await;
+    CoreProbe {
+        winner_base_url: resolved.winner.as_ref().map(|c| c.base_url.clone()),
+        winner_class: resolved.winner.as_ref().map(|c| c.class),
+        attempts: resolved.attempts,
     }
-
-    let under_wsl2 = env::under_wsl2();
-    let gateway = if under_wsl2 { env::default_gateway() } else { None };
-    let candidates = topology::candidates(under_wsl2, gateway.as_deref(), host, port);
-    resolve_candidates(&candidates).await
 }
 
 fn attempts_detail(attempts: &[topology::Attempt]) -> String {
@@ -295,6 +278,13 @@ fn check_reachable(probe: &CoreProbe) -> Check {
 
 // ---- check 4: token resolves and matches -----------------------------------
 
+/// This check's own per-request budget — coincidentally the same value
+/// `embarch-topology`'s candidate-probing uses internally, but a separate
+/// constant: this is an *authenticated* request to an already-resolved
+/// `base_url`, not a topology candidate probe, so it has no reason to share
+/// that crate-internal value even if the number happens to match today.
+const AUTHED_GET_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
 struct AuthedStatus {
     probes: Vec<serde_json::Value>,
 }
@@ -305,7 +295,7 @@ async fn authed_get(base_url: &str, path: &str, token: &str) -> Result<(u16, Str
     let response = client
         .get(&url)
         .bearer_auth(token)
-        .timeout(probe::PROBE_TIMEOUT)
+        .timeout(AUTHED_GET_TIMEOUT)
         .send()
         .await
         .map_err(|e| format!("request to {url} failed: {e}"))?;
