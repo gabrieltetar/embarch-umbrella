@@ -14,18 +14,16 @@ mod init;
 mod install;
 mod locate;
 mod manifest;
-mod probe;
 mod setup;
 mod state;
 mod token;
-mod topology;
 mod zephyr;
 
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
-use topology::{winner, Attempt, ProbeOutcome, DEFAULT_CORE_PORT};
+use embarch_topology::software::{winner, Attempt, ProbeOutcome, DEFAULT_CORE_PORT};
 
 /// Exit codes follow embarch-api's CLI convention (embarch-api/design.md §5a):
 /// 0 success, 1 any operation failure, 2 (clap's own) malformed invocation.
@@ -147,30 +145,18 @@ async fn main() {
 
 /// Find Core and report where it is. Returns the process exit code.
 async fn status(json: bool, host: Option<&str>, port: u16) -> i32 {
-    let under_wsl2 = env::under_wsl2();
-    let gateway = if under_wsl2 {
-        env::default_gateway()
-    } else {
-        None
-    };
-
-    let candidates = topology::candidates(under_wsl2, gateway.as_deref(), host, port);
-    let client = reqwest::Client::new();
-    // The async block owns its `url` and borrows the client (a shared
-    // reference is Copy, so the closure stays `Fn` across candidates).
-    let client = &client;
-    let attempts = topology::resolve(&candidates, move |url| async move {
-        probe::probe_core(client, &url).await
-    })
-    .await;
+    // embarch-topology/design.md decisions 2, 3: live, in-process, every
+    // call — this crate no longer owns any of the WSL2/gateway/probe I/O
+    // itself (formerly this file's own use of `env.rs`/`probe.rs`/`topology.rs`).
+    let resolved = embarch_topology::software::resolve_software_topology(port, host, None).await;
 
     if json {
-        println!("{}", status_json(&attempts));
+        println!("{}", status_json(&resolved.attempts));
     } else {
-        print_status(&attempts);
+        print_status(&resolved.attempts);
     }
 
-    if winner(&attempts).is_some() {
+    if resolved.winner.is_some() {
         0
     } else {
         EXIT_FAILURE
