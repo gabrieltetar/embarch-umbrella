@@ -159,6 +159,17 @@ pub async fn setup(host: Option<&str>, port: u16, dev_bench_repo: Option<&std::p
         None => println!("embarch-core: not found"),
     }
 
+    // embarch-core/design.md §3 decision 6's amendment: Core's own default
+    // is loopback-only; widening it for the one topology that actually needs
+    // a wider address is this call's job, not something a human has to
+    // remember to type. Computed once and baked into every `install`
+    // invocation below, whether run directly or printed for a human to paste
+    // into an elevated shell — an installed service's `--bind` is part of
+    // its registered start command (`embarch-core install`'s own doc
+    // comment), so this only has to happen at install time, not on every
+    // subsequent start.
+    let bind_addr = embarch_topology::software::recommended_bind_address(plan.class);
+
     if plan.already_running {
         println!("embarch-core is already running — nothing to install.");
     } else {
@@ -166,7 +177,7 @@ pub async fn setup(host: Option<&str>, port: u16, dev_bench_repo: Option<&std::p
             (TopologyClass::Remote, _) => {
                 println!(
                     "\nCore is on another machine. Start it there yourself:\n  \
-                     embarch-core install    (elevated, on that machine)\n\
+                     embarch-core install --bind {bind_addr}    (elevated, on that machine)\n\
                      Then copy its token file's contents to this machine:\n  \
                      export EMBARCH_TOKEN=<contents of /var/lib/embarch/token on that machine>"
                 );
@@ -177,20 +188,20 @@ pub async fn setup(host: Option<&str>, port: u16, dev_bench_repo: Option<&std::p
                 // to obtain one (design.md §3 decision 7).
                 println!(
                     "\nCore belongs on the Windows side. In an **elevated Windows** shell, run:\n  \
-                     \"{}\" install",
+                     \"{}\" install --bind {bind_addr}",
                     windows_display_path(&c.path)
                 );
             }
             (TopologyClass::Local, Some(c)) => {
                 println!("\nInstalling embarch-core as a service that starts at boot...");
-                match run(&c.path, &["install"]) {
+                match run(&c.path, &["install", "--bind", bind_addr]) {
                     Ok(true) => println!("Installed and started."),
                     // Almost always a privilege failure. Trying first is
                     // still right: someone who ran `sudo embarch setup` gets
                     // it done in one step.
                     Ok(false) | Err(_) => println!(
                         "Could not install the service — this needs elevation. Run:\n  \
-                         sudo \"{}\" install",
+                         sudo \"{}\" install --bind {bind_addr}",
                         c.path.display()
                     ),
                 }
