@@ -8,6 +8,7 @@
 //! (release CI) and §3.8 (dogfooding the guide) are what remains.
 
 mod config;
+mod deploy;
 mod doctor;
 mod env;
 mod init;
@@ -115,6 +116,48 @@ enum Command {
 
     /// Fallback: stop the running Core service, leaving it installed.
     Down,
+
+    /// Get a local `embarch-core` change onto the live Windows service:
+    /// sync, build natively, stop/copy/start under one elevation, verify.
+    ///
+    /// Replaces the hand-assembled procedure in
+    /// `embarch-doc/embarch-dev-workflow.md` §4a — which that section itself
+    /// calls "the single most-repeated undocumented step in the suite".
+    DeployCore {
+        /// Parent of the Linux-side checkouts. Defaults to saved state, then
+        /// to the parent of the checkout you are standing in.
+        #[arg(long)]
+        source_root: Option<PathBuf>,
+
+        /// Parent of the Windows-side source copies (a `/mnt/...` path).
+        /// Never guessed — required on the first run, remembered after.
+        #[arg(long)]
+        windows_root: Option<PathBuf>,
+
+        /// Windows `cargo.exe` (a `/mnt/...` path). Defaults to
+        /// `%USERPROFILE%\.cargo\bin\cargo.exe`.
+        #[arg(long)]
+        cargo: Option<PathBuf>,
+
+        /// The exe to replace. Defaults to the service's own
+        /// `BINARY_PATH_NAME`, which is the authoritative answer.
+        #[arg(long)]
+        install_target: Option<PathBuf>,
+
+        /// Windows service to restart.
+        #[arg(long)]
+        service: Option<String>,
+
+        /// Print the resolved plan and stop, touching nothing.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Do everything unelevated, write the elevated script, and print
+        /// the one command to run it — design.md §3 decision 7's posture,
+        /// for when you would rather run the privileged half yourself.
+        #[arg(long)]
+        print_script: bool,
+    },
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -138,6 +181,26 @@ async fn main() {
         Command::Doctor { json } => doctor::doctor(json).await,
         Command::Up { foreground } => setup::up(foreground),
         Command::Down => setup::down(),
+        Command::DeployCore {
+            source_root,
+            windows_root,
+            cargo,
+            install_target,
+            service,
+            dry_run,
+            print_script,
+        } => {
+            deploy::deploy_core(
+                source_root,
+                windows_root,
+                cargo,
+                install_target,
+                service,
+                dry_run,
+                print_script,
+            )
+            .await
+        }
     };
 
     std::process::exit(code);

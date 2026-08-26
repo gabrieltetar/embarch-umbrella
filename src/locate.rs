@@ -268,6 +268,58 @@ pub fn windows_core_service_state() -> Option<WindowsServiceState> {
     None
 }
 
+/// The **service's own** `BINARY_PATH_NAME`, as seen from a WSL2 guest —
+/// which is the only authoritative answer to "which `embarch-core.exe` does
+/// this machine actually run".
+///
+/// `locate_core` deliberately guesses (decision 28's canonical location, then
+/// a short conventional list) because its job is to find *an* exe to invoke.
+/// Deploying is the opposite problem: replacing the wrong copy is worse than
+/// finding none, and on this bench the live service runs out of a
+/// release-archive directory that appears on no conventional list at all
+/// (`embarch-dev-workflow.md` §4a). `sc.exe qc` is read-only, so a wrong
+/// answer costs a check rather than a botched deploy.
+///
+/// `None` for every failure alike — no `sc.exe`, no such service, or output
+/// this cannot parse.
+#[cfg(unix)]
+pub fn windows_core_service_binary_path() -> Option<PathBuf> {
+    let output = std::process::Command::new("sc.exe")
+        .args(["qc", WINDOWS_CORE_SERVICE_LABEL])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let win_path = parse_sc_qc_binary_path(&String::from_utf8_lossy(&output.stdout))?;
+    translate_windows_path_to_wsl(&win_path)
+}
+
+#[cfg(not(unix))]
+pub fn windows_core_service_binary_path() -> Option<PathBuf> {
+    None
+}
+
+/// Pulls the executable out of `sc.exe qc`'s `BINARY_PATH_NAME` line.
+///
+/// Two things make this less trivial than a `split(':')`. The value is a
+/// *command line*, not a path — this bench's is
+/// `C:\...\embarch-core.exe run --bind 0.0.0.0` — and it contains a drive
+/// letter's own colon, so the field is split off by name rather than at the
+/// first colon in the line. The path is then cut at `.exe` rather than at
+/// whitespace, because on any machine where Core lives under `Program Files`
+/// a whitespace split truncates it mid-path and names a directory instead of
+/// a binary. Quotes are stripped, since `sc.exe` quotes when the installer
+/// did.
+fn parse_sc_qc_binary_path(stdout: &str) -> Option<String> {
+    const FIELD: &str = "BINARY_PATH_NAME";
+    let line = stdout.lines().find(|l| l.contains(FIELD))?;
+    let after_field = &line[line.find(FIELD)? + FIELD.len()..];
+    let value = after_field.trim_start().trim_start_matches(':').trim().trim_start_matches('"');
+    let end = value.to_ascii_lowercase().find(".exe")? + ".exe".len();
+    Some(value[..end].to_string())
+}
+
 /// Parses `sc.exe query`'s output. Split out from the shell-out so the
 /// parsing is testable without Windows interop — the same split
 /// `token.rs`/`zephyr.rs` already make for their own shell-outs.
@@ -299,6 +351,48 @@ pub fn is_windows_path(p: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+
+    /// Verbatim from the real `sc.exe qc com.embarch.core` on this bench —
+    /// not hand-typed from the docs, which is the whole reason
+    /// `parse_sc_query`'s own fixture is a real capture too.
+    ///
+    /// Three things this pins at once: the value is a *command line* (`run
+    /// --bind 0.0.0.0` follows the exe), it contains a drive letter's colon
+    /// after the field's own colon, and the exe path here appears on no
+    /// conventional install list — which is exactly why `deploy-core` reads
+    /// the service's registration instead of guessing (design.md §3 decision
+    /// 37).
+    #[test]
+    fn the_services_own_binary_path_is_parsed_out_of_a_command_line() {
+        let real = "[SC] QueryServiceConfig SUCCESS\n\n\
+             SERVICE_NAME: com.embarch.core\n        \
+             TYPE               : 10  WIN32_OWN_PROCESS \n        \
+             START_TYPE         : 2   AUTO_START\n        \
+             BINARY_PATH_NAME   : C:\\Users\\tmp12\\embarch-setup\\embarch-0.1.0-x86_64-pc-windows-msvc\\embarch-core.exe run --bind 0.0.0.0\n        \
+             DISPLAY_NAME       : com.embarch.core\n";
+        assert_eq!(
+            parse_sc_qc_binary_path(real).as_deref(),
+            Some(
+                r"C:\Users\tmp12\embarch-setup\embarch-0.1.0-x86_64-pc-windows-msvc\embarch-core.exe"
+            )
+        );
+    }
+
+    /// A path with a space in it — the case a whitespace split would
+    /// truncate mid-path, naming `C:\Program` instead of a binary.
+    #[test]
+    fn a_quoted_path_with_spaces_survives() {
+        let line = "        BINARY_PATH_NAME   : \"C:\\Program Files\\embarch\\embarch-core.exe\" run\n";
+        assert_eq!(
+            parse_sc_qc_binary_path(line).as_deref(),
+            Some(r"C:\Program Files\embarch\embarch-core.exe")
+        );
+    }
+
+    #[test]
+    fn a_config_dump_without_the_field_is_none() {
+        assert_eq!(parse_sc_qc_binary_path("SERVICE_NAME: x\n"), None);
+    }
     use super::*;
 
     #[test]

@@ -246,6 +246,13 @@ pub async fn setup(host: Option<&str>, port: u16, dev_bench_repo: Option<&std::p
             .filter(|c| c.windows_exe_from_wsl2)
             .map(|c| c.path.clone()),
         dev_bench_repo_path,
+        // `setup` is about the topology; `deploy-core`'s own paths are its
+        // own (design.md §3 decision 37), and it saves them itself. Carried
+        // through rather than defaulted so a `setup` re-run doesn't wipe
+        // what a deploy remembered.
+        deploy_source_root: previously_saved.deploy_source_root,
+        deploy_windows_root: previously_saved.deploy_windows_root,
+        deploy_cargo_exe: previously_saved.deploy_cargo_exe,
     };
     match state::save(&saved) {
         Ok(()) => {

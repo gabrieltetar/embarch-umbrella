@@ -39,6 +39,24 @@ pub struct State {
     /// live anywhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dev_bench_repo_path: Option<PathBuf>,
+    /// The three paths `deploy-core` cannot rediscover (design.md §3
+    /// decision 37), remembered **only after a deploy that actually
+    /// landed** — so a wrong `--windows-root` isn't persisted for the next
+    /// run to inherit.
+    ///
+    /// Same rule as `dev_bench_repo_path` above and the same reason: a
+    /// checkout, a source copy, and a `cargo.exe` outside the WSL `PATH` can
+    /// each live anywhere, and probing for them would find a stale tree as
+    /// often as the right one. Note what is deliberately *not* here: the
+    /// install target. The service's own `BINARY_PATH_NAME` is authoritative
+    /// and free to read, so caching it could only go stale against the thing
+    /// it describes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy_source_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy_windows_root: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy_cargo_exe: Option<PathBuf>,
 }
 
 /// Resolve the config directory from environment values.
@@ -152,6 +170,11 @@ mod tests {
             host: None,
             core_exe: Some(PathBuf::from("/mnt/c/embarch/embarch-core.exe")),
             dev_bench_repo_path: None,
+            // One of `deploy-core`'s three paths set and two not, so this
+            // test also covers the skip_serializing_if on the new fields.
+            deploy_source_root: Some(PathBuf::from("/home/me/Github/embarch")),
+            deploy_windows_root: None,
+            deploy_cargo_exe: None,
         };
         let text = toml::to_string_pretty(&state).unwrap();
         // Match the key, not the substring — `topology = "wsl-host"` contains
