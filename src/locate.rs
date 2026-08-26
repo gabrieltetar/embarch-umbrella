@@ -216,6 +216,81 @@ pub fn locate_core(saved: Option<&Path>, under_wsl2: bool) -> Option<Located> {
     None
 }
 
+/// `embarch-core`'s own Windows service label (its `service.rs`'s
+/// `SERVICE_LABEL`). Duplicated rather than imported: umbrella depends on
+/// none of the three binaries it orchestrates, by design (design.md §1) —
+/// it shells out. Verified against the real installed service on this
+/// bench, not read off the source: `sc.exe query com.embarch.core` returns
+/// `SERVICE_NAME: com.embarch.core`.
+pub const WINDOWS_CORE_SERVICE_LABEL: &str = "com.embarch.core";
+
+/// What a read-only probe found on the Windows side (design.md §3 decision
+/// 30). Absence — no service at all — is `None` from the probe, not a
+/// variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowsServiceState {
+    Running,
+    /// Installed, but not currently running — still the Core this machine
+    /// means, just stopped. `up`'s job is to say how to start *it*, not to
+    /// start a different one.
+    Installed,
+}
+
+/// Is `embarch-core` installed as a Windows service, as seen from a WSL2
+/// guest (design.md §3 decision 30)?
+///
+/// **Read-only, and that is the safety argument.** `sc.exe query` changes
+/// nothing, so a wrong answer here costs a check rather than a botched
+/// start — which is why this is allowed to be a probe at all instead of a
+/// prompt or a required flag.
+///
+/// `None` for every failure mode alike — no `sc.exe` (not under WSL2, or no
+/// Windows interop), a service that does not exist (`sc.exe` exits 1060), or
+/// output this cannot parse. All three mean the same thing to the caller:
+/// no Windows service to defer to, carry on with the existing behaviour.
+#[cfg(unix)]
+pub fn windows_core_service_state() -> Option<WindowsServiceState> {
+    let output = std::process::Command::new("sc.exe")
+        .args(["query", WINDOWS_CORE_SERVICE_LABEL])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_sc_query(&String::from_utf8_lossy(&output.stdout))
+}
+
+#[cfg(not(unix))]
+pub fn windows_core_service_state() -> Option<WindowsServiceState> {
+    // This probe exists to resolve a WSL2-guest ambiguity (design.md §3
+    // decision 30). A native Windows `embarch` can control the service
+    // directly and has no ambiguity to resolve.
+    None
+}
+
+/// Parses `sc.exe query`'s output. Split out from the shell-out so the
+/// parsing is testable without Windows interop — the same split
+/// `token.rs`/`zephyr.rs` already make for their own shell-outs.
+///
+/// Anchored on `SERVICE_NAME:` being present, because `sc.exe` prints its
+/// "does not exist" message on *stdout* while still sometimes exiting
+/// non-zero; requiring the header means a failure message can never be read
+/// as a running service.
+fn parse_sc_query(stdout: &str) -> Option<WindowsServiceState> {
+    if !stdout.contains("SERVICE_NAME:") {
+        return None;
+    }
+    let state_line = stdout.lines().find(|l| l.trim_start().starts_with("STATE"))?;
+    // `STATE : 4  RUNNING` / `STATE : 1  STOPPED` — matched on the word,
+    // not the numeric code, since the words are what `sc.exe` guarantees to
+    // print and the spacing varies.
+    Some(if state_line.contains("RUNNING") {
+        WindowsServiceState::Running
+    } else {
+        WindowsServiceState::Installed
+    })
+}
+
 /// Is this a path into a Windows filesystem as mounted by WSL2?
 pub fn is_windows_path(p: &Path) -> bool {
     let s = p.to_string_lossy();
@@ -258,6 +333,34 @@ mod tests {
         let paths = windows_conventional_core_paths();
         assert!(!paths.is_empty());
         assert!(paths.iter().all(|p| is_windows_path(p)));
+    }
+
+    #[test]
+    fn sc_query_output_for_a_running_service_is_read_as_running() {
+        // Verbatim from the real `sc.exe query com.embarch.core` on this
+        // bench, so the parser is pinned to output that actually occurred
+        // rather than output imagined for it.
+        let stdout = "\nSERVICE_NAME: com.embarch.core \n        TYPE               : 10  WIN32_OWN_PROCESS  \n        STATE              : 4  RUNNING \n                                (STOPPABLE, NOT_PAUSABLE, IGNORES_SHUTDOWN)\n        WIN32_EXIT_CODE    : 0  (0x0)\n";
+        assert_eq!(parse_sc_query(stdout), Some(WindowsServiceState::Running));
+    }
+
+    #[test]
+    fn a_stopped_service_is_installed_not_absent() {
+        let stdout = "\nSERVICE_NAME: com.embarch.core \n        TYPE               : 10  WIN32_OWN_PROCESS  \n        STATE              : 1  STOPPED \n";
+        assert_eq!(parse_sc_query(stdout), Some(WindowsServiceState::Installed));
+    }
+
+    #[test]
+    fn the_service_does_not_exist_message_is_never_read_as_a_service() {
+        // `sc.exe` prints this on stdout; without the SERVICE_NAME anchor a
+        // looser parse could find no STATE line and still have to decide.
+        let stdout = "[SC] EnumQueryServicesStatus:OpenService FAILED 1060:\n\nThe specified service does not exist as an installed service.\n";
+        assert_eq!(parse_sc_query(stdout), None);
+    }
+
+    #[test]
+    fn output_with_no_state_line_at_all_is_none_rather_than_a_guess() {
+        assert_eq!(parse_sc_query("SERVICE_NAME: com.embarch.core\n"), None);
     }
 
     #[test]

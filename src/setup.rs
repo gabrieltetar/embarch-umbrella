@@ -328,6 +328,69 @@ pub fn windows_display_path(p: &std::path::Path) -> String {
     s.to_string()
 }
 
+/// Decision 30's probe, plus the message it produces. Under WSL2 with
+/// mirrored networking, a Windows-hosted Core and a guest-hosted Core both
+/// answer at loopback, so `local` does not say *where* Core is — and
+/// `up`/`down` have to know before deciding whether they can act or must
+/// hand over to an elevated Windows shell. The probe resolves it in favour
+/// of the thing that is actually installed.
+///
+/// `Some(message)` means: defer to the Windows service, print this, do not
+/// touch the guest-side path. `None` means no Windows service was found —
+/// behave exactly as before this existed.
+fn defer_to_windows_service(under_wsl2: bool, saved: &State, verb: &str) -> Option<Deferral> {
+    if !under_wsl2 {
+        return None;
+    }
+    let state = locate::windows_core_service_state()?;
+    let label = locate::WINDOWS_CORE_SERVICE_LABEL;
+
+    // Already in the state being asked for: say so and stop. Printing how to
+    // start an already-running service is the kind of message that trains
+    // people to stop reading them.
+    let already = match (verb, state) {
+        ("start", locate::WindowsServiceState::Running) => Some("running"),
+        ("stop", locate::WindowsServiceState::Installed) => Some("stopped"),
+        _ => None,
+    };
+    if let Some(already) = already {
+        return Some(Deferral {
+            message: format!(
+                "embarch-core is installed as a Windows service ({label}) and already {already} \
+                 — that is the Core this machine uses. Nothing to do."
+            ),
+            satisfied: true,
+        });
+    }
+
+    // Name the real exe if it can be found, since that is what the operator
+    // has to type; fall back to the service label, which is always true even
+    // when the binary isn't locatable from here.
+    let how = match locate::locate_core(saved.core_exe.as_deref(), under_wsl2) {
+        Some(core) if core.windows_exe_from_wsl2 => {
+            format!("  \"{}\" {verb}", windows_display_path(&core.path))
+        }
+        _ => format!("  sc.exe {verb} {label}"),
+    };
+
+    Some(Deferral {
+        message: format!(
+            "embarch-core is installed as a Windows service ({label}) — that is the Core this \
+             machine uses, so nothing here touches a guest-side one.\nTo {verb} it, in an \
+             **elevated Windows** shell:\n{how}"
+        ),
+        satisfied: false,
+    })
+}
+
+/// What [`defer_to_windows_service`] found: a message to print, and whether
+/// the request is already satisfied (so `up`/`down` exit `0` rather than
+/// reporting a failure they didn't have).
+struct Deferral {
+    message: String,
+    satisfied: bool,
+}
+
 /// A Core on another machine can't be controlled from here — umbrella does
 /// no remote orchestration at all, by design (design.md §3 decision 8). Say
 /// so plainly rather than shelling out to a local binary that would start a
@@ -358,6 +421,28 @@ pub fn up(foreground: bool) -> i32 {
     if let Some(msg) = refuse_if_remote(&saved, "start") {
         println!("{msg}");
         return 1;
+    }
+
+    // Decision 30, and it has to come before `locate_core`: on a machine
+    // where `setup` also installed a guest-side `embarch-core` on `PATH`,
+    // resolution would find *that* first and start the wrong Core.
+    //
+    // `--foreground` is deliberately exempt. The probe settles an ambiguity
+    // about which Core `up` should drive; `--foreground` is not a request to
+    // drive a service at all, it is "run Core in this terminal," which is a
+    // third thing and an explicit one. It warns and proceeds — the same
+    // explicit-wins posture `EMBARCH_CORE_EXE` already has.
+    match defer_to_windows_service(under_wsl2, &saved, "start") {
+        Some(deferral) if !foreground => {
+            println!("{}", deferral.message);
+            return if deferral.satisfied { 0 } else { 1 };
+        }
+        Some(_) => eprintln!(
+            "Warning: embarch-core is installed as a Windows service ({}) on this machine. \
+             Running one in the foreground here starts a second, separate Core.",
+            locate::WINDOWS_CORE_SERVICE_LABEL
+        ),
+        None => {}
     }
 
     let Some(core) = locate::locate_core(saved.core_exe.as_deref(), under_wsl2) else {
@@ -411,6 +496,16 @@ pub fn down() -> i32 {
     if let Some(msg) = refuse_if_remote(&saved, "stop") {
         println!("{msg}");
         return 1;
+    }
+
+    // Decision 30 names `up`; applying it to `down` too is an extension
+    // beyond its text, taken deliberately. The ambiguity is identical, and
+    // the asymmetry would be the dangerous half: `up` starting the wrong
+    // Core fails on a port bind, `down` stopping the wrong one succeeds
+    // quietly and leaves the real Core running.
+    if let Some(deferral) = defer_to_windows_service(under_wsl2, &saved, "stop") {
+        println!("{}", deferral.message);
+        return if deferral.satisfied { 0 } else { 1 };
     }
 
     let Some(core) = locate::locate_core(saved.core_exe.as_deref(), under_wsl2) else {
