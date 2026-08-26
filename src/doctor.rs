@@ -873,10 +873,11 @@ pub async fn doctor(json: bool) -> i32 {
     let check11 = check_schema_version();
     let check12 = check_dev_bench(&core_probe, authed.as_ref(), config.as_ref()).await;
     let check13 = check_firmware_version(&core_probe, authed.as_ref(), config.as_ref(), &saved).await;
+    let check14 = check_flash_backend(core.as_ref());
 
     let checks = vec![
         check1, check2, check3, check4, check5, check6, check7, check8, check9, check10, check11, check12,
-        check13,
+        check13, check14,
     ];
 
     let any_fail = checks.iter().any(|c| c.status == Status::Fail);
@@ -892,6 +893,97 @@ pub async fn doctor(json: bool) -> i32 {
     } else {
         0
     }
+}
+
+// ---- check 14: the flashing backend each chip family resolves to ------------
+
+/// Asks the located `embarch-core` which program it would flash with
+/// ([embarch-core/design.md](../embarch-core/design.md) §3 decision 36).
+///
+/// **Why this is a `doctor` check and not left to the moment of a flash.**
+/// Core refuses to flash an nRF54L part with probe-rs — that family stores
+/// code in RRAM, which probe-rs does not model — so it needs a vendor tool
+/// (`nrfutil`, `jlink`, `nrfjprog`) that cannot be bundled for licensing
+/// reasons and therefore might simply be absent. Discovering that at the
+/// moment someone flashes is the worst time; discovering it in `doctor` is
+/// the point of `doctor`.
+///
+/// **It deliberately runs the *located* core binary rather than reasoning
+/// here**, which on this suite's own bench means running a Windows `.exe`
+/// from WSL2. That is the correct answer rather than an accident: the tool has
+/// to exist on the machine running Core, not the machine running `doctor`, and
+/// invoking Core's own binary is the only thing that answers the question
+/// about the right machine. A second implementation of the search here would
+/// be a mirror that drifts — the same mistake `doctor`'s check 8 was
+/// refactored out of.
+fn check_flash_backend(core: Option<&Located>) -> Check {
+    const NAME: &str = "flashing backend available for every chip family";
+    let Some(core) = core else {
+        return check(14, NAME, Status::Warn, "skipped — embarch-core not located (see check 1)");
+    };
+
+    let output = match Command::new(&core.path).arg("flash-backend").output() {
+        Ok(o) => o,
+        Err(e) => {
+            return check(
+                14,
+                NAME,
+                Status::Warn,
+                format!("couldn't run `{} flash-backend`: {e}", core.path.display()),
+            )
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut rows: Vec<(String, String)> = Vec::new();
+    let mut unavailable: Vec<String> = Vec::new();
+    for line in stdout.lines() {
+        let mut parts = line.split('\t');
+        let (Some(chip), Some(backend)) = (parts.next(), parts.next()) else { continue };
+        if backend == "UNAVAILABLE" {
+            unavailable.push(chip.to_string());
+        } else {
+            rows.push((chip.to_string(), backend.to_string()));
+        }
+    }
+
+    if rows.is_empty() && unavailable.is_empty() {
+        // An older Core predating the subcommand answers with a clap error.
+        return check(
+            14,
+            NAME,
+            Status::Warn,
+            "this embarch-core has no `flash-backend` subcommand — it predates §3 decision 36 and \
+             will flash every target with probe-rs, including Nordic RRAM parts",
+        );
+    }
+
+    let summary = rows
+        .iter()
+        .map(|(c, b)| format!("{c}={b}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+
+    if unavailable.is_empty() {
+        return check(14, NAME, Status::Pass, summary);
+    }
+
+    with_fix(
+        check(
+            14,
+            NAME,
+            Status::Fail,
+            format!("no backend for {}{}{summary}", unavailable.join(", "), if summary.is_empty() { "" } else { " — resolved: " }),
+        ),
+        // Core's own error already names the tools, the URLs and the override
+        // variables; pointing at it beats paraphrasing it into a second place
+        // that can go stale.
+        format!(
+            "install a vendor flashing tool on the machine running embarch-core, then re-run. \
+             `{} flash-backend` prints exactly which tools it looked for and where.",
+            core.path.display()
+        ),
+    )
 }
 
 fn render_human(checks: &[Check]) {
