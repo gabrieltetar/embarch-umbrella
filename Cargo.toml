@@ -23,6 +23,13 @@ clap = { version = "4.6.2", features = ["derive"] }
 # probe-rs/serialport (see this file's own "deliberately absent" comment
 # below, which stays true with this dependency in place).
 embarch-topology = { path = "../embarch-topology" }
+# ../embarch-doc/embarch-umbrella/decisions/doctor.md 33: `doctor`'s check 11
+# needs a host-type schema version to compare Core's served one against, and
+# the only honest local source of one is this constant. Default features only
+# — the `std`/`gatt-extract`/`study-ui` halves are authoring-time tools this
+# crate never touches, so this stays a types-only dependency and pulls in no
+# hardware. Nothing else in this crate links a study type.
+embarch-study-designer = { path = "../embarch-study-designer" }
 # rustls rather than native-tls, matching embarch-api: no system OpenSSL
 # dependency, so this stays trivially buildable wherever Core happens to run.
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
