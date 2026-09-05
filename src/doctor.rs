@@ -2,7 +2,8 @@
 //! line for anything short of a pass.
 //!
 //! Ordered the same as spec.md's table, and largely dependency-ordered too:
-//! checks 4/5/11/12/13/15 need check 3's winning candidate, checks 7-9 need
+//! checks 4/5/11/12/13/15 need check 3's winning candidate, checks 11/14/15
+//! shell out to a binary check 1 located, and checks 7-9 need
 //! check 6's config. When a prerequisite check didn't pass, the checks that
 //! depend on it report themselves `Warn`-skipped rather than re-deriving (or
 //! silently repeating) the same failure — the exit code still reflects the
@@ -798,15 +799,31 @@ async fn fetch_dev_bench_hello(
 
 /// The numbers check 11 compares, each one either a value or the reason it
 /// isn't there. Split out from the check so the comparison can be tested with
-/// the numbers injected, without a live Core or a bench (decision 33).
+/// the numbers injected, without a live Core, a bench, or an `embarch-api` on
+/// disk (decisions 33, 35).
 struct SchemaVersions<'a> {
     /// `/status`'s `study_designer_schema_version`: the host-type constant
     /// **the deployed Core** was built against.
     core_host: Result<u32, &'a str>,
-    /// `HOST_TYPE_SCHEMA_VERSION` as compiled into **this** binary. Not
-    /// optional: it is a compile-time constant of the binary doing the
-    /// asking, so it is the one number that is always available.
-    local_host: u32,
+    /// `host_type_schema_version` off the **located `embarch-api`**'s
+    /// `--json versions` object (`embarch-api` decision 52) — the constant
+    /// compiled into the binary that actually submits studies, and therefore
+    /// the number this hop turns on.
+    ///
+    /// Fallible, and deliberately **not** defaulted to `umbrella_host` when it
+    /// cannot be obtained: "could not ask `embarch-api`" is a different
+    /// verdict from "they disagree", and a silent fallback would report a
+    /// clean pass on exactly the mixed install this check exists to catch
+    /// (decision 35).
+    api_host: Result<u32, String>,
+    /// `HOST_TYPE_SCHEMA_VERSION` as compiled into **this** binary. Always
+    /// available — it is a compile-time constant of the binary doing the
+    /// asking — but never the number the study hop turns on, because `embarch`
+    /// submits no studies. Kept as a fourth number because disagreeing with
+    /// `api_host` *is* a mixed install, and nothing else here notices one on a
+    /// hand-built machine with no suite manifest for check 1 to read
+    /// (decision 36).
+    umbrella_host: u32,
     /// `/dev-bench/hello`'s `schema_version`: the wire constant **the flashed
     /// bench** was built against, paired with Core's own `compatible` verdict
     /// on it.
@@ -821,10 +838,16 @@ const CHECK_11_NAME: &str = "study-designer schema versions agree";
 /// **What each comparison can actually prove**, and why they are not the same
 /// comparison twice:
 ///
-/// - `core_host` versus `local_host` is the `embarch-api` <-> `embarch-core`
+/// - `core_host` versus `api_host` is the `embarch-api` <-> `embarch-core`
 ///   hop, the one `embarch-api` itself refuses to submit a `Study` across
 ///   (`embarch-core-client`). A difference is a **fail**: the pair on this
-///   machine cannot run a study at all.
+///   machine cannot run a study at all. Both sides are now the real
+///   binaries' own numbers — Core's served one, and the located
+///   `embarch-api`'s compiled one (decision 35).
+/// - `api_host` versus `umbrella_host` is a **different question**: whether
+///   the two halves of this install came from one build. A difference blocks
+///   no study, because `embarch` never submits one, so it is a **warn** with
+///   the same reinstall fix check 1 gives (decision 36).
 /// - The bench's wire version is a **different sequence** —
 ///   `DEV_BENCH_WIRE_SCHEMA_VERSION` counts its own history and is only
 ///   guaranteed to be `<=` the host one, so it can never be compared against
@@ -848,16 +871,15 @@ fn judge_schema_versions(v: &SchemaVersions<'_>) -> Check {
         }
     }
 
-    match v.core_host {
-        Ok(core) => {
+    match (&v.core_host, &v.api_host) {
+        (Ok(core), Ok(api)) => {
             parts.push(format!(
-                "host type: Core serves v{core}, this embarch was built against v{}",
-                v.local_host
+                "host type: Core serves v{core}, the located embarch-api was built against v{api}"
             ));
-            if core != v.local_host {
+            if core != api {
                 degrade(Status::Fail, &mut worst);
                 fixes.push(
-                    "the deployed Core and this suite install were built against different \
+                    "the deployed Core and the located embarch-api were built against different \
                      embarch-study-designer host types — embarch-api will refuse to submit a study. \
                      Redeploy Core from this build (`embarch deploy-core`), or reinstall the suite \
                      archive that matches the deployed Core."
@@ -865,13 +887,56 @@ fn judge_schema_versions(v: &SchemaVersions<'_>) -> Check {
                 );
             }
         }
-        Err(why) => {
+        (Err(why), Ok(api)) => {
             parts.push(format!(
-                "host type: Core's version unavailable — {why}; this embarch was built against v{}",
-                v.local_host
+                "host type: Core's version unavailable — {why}; the located embarch-api was built \
+                 against v{api}"
             ));
             degrade(Status::Warn, &mut worst);
         }
+        (Ok(core), Err(why)) => {
+            parts.push(format!(
+                "host type: Core serves v{core}, but the located embarch-api could not be asked — \
+                 {why}"
+            ));
+            degrade(Status::Warn, &mut worst);
+        }
+        (Err(core_why), Err(api_why)) => {
+            parts.push(format!(
+                "host type: neither number is available — Core: {core_why}; embarch-api: {api_why}"
+            ));
+            degrade(Status::Warn, &mut worst);
+        }
+    }
+
+    // The fourth number, and the only one that is free: this binary's own
+    // compiled constant (decision 36). It settles nothing about running a
+    // study — `embarch` submits none — so it never fails the check; what it
+    // catches is `embarch` and `embarch-api` having come from two different
+    // builds, which on a machine with no suite manifest nothing else here
+    // would notice.
+    match &v.api_host {
+        Ok(api) if *api != v.umbrella_host => {
+            parts.push(format!(
+                "mixed install: this embarch was itself built against v{}, and it just located an \
+                 embarch-api built against v{api}",
+                v.umbrella_host
+            ));
+            degrade(Status::Warn, &mut worst);
+            fixes.push(
+                "embarch and embarch-api on this machine came from different builds. Reinstall \
+                 both from one suite archive (check 1 compares all three against its manifest, \
+                 where there is one). Nothing here blocks a study: embarch submits none, and it is \
+                 embarch-api's number above that the study hop turns on."
+                    .to_string(),
+            );
+        }
+        Ok(_) => parts.push(format!("this embarch agrees at v{}", v.umbrella_host)),
+        Err(_) => parts.push(format!(
+            "this embarch was itself built against v{} — context only, and not a stand-in for the \
+             number that could not be read",
+            v.umbrella_host
+        )),
     }
 
     match v.bench_wire {
@@ -912,7 +977,73 @@ fn judge_schema_versions(v: &SchemaVersions<'_>) -> Check {
     }
 }
 
-fn check_schema_versions(authed: Option<&AuthedStatus>, hello: &HelloOutcome) -> Check {
+/// Read `host_type_schema_version` out of what `embarch-api --json versions`
+/// printed, or say why there is no number in it.
+///
+/// Split from the spawn so every failure shape — an `embarch-api` too old to
+/// know the subcommand, one that printed something else, one that answered
+/// without the field — is testable with no binary on disk (decision 35).
+fn api_host_from_output(exit_code: Option<i32>, ok: bool, stdout: &str) -> Result<u32, String> {
+    if !ok {
+        // `versions` reads compiled constants and always exits 0
+        // (`embarch-api` decision 52), so a non-zero exit is not this surface
+        // answering. Clap exits 2 on a subcommand it does not know, which is
+        // precisely an embarch-api predating that decision — the same
+        // "warn naming what it predates" check 14 gives an older Core.
+        return Err(match exit_code {
+            Some(2) => "the located embarch-api has no `versions` subcommand (clap exited 2) — it \
+                        predates embarch-api decision 52"
+                .to_string(),
+            Some(code) => format!(
+                "`embarch-api --json versions` exited {code}, and it is a surface that always exits 0"
+            ),
+            None => "`embarch-api --json versions` was killed by a signal".to_string(),
+        });
+    }
+    let parsed = serde_json::from_str::<serde_json::Value>(stdout.trim())
+        .map_err(|e| format!("`embarch-api --json versions` printed no JSON object ({e})"))?;
+    parsed
+        .get("host_type_schema_version")
+        .and_then(|v| v.as_u64())
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| {
+            "`embarch-api --json versions` answered without a `host_type_schema_version`".to_string()
+        })
+}
+
+/// Ask the **located** `embarch-api` which `embarch-study-designer` host type
+/// schema version it compiled.
+///
+/// Same reasoning as check 14's shell-out: the number wanted is a fact about a
+/// *different binary*, and only that binary can state it. `versions` loads no
+/// config and contacts no Core precisely so it still answers on a machine
+/// whose config or Core is the thing being diagnosed (`embarch-api`
+/// decision 52).
+///
+/// **`--json` goes before the subcommand.** It is a flag on `embarch-api`'s
+/// top-level parser and is not `global`, so `embarch-api versions --json`
+/// exits 2 with `unexpected argument '--json' found` [verified 2026-09-04
+/// against a local build] — which this function would then report as an
+/// embarch-api too old to know the subcommand.
+fn api_host_schema_version(api: Option<&Located>) -> Result<u32, String> {
+    let Some(api) = api else {
+        return Err("embarch-api not located (see check 1)".to_string());
+    };
+    match Command::new(&api.path).args(["--json", "versions"]).output() {
+        Ok(o) => api_host_from_output(
+            o.status.code(),
+            o.status.success(),
+            &String::from_utf8_lossy(&o.stdout),
+        ),
+        Err(e) => Err(format!("couldn't run `{} --json versions`: {e}", api.path.display())),
+    }
+}
+
+fn check_schema_versions(
+    authed: Option<&AuthedStatus>,
+    hello: &HelloOutcome,
+    api: Option<&Located>,
+) -> Check {
     let core_host = match authed {
         None => Err("no authenticated /status (see checks 3 and 4)"),
         Some(a) => a.study_designer_schema_version.ok_or(
@@ -932,7 +1063,8 @@ fn check_schema_versions(authed: Option<&AuthedStatus>, hello: &HelloOutcome) ->
 
     judge_schema_versions(&SchemaVersions {
         core_host,
-        local_host: embarch_study_designer::HOST_TYPE_SCHEMA_VERSION,
+        api_host: api_host_schema_version(api),
+        umbrella_host: embarch_study_designer::HOST_TYPE_SCHEMA_VERSION,
         bench_wire,
     })
 }
@@ -1195,7 +1327,7 @@ pub async fn doctor(json: bool) -> i32 {
     // One handshake, two checks: `/dev-bench/hello` opens the serial link, so
     // checks 11 and 13 share one answer rather than opening it twice.
     let hello = fetch_dev_bench_hello(&core_probe, authed.as_ref(), config.as_ref()).await;
-    let check11 = check_schema_versions(authed.as_ref(), &hello);
+    let check11 = check_schema_versions(authed.as_ref(), &hello, api.as_ref());
     let check12 = check_dev_bench(&core_probe, authed.as_ref(), config.as_ref()).await;
     let check13 = check_firmware_version(&hello, &saved);
     let check14 = check_flash_backend(core.as_ref());
@@ -1490,12 +1622,20 @@ mod tests {
     // reason the numbers are threaded in as a struct rather than fetched
     // inside the check.
 
+    /// The common case: `embarch` and the located `embarch-api` agree, so the
+    /// fourth number (decision 36) is quiet and the matrix under test is the
+    /// Core-versus-api one.
     fn versions<'a>(
         core_host: Result<u32, &'a str>,
-        local_host: u32,
+        api_host: u32,
         bench_wire: Result<(u32, Option<bool>), &'a str>,
     ) -> SchemaVersions<'a> {
-        SchemaVersions { core_host, local_host, bench_wire }
+        SchemaVersions {
+            core_host,
+            api_host: Ok(api_host),
+            umbrella_host: api_host,
+            bench_wire,
+        }
     }
 
     #[test]
@@ -1561,17 +1701,151 @@ mod tests {
         assert!(c.detail.contains("no `compatible` verdict"), "{}", c.detail);
     }
 
+    // ---- check 11: where the host number comes from (decisions 35, 36) ------
+
     #[test]
-    fn the_local_host_version_is_this_binarys_compiled_constant() {
-        // The check has to compare against a real constant, not a literal
-        // this test would have to be updated alongside.
-        let c = check_schema_versions(None, &HelloOutcome::NoBench);
-        assert!(
-            c.detail.contains(&format!("v{}", embarch_study_designer::HOST_TYPE_SCHEMA_VERSION)),
-            "{}",
-            c.detail
+    fn an_embarch_api_that_cannot_be_asked_is_a_skip_naming_why_never_a_silent_fallback() {
+        // The whole point of decision 35: the numbers Core and *this* binary
+        // hold agree here, so a fallback to the local constant would report a
+        // clean Pass. It must not — nobody asked the binary that submits the
+        // study.
+        let c = judge_schema_versions(&SchemaVersions {
+            core_host: Ok(17),
+            api_host: Err("embarch-api not located (see check 1)".to_string()),
+            umbrella_host: 17,
+            bench_wire: Ok((15, Some(true))),
+        });
+        assert_eq!(c.status, Status::Warn, "{}", c.detail);
+        assert!(c.detail.contains("embarch-api not located"), "{}", c.detail);
+        // The number that *was* obtained is still printed, and the local
+        // constant is labelled as context rather than as the comparison.
+        assert!(c.detail.contains("v17"), "{}", c.detail);
+        assert!(c.detail.contains("context only"), "{}", c.detail);
+    }
+
+    #[test]
+    fn could_not_ask_and_they_disagree_are_different_verdicts() {
+        let unasked = judge_schema_versions(&SchemaVersions {
+            core_host: Ok(16),
+            api_host: Err("embarch-api not located (see check 1)".to_string()),
+            umbrella_host: 17,
+            bench_wire: Err("no dev-bench plugged in"),
+        });
+        let disagree = judge_schema_versions(&versions(Ok(16), 17, Err("no dev-bench plugged in")));
+        assert_eq!(unasked.status, Status::Warn);
+        assert_eq!(disagree.status, Status::Fail);
+    }
+
+    #[test]
+    fn an_embarch_disagreeing_with_the_api_it_located_warns_without_failing() {
+        // Decision 36: a real mixed install, and the study hop is still fine —
+        // embarch submits nothing, so this cannot be a Fail.
+        let c = judge_schema_versions(&SchemaVersions {
+            core_host: Ok(17),
+            api_host: Ok(17),
+            umbrella_host: 16,
+            bench_wire: Ok((15, Some(true))),
+        });
+        assert_eq!(c.status, Status::Warn, "{}", c.detail);
+        assert!(c.detail.contains("mixed install"), "{}", c.detail);
+        assert!(c.detail.contains("v16") && c.detail.contains("v17"), "{}", c.detail);
+        assert!(c.fix.as_deref().unwrap().contains("one suite archive"), "{:?}", c.fix);
+    }
+
+    #[test]
+    fn a_core_api_disagreement_outranks_a_mixed_install_warning() {
+        let c = judge_schema_versions(&SchemaVersions {
+            core_host: Ok(15),
+            api_host: Ok(17),
+            umbrella_host: 16,
+            bench_wire: Ok((15, Some(true))),
+        });
+        assert_eq!(c.status, Status::Fail);
+        // Both fix lines survive: the blocking one and the mixed-install one.
+        let fix = c.fix.as_deref().unwrap();
+        assert!(fix.contains("deploy-core") && fix.contains("one suite archive"), "{fix}");
+    }
+
+    #[test]
+    fn a_versions_object_yields_the_api_binarys_compiled_number() {
+        let stdout = r#"{ "schema_version": 1, "success": true, "api_version": "0.1.0",
+                          "host_type_schema_version": 17 }"#;
+        assert_eq!(api_host_from_output(Some(0), true, stdout), Ok(17));
+    }
+
+    #[test]
+    fn an_embarch_api_too_old_for_versions_says_what_it_predates() {
+        // clap exits 2 on an unknown subcommand, printing its usage error to
+        // stderr and nothing to stdout.
+        let e = api_host_from_output(Some(2), false, "").unwrap_err();
+        assert!(e.contains("no `versions` subcommand"), "{e}");
+        assert!(e.contains("decision 52"), "{e}");
+    }
+
+    #[test]
+    fn a_non_zero_exit_that_is_not_clap_is_reported_as_itself() {
+        let e = api_host_from_output(Some(101), false, "").unwrap_err();
+        assert!(e.contains("101"), "{e}");
+    }
+
+    #[test]
+    fn an_answer_without_the_field_is_an_error_not_a_zero() {
+        let e = api_host_from_output(Some(0), true, r#"{"success": true, "api_version": "0.1.0"}"#)
+            .unwrap_err();
+        assert!(e.contains("host_type_schema_version"), "{e}");
+    }
+
+    #[test]
+    fn output_that_is_not_json_at_all_is_an_error() {
+        let e = api_host_from_output(Some(0), true, "embarch-api 0.1.0").unwrap_err();
+        assert!(e.contains("no JSON object"), "{e}");
+    }
+
+    #[test]
+    fn a_missing_embarch_api_binary_is_a_reason_not_a_panic() {
+        let located = Located {
+            path: PathBuf::from("/no/such/embarch-api-xyz"),
+            found_by: locate::FoundBy::EnvVar,
+            windows_exe_from_wsl2: false,
+        };
+        let e = api_host_schema_version(Some(&located)).unwrap_err();
+        assert!(e.contains("couldn't run"), "{e}");
+        assert!(api_host_schema_version(None).unwrap_err().contains("check 1"));
+    }
+
+    /// The three failing shapes against a real spawn, not just a parse: an
+    /// `embarch-api` that answers, one too old to know the subcommand, and one
+    /// this user cannot execute. Unix-only because it fabricates the binaries
+    /// as shell scripts and uses unix permission bits.
+    #[cfg(unix)]
+    #[test]
+    fn a_located_binary_is_actually_spawned_and_its_failures_are_reported() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir();
+        let fake = |name: &str, body: &str, mode: u32| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
+            Located { path: p, found_by: locate::FoundBy::EnvVar, windows_exe_from_wsl2: false }
+        };
+
+        let answers = fake(
+            "answers",
+            r#"echo '{"schema_version":1,"success":true,"api_version":"0.1.0","host_type_schema_version":17}'"#,
+            0o755,
         );
-        assert_eq!(c.status, Status::Warn);
+        assert_eq!(api_host_schema_version(Some(&answers)), Ok(17));
+
+        let too_old = fake("too-old", "echo \"error: unrecognized subcommand\" >&2; exit 2", 0o755);
+        let e = api_host_schema_version(Some(&too_old)).unwrap_err();
+        assert!(e.contains("no `versions` subcommand"), "{e}");
+
+        // No execute bit for anyone, which `execve` refuses even for root —
+        // so this stays deterministic wherever the suite runs.
+        let unreadable = fake("unreadable", "echo nope", 0o644);
+        let e = api_host_schema_version(Some(&unreadable)).unwrap_err();
+        assert!(e.contains("couldn't run"), "{e}");
     }
 
     // ---- check 15: core_version, a different question ------------------------
