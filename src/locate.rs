@@ -30,6 +30,12 @@ pub enum FoundBy {
     /// change this run just made isn't visible to this run's own environment
     /// until a new shell starts.
     JustInstalled,
+    /// The canonical copy `setup` *would* install — reported by
+    /// `setup --dry-run` (decision 21) where a real run would report
+    /// `JustInstalled`. A separate variant rather than reusing that one,
+    /// because "just installed here" is the one thing a dry run must never
+    /// claim.
+    PendingInstall,
 }
 
 impl FoundBy {
@@ -40,6 +46,7 @@ impl FoundBy {
             FoundBy::Path => "PATH",
             FoundBy::WindowsConventionalDir => "Windows install directory",
             FoundBy::JustInstalled => "just installed here",
+            FoundBy::PendingInstall => "would be installed by this run",
         }
     }
 }

@@ -102,14 +102,60 @@ fn run(program: &std::path::Path, args: &[&str]) -> Result<bool> {
     Ok(status.success())
 }
 
-/// Copy this platform's binaries to the canonical location and make sure
-/// `PATH` includes it (decision 28), from wherever the currently-running
-/// `embarch` binary sits — the unpacked release archive. Printed regardless
-/// of outcome, since a failure here (e.g. no writable `HOME`/`LOCALAPPDATA`)
+/// Every location a run of `setup` may write to, resolved from the
+/// environment in one place. Passed down rather than read at each write, so
+/// `--dry-run`'s description and the real run's writes come from the same
+/// four paths, and so the whole apply step can be pointed at a sandbox in a
+/// test.
+struct Locations {
+    /// Directory holding the running `embarch` — the unpacked release
+    /// archive, and decision 28's only install source.
+    source_dir: Option<PathBuf>,
+    /// Decision 28's canonical per-user install directory.
+    bin_dir: Option<PathBuf>,
+    /// `$HOME`, for the one sourcing line decision 28 adds to whichever
+    /// shell rc files already exist. Unused on Windows, where `PATH` lives
+    /// in the registry instead.
+    home: Option<PathBuf>,
+    /// Where the concluded topology is recorded (`state.rs`).
+    state_path: Option<PathBuf>,
+}
+
+impl Locations {
+    fn from_env() -> Self {
+        Locations {
+            source_dir: std::env::current_exe().ok().and_then(|e| e.parent().map(std::path::Path::to_path_buf)),
+            bin_dir: install::canonical_bin_dir().ok(),
+            home: std::env::var_os("HOME").map(PathBuf::from),
+            state_path: state::state_path().ok(),
+        }
+    }
+}
+
+/// Decision 28's install — copy this platform's binaries to the canonical
+/// location and make sure `PATH` includes it — or, under `--dry-run`, the
+/// same plan printed and not taken (decision 21). Printed regardless of
+/// outcome, since a failure here (e.g. no writable `HOME`/`LOCALAPPDATA`)
 /// shouldn't silently abort the rest of `setup`.
-fn install_this_platform() -> Option<install::InstallReport> {
-    let source_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
-    match install::install(&source_dir) {
+///
+/// Returns the destinations that hold (or, dry, would hold) a suite binary
+/// afterwards — what the `local` fallback below needs.
+fn install_this_platform(loc: &Locations, dry_run: bool) -> Vec<PathBuf> {
+    let (Some(source_dir), Some(bin_dir)) = (&loc.source_dir, &loc.bin_dir) else {
+        println!(
+            "\nCould not work out where to install the suite binaries (no LOCALAPPDATA, \
+             XDG_DATA_HOME, or HOME set) — skipping the install step."
+        );
+        return Vec::new();
+    };
+
+    if dry_run {
+        let plan = install::plan_install(source_dir, bin_dir, loc.home.as_deref());
+        println!("\n{}", plan.render());
+        return plan.destinations();
+    }
+
+    match install::install_into(source_dir, bin_dir, loc.home.as_deref()) {
         Ok(report) => {
             if report.copied.is_empty() {
                 println!("\nNothing to install: no suite binaries found next to this one.");
@@ -124,19 +170,42 @@ fn install_this_platform() -> Option<install::InstallReport> {
                     println!("PATH already includes {}.", report.bin_dir.display());
                 }
             }
-            Some(report)
+            report.copied
         }
         Err(e) => {
             println!("\nCould not install to the canonical location: {e:#}");
-            None
+            Vec::new()
         }
     }
 }
 
-pub async fn setup(host: Option<&str>, port: u16, dev_bench_repo: Option<&std::path::Path>) -> i32 {
-    let install_report = install_this_platform();
+pub async fn setup(host: Option<&str>, port: u16, dev_bench_repo: Option<&std::path::Path>, dry_run: bool) -> i32 {
+    let loc = Locations::from_env();
     let previously_saved = state::load();
-    let mut plan = make_plan(host, port).await;
+    // Every detection step runs identically in both modes — that, not the
+    // early return, is what decision 21 actually asks for: one detection
+    // path, described or executed, never a second implementation of it.
+    let plan = make_plan(host, port).await;
+    apply_plan(plan, previously_saved, dev_bench_repo, &loc, dry_run)
+}
+
+/// Everything `setup` does once detection has concluded. The single place
+/// any machine change happens, and the only argument that decides whether
+/// one does is `dry_run`.
+fn apply_plan(
+    mut plan: Plan,
+    previously_saved: State,
+    dev_bench_repo: Option<&std::path::Path>,
+    loc: &Locations,
+    dry_run: bool,
+) -> i32 {
+    if dry_run {
+        println!(
+            "embarch setup --dry-run: every detection step below really ran; nothing below is done."
+        );
+    }
+
+    let installed = install_this_platform(loc, dry_run);
 
     // locate_core's PATH lookup can't see a PATH change this same run just
     // made (a running process's own environment doesn't retroactively
@@ -145,11 +214,10 @@ pub async fn setup(host: Option<&str>, port: u16, dev_bench_repo: Option<&std::p
     // that's actually now fully set up. Not applicable to wsl-host/remote:
     // those need the real Windows-side or remote binary, not this local copy.
     if plan.core.is_none() && plan.class == TopologyClass::Local {
-        if let Some(report) = &install_report {
-            let candidate = report.bin_dir.join(locate::native_name("embarch-core"));
-            if candidate.is_file() {
-                plan.core = Some(Located { path: candidate, found_by: FoundBy::JustInstalled, windows_exe_from_wsl2: false });
-            }
+        let candidate = loc.bin_dir.as_ref().map(|d| d.join(locate::native_name("embarch-core")));
+        if let Some(candidate) = candidate.filter(|c| installed.contains(c)) {
+            let found_by = if dry_run { FoundBy::PendingInstall } else { FoundBy::JustInstalled };
+            plan.core = Some(Located { path: candidate, found_by, windows_exe_from_wsl2: false });
         }
     }
 
@@ -185,11 +253,19 @@ pub async fn setup(host: Option<&str>, port: u16, dev_bench_repo: Option<&std::p
             (TopologyClass::WslHost, Some(c)) => {
                 // Cannot be done from here: controlling a Windows service
                 // needs an elevated Windows shell, and umbrella never tries
-                // to obtain one (design.md §3 decision 7).
+                // to obtain one (design.md §3 decision 7). Identical in both
+                // modes — it was already only ever a printed instruction.
                 println!(
                     "\nCore belongs on the Windows side. In an **elevated Windows** shell, run:\n  \
                      \"{}\" install --bind {bind_addr}",
                     windows_display_path(&c.path)
+                );
+            }
+            (TopologyClass::Local, Some(c)) if dry_run => {
+                println!(
+                    "\nWould register embarch-core as a service that starts at boot. Needs \
+                     elevation unless this is already root:\n  \"{}\" install --bind {bind_addr}",
+                    c.path.display()
                 );
             }
             (TopologyClass::Local, Some(c)) => {
@@ -211,13 +287,20 @@ pub async fn setup(host: Option<&str>, port: u16, dev_bench_repo: Option<&std::p
                     "\nCan't continue without embarch-core. It ships in the same archive as this \
                      binary — unpack them into one directory, or point EMBARCH_CORE_EXE at it."
                 );
+                // Said even here: a dry run that stops early has still done
+                // nothing, and leaving that unsaid is exactly the doubt
+                // decision 21 exists to remove.
+                if dry_run {
+                    println!("\n--dry-run: nothing above was done.");
+                }
                 return 1;
             }
         }
     }
 
     // The token file is Core's to create on first start; all we can usefully
-    // say is whether it's there yet.
+    // say is whether it's there yet. A read either way, so `--dry-run`
+    // reports exactly what a real run would.
     if let Some(token) = token_path_for(plan.class, cfg!(windows)) {
         if token.exists() {
             println!("\nToken file: {} (present)", token.display());
@@ -254,16 +337,26 @@ pub async fn setup(host: Option<&str>, port: u16, dev_bench_repo: Option<&std::p
         deploy_windows_root: previously_saved.deploy_windows_root,
         deploy_cargo_exe: previously_saved.deploy_cargo_exe,
     };
-    match state::save(&saved) {
-        Ok(()) => {
-            if let Ok(p) = state::state_path() {
-                println!("Saved topology to {}", p.display());
-            }
-        }
-        Err(e) => println!("Could not save state: {e:#}"),
+    match (&loc.state_path, dry_run) {
+        (Some(p), true) => println!(
+            "\nWould record topology `{}` in {}",
+            saved.topology.as_deref().unwrap_or("?"),
+            p.display()
+        ),
+        (Some(p), false) => match state::save_to(p, &saved) {
+            Ok(()) => println!("Saved topology to {}", p.display()),
+            Err(e) => println!("Could not save state: {e:#}"),
+        },
+        (None, _) => println!(
+            "Could not save state: no config directory (no APPDATA, XDG_CONFIG_HOME, or HOME set)"
+        ),
     }
 
-    println!("\nNext: `embarch status` to confirm, then `embarch init` in a firmware repo.");
+    if dry_run {
+        println!("\n--dry-run: nothing above was done. Re-run without --dry-run to do it.");
+    } else {
+        println!("\nNext: `embarch status` to confirm, then `embarch init` in a firmware repo.");
+    }
     0
 }
 
@@ -604,6 +697,104 @@ mod tests {
             )),
             "C:\\Program Files\\embarch\\embarch-core.exe"
         );
+    }
+
+    /// Decision 21's actual promise, and the only part of it a host test can
+    /// establish: `--dry-run` walks the whole apply step and changes
+    /// nothing. Every location `setup` can write to is pointed at a
+    /// sandbox — the install directory, `$HOME`'s rc files, the env file,
+    /// the state file — and `embarch-core` is a script that would leave a
+    /// sentinel behind if it were ever executed. The plan deliberately has
+    /// no located Core, so the `local` install-then-register path runs in
+    /// full rather than short-circuiting.
+    #[test]
+    fn a_dry_run_reaches_no_side_effecting_call() {
+        let sandbox = std::env::temp_dir().join(format!(
+            "embarch-umbrella-dry-run-{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&sandbox);
+        let source = sandbox.join("archive");
+        let home = sandbox.join("home");
+        let bin_dir = sandbox.join("install").join("bin");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+
+        let sentinel = sandbox.join("EXECUTED");
+        let core = source.join(locate::native_name("embarch-core"));
+        std::fs::write(&core, format!("#!/bin/sh\ntouch \"{}\"\n", sentinel.display())).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&core, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        std::fs::write(source.join(locate::native_name("embarch")), b"embarch").unwrap();
+        std::fs::write(home.join(".bashrc"), b"# rc\n").unwrap();
+
+        let loc = Locations {
+            source_dir: Some(source),
+            bin_dir: Some(bin_dir.clone()),
+            home: Some(home.clone()),
+            state_path: Some(sandbox.join("config").join("umbrella.toml")),
+        };
+        let plan = Plan {
+            class: TopologyClass::Local,
+            host: None,
+            core: None,
+            already_running: false,
+        };
+
+        let code = apply_plan(plan, State::default(), None, &loc, true);
+        assert_eq!(code, 0);
+
+        assert!(!sentinel.exists(), "--dry-run must not run embarch-core");
+        assert!(!bin_dir.exists(), "--dry-run must copy no binaries");
+        assert!(!sandbox.join("install").join("env").exists(), "--dry-run must not write the env file");
+        assert!(!sandbox.join("config").exists(), "--dry-run must not write the state file");
+        assert_eq!(
+            std::fs::read_to_string(home.join(".bashrc")).unwrap(),
+            "# rc\n",
+            "--dry-run must not touch a shell rc file"
+        );
+
+        std::fs::remove_dir_all(&sandbox).unwrap();
+    }
+
+    /// The counterpart: the dry run has to *describe* decision 28's install
+    /// and `PATH` write, not quietly omit them because they are the steps
+    /// that used to only print while acting.
+    #[test]
+    fn the_dry_run_plan_names_the_install_and_the_path_write() {
+        let sandbox = std::env::temp_dir().join(format!(
+            "embarch-umbrella-dry-plan-{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&sandbox);
+        let source = sandbox.join("archive");
+        let home = sandbox.join("home");
+        let bin_dir = sandbox.join("install").join("bin");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(source.join(locate::native_name("embarch")), b"embarch").unwrap();
+        std::fs::write(source.join(locate::native_name("embarch-core")), b"core").unwrap();
+        std::fs::write(home.join(".bashrc"), b"# rc\n").unwrap();
+
+        let rendered = install::plan_install(&source, &bin_dir, Some(&home)).render();
+        assert!(rendered.contains(&bin_dir.display().to_string()), "{rendered}");
+        assert!(rendered.contains("embarch-core"), "{rendered}");
+        // `embarch-api` isn't in this archive: named as skipped rather than
+        // silently absent.
+        assert!(rendered.contains("skipped"), "{rendered}");
+        assert!(rendered.contains("PATH"), "{rendered}");
+        #[cfg(unix)]
+        assert!(rendered.contains(".bashrc"), "{rendered}");
+
+        // And the destination the `local` fallback keys off is the one the
+        // plan says a copy would land at.
+        let plan = install::plan_install(&source, &bin_dir, Some(&home));
+        assert!(plan.destinations().contains(&bin_dir.join(locate::native_name("embarch-core"))));
+
+        std::fs::remove_dir_all(&sandbox).unwrap();
     }
 
     #[test]

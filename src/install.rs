@@ -51,6 +51,12 @@ pub fn canonical_bin_dir() -> Result<PathBuf> {
     .context("could not determine an install directory (no LOCALAPPDATA, XDG_DATA_HOME, or HOME set)")
 }
 
+/// The three binaries the suite release archive carries, in the order a
+/// person reads them: the one they just ran, the one it sets up, and the one
+/// everything afterwards goes through. Named once so `install_binaries` and
+/// [`plan_install`] can never disagree about the set.
+pub const SUITE_BINARIES: [&str; 3] = ["embarch", "embarch-core", "embarch-api"];
+
 /// Copy `embarch`, `embarch-core`, `embarch-api` from `source_dir` (the
 /// currently-running `embarch` binary's own directory — the unpacked release
 /// archive) into `dest_dir`, creating it if needed. This is the *only* place
@@ -65,7 +71,7 @@ pub fn install_binaries(source_dir: &Path, dest_dir: &Path) -> Result<Vec<PathBu
         .with_context(|| format!("could not create {}", dest_dir.display()))?;
 
     let mut written = Vec::new();
-    for stem in ["embarch", "embarch-core", "embarch-api"] {
+    for stem in SUITE_BINARIES {
         let name = locate::native_name(stem);
         let src = source_dir.join(&name);
         let dst = dest_dir.join(&name);
@@ -142,6 +148,22 @@ pub fn candidate_rc_files(home: &Path) -> Vec<PathBuf> {
     [".bashrc", ".zshrc"].iter().map(|f| home.join(f)).collect()
 }
 
+/// Whether `content` already carries the sourcing line for `env_path`. The
+/// one predicate `ensure_sourced`, `ensure_not_sourced` and [`plan_install`]
+/// all share, so a dry run can never report a change the real run would not
+/// make.
+fn contains_sourcing_line(content: &str, env_path: &Path) -> bool {
+    let line = sourcing_line(env_path);
+    content.lines().any(|l| l.trim() == line)
+}
+
+/// Read-only form of the above, for [`plan_install`]. An unreadable rc file
+/// reads as "not sourced yet" — the same thing the real run would then fail
+/// to change, and reporting the intent is more useful than staying silent.
+fn already_sourced(rc_path: &Path, env_path: &Path) -> bool {
+    std::fs::read_to_string(rc_path).is_ok_and(|c| contains_sourcing_line(&c, env_path))
+}
+
 /// Idempotently append a line sourcing `env_path` to `rc_path`, if `rc_path`
 /// exists and doesn't already source it. Returns whether a change was made.
 pub fn ensure_sourced(rc_path: &Path, env_path: &Path) -> Result<bool> {
@@ -150,7 +172,7 @@ pub fn ensure_sourced(rc_path: &Path, env_path: &Path) -> Result<bool> {
     }
     let existing = std::fs::read_to_string(rc_path).with_context(|| format!("could not read {}", rc_path.display()))?;
     let line = sourcing_line(env_path);
-    if existing.lines().any(|l| l.trim() == line) {
+    if contains_sourcing_line(&existing, env_path) {
         return Ok(false);
     }
     let mut updated = existing;
@@ -171,7 +193,7 @@ pub fn ensure_not_sourced(rc_path: &Path, env_path: &Path) -> Result<bool> {
     }
     let existing = std::fs::read_to_string(rc_path).with_context(|| format!("could not read {}", rc_path.display()))?;
     let line = sourcing_line(env_path);
-    if !existing.lines().any(|l| l.trim() == line) {
+    if !contains_sourcing_line(&existing, env_path) {
         return Ok(false);
     }
 
@@ -203,11 +225,13 @@ pub fn ensure_not_sourced(rc_path: &Path, env_path: &Path) -> Result<bool> {
     Ok(true)
 }
 
-pub fn ensure_path_unix(bin_dir: &Path) -> Result<Vec<PathBuf>> {
+/// `$HOME` passed in rather than read here, so `setup` resolves every
+/// location it may write to in one place and the whole flow can be pointed
+/// at a sandbox in a test.
+pub fn ensure_path_unix_in(bin_dir: &Path, home: &Path) -> Result<Vec<PathBuf>> {
     let env_path = write_env_file(bin_dir)?;
-    let home = std::env::var("HOME").context("HOME is not set")?;
     let mut changed = Vec::new();
-    for rc in candidate_rc_files(Path::new(&home)) {
+    for rc in candidate_rc_files(home) {
         if ensure_sourced(&rc, &env_path)? {
             changed.push(rc);
         }
@@ -272,6 +296,18 @@ pub mod windows_path {
         RegKey::predef(HKEY_CURRENT_USER)
             .open_subkey_with_flags("Environment", KEY_READ | KEY_WRITE)
             .context("could not open HKCU\\Environment")
+    }
+
+    /// Read-only: is `bin_dir` already on the per-user `PATH`? Opened
+    /// `KEY_READ` only, so `setup --dry-run` cannot even hold a writable
+    /// handle to the key decision 28 edits.
+    pub fn is_on_path(bin_dir: &Path) -> Result<bool> {
+        let env_key = RegKey::predef(HKEY_CURRENT_USER)
+            .open_subkey_with_flags("Environment", KEY_READ)
+            .context("could not read HKCU\\Environment")?;
+        let (current, _) = read_path(&env_key);
+        let bin_dir_str = bin_dir.to_string_lossy();
+        Ok(current.split(';').any(|d| dirs_equal(d, &bin_dir_str)))
     }
 
     /// Add `bin_dir` to the per-user `PATH`, idempotently. Returns whether a
@@ -352,16 +388,170 @@ pub struct InstallReport {
 /// Copy this platform's binaries to the canonical location and make sure
 /// `PATH` includes it — the real install step decision 28 introduces,
 /// replacing decision 3's sibling-lookup-plus-printed-hint.
-pub fn install(source_dir: &Path) -> Result<InstallReport> {
-    let bin_dir = canonical_bin_dir()?;
-    let copied = install_binaries(source_dir, &bin_dir)?;
+///
+/// Every location it writes to is a parameter rather than an environment
+/// read, because [`plan_install`] has to describe exactly these writes for
+/// `setup --dry-run` (decision 21) and the two must not drift.
+pub fn install_into(source_dir: &Path, bin_dir: &Path, home: Option<&Path>) -> Result<InstallReport> {
+    let copied = install_binaries(source_dir, bin_dir)?;
+    let path_changed = ensure_path(bin_dir, home)?;
+    Ok(InstallReport { bin_dir: bin_dir.to_path_buf(), copied, path_changed })
+}
 
-    #[cfg(windows)]
-    let path_changed = windows_path::ensure_path(&bin_dir)?;
-    #[cfg(unix)]
-    let path_changed = !ensure_path_unix(&bin_dir)?.is_empty();
+#[cfg(unix)]
+fn ensure_path(bin_dir: &Path, home: Option<&Path>) -> Result<bool> {
+    let home = home.context("HOME is not set")?;
+    Ok(!ensure_path_unix_in(bin_dir, home)?.is_empty())
+}
 
-    Ok(InstallReport { bin_dir, copied, path_changed })
+#[cfg(windows)]
+fn ensure_path(bin_dir: &Path, _home: Option<&Path>) -> Result<bool> {
+    windows_path::ensure_path(bin_dir)
+}
+
+// ---------- the same install, described rather than done ----------
+
+/// What [`install_into`] *would* do, computed by reading only — decision
+/// 21's `setup --dry-run` half. Deliberately built from the same constants
+/// and the same predicates the real install uses (`SUITE_BINARIES`,
+/// `paths_refer_to_the_same_file`, `contains_sourcing_line`) rather than
+/// from a second description of them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstallPlan {
+    pub bin_dir: PathBuf,
+    pub binaries: Vec<PlannedBinary>,
+    pub path: PathPlan,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlannedBinary {
+    pub name: String,
+    pub dest: PathBuf,
+    pub action: BinaryAction,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BinaryAction {
+    Copy,
+    AlreadyInPlace,
+    /// Not next to the running `embarch` — a dev build, or an archive
+    /// unpacked in pieces. `install_binaries` skips it rather than failing
+    /// the whole install over one binary, so the plan says so too.
+    MissingAtSource,
+}
+
+/// How `PATH` gets the canonical directory on this platform, or that it
+/// already has it. The two arms are decision 28's two platform branches.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PathPlan {
+    AlreadyPresent,
+    // Each platform constructs one of the two; both are matched in
+    // `render` on every platform, and matching is not construction.
+    #[cfg_attr(windows, allow(dead_code))]
+    Unix { env_file: PathBuf, rc_files: Vec<PathBuf> },
+    #[cfg_attr(not(windows), allow(dead_code))]
+    WindowsRegistry,
+    /// Could not be established without writing something — reported rather
+    /// than guessed at.
+    Undetermined(String),
+}
+
+pub fn plan_install(source_dir: &Path, bin_dir: &Path, home: Option<&Path>) -> InstallPlan {
+    let binaries = SUITE_BINARIES
+        .iter()
+        .map(|stem| {
+            let name = locate::native_name(stem);
+            let src = source_dir.join(&name);
+            let dest = bin_dir.join(&name);
+            let action = if !src.is_file() {
+                BinaryAction::MissingAtSource
+            } else if paths_refer_to_the_same_file(&src, &dest) {
+                BinaryAction::AlreadyInPlace
+            } else {
+                BinaryAction::Copy
+            };
+            PlannedBinary { name, dest, action }
+        })
+        .collect();
+    InstallPlan { bin_dir: bin_dir.to_path_buf(), binaries, path: plan_path(bin_dir, home) }
+}
+
+#[cfg(unix)]
+fn plan_path(bin_dir: &Path, home: Option<&Path>) -> PathPlan {
+    let env_file = env_file_path(bin_dir);
+    let Some(home) = home else {
+        return PathPlan::Undetermined("HOME is not set".to_string());
+    };
+    // `write_env_file` always rewrites, so "no change" means the file is
+    // already byte-identical to what this run would write.
+    let env_file_current =
+        std::fs::read_to_string(&env_file).is_ok_and(|c| c == env_file_contents(bin_dir));
+    let rc_files: Vec<PathBuf> = candidate_rc_files(home)
+        .into_iter()
+        .filter(|rc| rc.is_file() && !already_sourced(rc, &env_file))
+        .collect();
+    if env_file_current && rc_files.is_empty() {
+        PathPlan::AlreadyPresent
+    } else {
+        PathPlan::Unix { env_file, rc_files }
+    }
+}
+
+#[cfg(windows)]
+fn plan_path(bin_dir: &Path, _home: Option<&Path>) -> PathPlan {
+    match windows_path::is_on_path(bin_dir) {
+        Ok(true) => PathPlan::AlreadyPresent,
+        Ok(false) => PathPlan::WindowsRegistry,
+        Err(e) => PathPlan::Undetermined(format!("{e:#}")),
+    }
+}
+
+impl InstallPlan {
+    /// Destinations that will hold a suite binary once this plan has run —
+    /// what `setup` needs to know whether the `embarch-core` it is about to
+    /// register would be the copy this same run puts there.
+    pub fn destinations(&self) -> Vec<PathBuf> {
+        self.binaries
+            .iter()
+            .filter(|b| b.action != BinaryAction::MissingAtSource)
+            .map(|b| b.dest.clone())
+            .collect()
+    }
+
+    pub fn render(&self) -> String {
+        let mut out = format!("Would install to {}:\n", self.bin_dir.display());
+        for b in &self.binaries {
+            let what = match b.action {
+                BinaryAction::Copy => "copy",
+                BinaryAction::AlreadyInPlace => "already there, no copy",
+                BinaryAction::MissingAtSource => "not next to this binary, skipped",
+            };
+            out.push_str(&format!("  {:<13} {what}\n", b.name));
+        }
+        out.push_str(&match &self.path {
+            PathPlan::AlreadyPresent => {
+                format!("PATH: already includes {}, no change.", self.bin_dir.display())
+            }
+            PathPlan::Unix { env_file, rc_files } => {
+                let rc = if rc_files.is_empty() {
+                    "no shell rc file needs a line added".to_string()
+                } else {
+                    format!(
+                        "add one sourcing line to {}",
+                        rc_files.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ")
+                    )
+                };
+                format!("PATH: would write {} and {rc}. Per-user, no elevation.", env_file.display())
+            }
+            PathPlan::WindowsRegistry => {
+                "PATH: would append it to HKCU\\Environment\\Path. Per-user, no elevation.".to_string()
+            }
+            PathPlan::Undetermined(why) => {
+                format!("PATH: could not tell whether a change is needed ({why}).")
+            }
+        });
+        out
+    }
 }
 
 /// Reverse `install`: remove the canonical binaries and undo the `PATH`

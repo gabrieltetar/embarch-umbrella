@@ -117,7 +117,13 @@ fn load_from(path: &Path) -> Option<State> {
 }
 
 pub fn save(state: &State) -> Result<()> {
-    let path = state_path()?;
+    save_to(&state_path()?, state)
+}
+
+/// The path passed in rather than resolved here, so `setup` can name every
+/// location it writes to in one place — which is what lets `--dry-run`
+/// (decision 21) report the state file it would write without writing one.
+pub fn save_to(path: &Path, state: &State) -> Result<()> {
     let dir = path
         .parent()
         .context("state path has no parent directory")?;
@@ -126,7 +132,7 @@ pub fn save(state: &State) -> Result<()> {
     let mut state = state.clone();
     state.schema_version = STATE_SCHEMA_VERSION;
     let text = toml::to_string_pretty(&state).context("could not serialize state")?;
-    std::fs::write(&path, text).with_context(|| format!("could not write {}", path.display()))?;
+    std::fs::write(path, text).with_context(|| format!("could not write {}", path.display()))?;
     Ok(())
 }
 

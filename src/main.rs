@@ -70,6 +70,12 @@ enum Command {
         /// path unchanged.
         #[arg(long)]
         dev_bench_repo: Option<PathBuf>,
+
+        /// Run every detection step exactly as `setup` does, print the
+        /// concrete actions — which service call, which files, whether
+        /// elevation is needed — and change nothing (decision 21).
+        #[arg(long, conflicts_with = "uninstall")]
+        dry_run: bool,
     },
 
     /// Integrate the firmware repo in the current directory: scaffold
@@ -170,11 +176,11 @@ async fn main() {
 
     let code = match cli.command {
         Command::Status { json, host, port } => status(json, host.as_deref(), port).await,
-        Command::Setup { host, port, uninstall, dev_bench_repo } => {
+        Command::Setup { host, port, uninstall, dev_bench_repo, dry_run } => {
             if uninstall {
                 setup::uninstall()
             } else {
-                setup::setup(host.as_deref(), port, dev_bench_repo.as_deref()).await
+                setup::setup(host.as_deref(), port, dev_bench_repo.as_deref(), dry_run).await
             }
         }
         Command::Init { uninstall } => init::init(uninstall),
