@@ -181,11 +181,29 @@ fn manifest_mismatches(m: &crate::manifest::Manifest, c_ver: Option<&str>, a_ver
 /// `c_ver`/`a_ver` are each component's `--version` output, resolved **once**
 /// in the driver: check 15 wants Core's, and spawning the same binary twice to
 /// ask it the same question would let the two checks disagree.
+/// Which machine Core belongs to, for the two checks that must not demand a
+/// local `embarch-core` where none belongs (decision 38). Only ever consulted
+/// when no binary could be located at all, which is what makes the WSL2 arm
+/// safe: decision 30's mirrored-networking ambiguity means a `local` winner
+/// under WSL2 says "something answered at loopback", not "Core is in the
+/// guest" — and a guest-local Core that `setup` installed would have been
+/// located on `PATH` before this was asked.
+fn core_belongs_to(winner: Option<TopologyClass>, host: Option<&str>, under_wsl2: bool) -> TopologyClass {
+    match winner {
+        Some(TopologyClass::Remote) => TopologyClass::Remote,
+        _ if host.is_some() => TopologyClass::Remote,
+        _ if under_wsl2 => TopologyClass::WslHost,
+        Some(class) => class,
+        None => TopologyClass::Local,
+    }
+}
+
 fn check_binaries(
     core: Option<&Located>,
     api: Option<&Located>,
     c_ver: Option<&str>,
     a_ver: Option<&str>,
+    class: TopologyClass,
 ) -> Check {
     match (core, api) {
         (Some(c), Some(a)) => {
@@ -199,53 +217,116 @@ fn check_binaries(
 
             let manifest = crate::manifest::find_next_to_me().and_then(|p| crate::manifest::load(&p));
             match manifest {
-                None => check(
-                    1,
-                    "binaries found",
-                    Status::Pass,
-                    format!(
-                        "{found}. No suite manifest next to this binary — either not installed from a \
-                         suite archive (milestone-6.md §3.7), or a per-repo/debug build; \
-                         version-vs-manifest comparison skipped."
+                None => with_code(
+                    check(
+                        1,
+                        "binaries found",
+                        Status::Pass,
+                        format!(
+                            "{found}. No suite manifest next to this binary — either not installed from a \
+                             suite archive (milestone-6.md §3.7), or a per-repo/debug build; \
+                             version-vs-manifest comparison skipped."
+                        ),
                     ),
+                    "no-manifest",
                 ),
                 Some(m) => {
-                    let mismatches = manifest_mismatches(&m, c_ver, a_ver);
-                    if mismatches.is_empty() {
-                        check(
-                            1,
-                            "binaries found",
-                            Status::Pass,
-                            format!("{found}. Matches suite manifest v{} ({}).", m.suite_version, m.target),
+                    // The manifest describes the archive *this* binary came
+                    // from. On `wsl-host` that is a Linux archive and Core is a
+                    // Windows exe out of a different one, so the manifest has
+                    // nothing to say about it and saying it anyway would be a
+                    // confident verdict about the wrong artifact (decision 38).
+                    let cross_target_core = c.windows_exe_from_wsl2 && !m.target.contains("windows");
+                    let compared_core = if cross_target_core { None } else { c_ver };
+                    let note = if cross_target_core {
+                        format!(
+                            " embarch-core is a Windows build and this manifest is the {} one; check 15 \
+                             compares it against the running Core instead.",
+                            if m.target.is_empty() { "untargeted" } else { &m.target }
                         )
                     } else {
-                        with_fix(
+                        String::new()
+                    };
+                    let mismatches = manifest_mismatches(&m, compared_core, a_ver);
+                    if mismatches.is_empty() {
+                        with_code(
                             check(
                                 1,
                                 "binaries found",
-                                Status::Fail,
-                                format!("{found}. Suite manifest v{} mismatch: {}", m.suite_version, mismatches.join("; ")),
+                                Status::Pass,
+                                format!(
+                                    "{found}. Matches suite manifest v{} ({}).{note}",
+                                    m.suite_version, m.target
+                                ),
                             ),
-                            "reinstall from a matching suite archive, so all three binaries come from the \
-                             same release",
+                            if cross_target_core { "manifest-partial" } else { "manifest-match" },
+                        )
+                    } else {
+                        with_code(
+                            with_fix(
+                                check(
+                                    1,
+                                    "binaries found",
+                                    Status::Fail,
+                                    format!(
+                                        "{found}. Suite manifest v{} mismatch: {}.{note}",
+                                        m.suite_version,
+                                        mismatches.join("; ")
+                                    ),
+                                ),
+                                "reinstall from a matching suite archive, so all three binaries come from the \
+                                 same release",
+                            ),
+                            "manifest-mismatch",
                         )
                     }
                 }
             }
         }
-        _ => with_fix(
-            check(
-                1,
-                "binaries found",
-                Status::Fail,
-                format!(
-                    "embarch-core: {}; embarch-api: {}",
-                    core.map(|c| c.path.display().to_string()).unwrap_or_else(|| "not found".to_string()),
-                    api.map(|a| a.path.display().to_string()).unwrap_or_else(|| "not found".to_string()),
+        // Decision 38: on `wsl-host` and `remote` there is no local
+        // `embarch-core` to expect, and `setup` already treats its absence as
+        // correct. Reporting it as a Fail made the first line of the first live
+        // `doctor` run a false red on a healthy machine.
+        (None, Some(_)) if class != TopologyClass::Local => with_code(
+            with_fix(
+                check(
+                    1,
+                    "binaries found",
+                    Status::Warn,
+                    format!(
+                        "embarch-api: {}; no embarch-core on this machine, which is correct for \
+                         topology `{}` — Core's binary lives {}. Checks 14 and 15 cannot ask it \
+                         anything, and say so.",
+                        api.map(|a| a.path.display().to_string()).unwrap_or_default(),
+                        class.as_str(),
+                        if class == TopologyClass::Remote {
+                            "on the machine running it"
+                        } else {
+                            "on the Windows side, and its service registration could not be read"
+                        },
+                    ),
                 ),
+                "nothing to fix unless checks 14 and 15 are wanted: point EMBARCH_CORE_EXE at the \
+                 exe this machine's Core runs (on wsl-host, its /mnt/c path)",
             ),
-            "download the suite archive and unpack both binaries next to `embarch`, or set \
-             EMBARCH_CORE_EXE / EMBARCH_API_BIN",
+            "core-not-local",
+        ),
+        _ => with_code(
+            with_fix(
+                check(
+                    1,
+                    "binaries found",
+                    Status::Fail,
+                    format!(
+                        "embarch-core: {}; embarch-api: {}",
+                        core.map(|c| c.path.display().to_string()).unwrap_or_else(|| "not found".to_string()),
+                        api.map(|a| a.path.display().to_string()).unwrap_or_else(|| "not found".to_string()),
+                    ),
+                ),
+                "download the suite archive and unpack both binaries next to `embarch`, or set \
+                 EMBARCH_CORE_EXE / EMBARCH_API_BIN",
+            ),
+            "not-found",
         ),
     }
 }
@@ -2015,11 +2096,16 @@ pub async fn doctor(json: bool) -> i32 {
     let core_version_output = core.as_ref().and_then(|c| binary_version(&c.path));
     let api_version_output = api.as_ref().and_then(|a| binary_version(&a.path));
 
+    // Which machine Core belongs to, asked once and used by the two checks
+    // that must not demand a local binary where none belongs (decision 38).
+    let core_class = core_belongs_to(core_probe.winner_class, host.as_deref(), under_wsl2);
+
     let check1 = check_binaries(
         core.as_ref(),
         api.as_ref(),
         core_version_output.as_deref(),
         api_version_output.as_deref(),
+        core_class,
     );
     let check2 = check_service(&core_probe, host.as_deref(), core.as_ref());
     let check3 = check_reachable(&core_probe);
@@ -2039,7 +2125,7 @@ pub async fn doctor(json: bool) -> i32 {
     let check11 = check_schema_versions(authed.as_ref(), &hello, api.as_ref());
     let check12 = check_dev_bench(&core_probe, authed.as_ref(), config.as_ref()).await;
     let check13 = check_firmware_version(&hello, &saved);
-    let check14 = check_flash_backend(core.as_ref());
+    let check14 = check_flash_backend(core.as_ref(), core_class);
     let check15 = check_core_build(authed.as_ref(), core_version_output.as_deref());
     // Check 3's winner is the honest source for *which machine* holds Core's
     // data directory; with no winner, this host's own shape is the stated
@@ -2091,20 +2177,38 @@ pub async fn doctor(json: bool) -> i32 {
 /// about the right machine. A second implementation of the search here would
 /// be a mirror that drifts — the same mistake `doctor`'s check 8 was
 /// refactored out of.
-fn check_flash_backend(core: Option<&Located>) -> Check {
+fn check_flash_backend(core: Option<&Located>, class: TopologyClass) -> Check {
     const NAME: &str = "flashing backend available for every chip family";
     let Some(core) = core else {
-        return check(14, NAME, Status::Warn, "skipped — embarch-core not located (see check 1)");
+        // Decision 38: "see check 1" made this check unreadable on the one
+        // topology it most needed to answer for — check 1 was itself wrong
+        // there, and a reader who followed the pointer learned nothing about
+        // flashing. It says what is missing and what would supply it.
+        let detail = match class {
+            TopologyClass::Remote => {
+                "skipped — Core runs on another machine, and only its own binary can say which                  flashing program it would resolve there"
+            }
+            TopologyClass::WslHost => {
+                "skipped — no embarch-core binary this host can run: nothing is registered as the                  Windows service (`sc.exe qc com.embarch.core`), no copy sits in a conventional                  Windows location, and EMBARCH_CORE_EXE is unset"
+            }
+            TopologyClass::Local => {
+                "skipped — no embarch-core binary on this machine to ask; `embarch setup` installs one"
+            }
+        };
+        return with_code(check(14, NAME, Status::Warn, detail), "core-not-located");
     };
 
     let output = match Command::new(&core.path).arg("flash-backend").output() {
         Ok(o) => o,
         Err(e) => {
-            return check(
-                14,
-                NAME,
-                Status::Warn,
-                format!("couldn't run `{} flash-backend`: {e}", core.path.display()),
+            return with_code(
+                check(
+                    14,
+                    NAME,
+                    Status::Warn,
+                    format!("couldn't run `{} flash-backend`: {e}", core.path.display()),
+                ),
+                "core-unrunnable",
             )
         }
     };
@@ -2124,12 +2228,15 @@ fn check_flash_backend(core: Option<&Located>) -> Check {
 
     if rows.is_empty() && unavailable.is_empty() {
         // An older Core predating the subcommand answers with a clap error.
-        return check(
-            14,
-            NAME,
-            Status::Warn,
-            "this embarch-core has no `flash-backend` subcommand — it predates §3 decision 36 and \
-             will flash every target with probe-rs, including Nordic RRAM parts",
+        return with_code(
+            check(
+                14,
+                NAME,
+                Status::Warn,
+                "this embarch-core has no `flash-backend` subcommand — it predates §3 decision 36 and \
+                 will flash every target with probe-rs, including Nordic RRAM parts",
+            ),
+            "no-flash-backend-subcommand",
         );
     }
 
@@ -2140,10 +2247,10 @@ fn check_flash_backend(core: Option<&Located>) -> Check {
         .join(", ");
 
     if unavailable.is_empty() {
-        return check(14, NAME, Status::Pass, summary);
+        return with_code(check(14, NAME, Status::Pass, summary), "every-family-covered");
     }
 
-    with_fix(
+    with_code(with_fix(
         check(
             14,
             NAME,
@@ -2158,7 +2265,7 @@ fn check_flash_backend(core: Option<&Located>) -> Check {
              `{} flash-backend` prints exactly which tools it looked for and where.",
             core.path.display()
         ),
-    )
+    ), "family-uncovered")
 }
 
 fn render_human(checks: &[Check]) {
@@ -2628,6 +2735,76 @@ mod tests {
     fn output_that_is_not_json_at_all_is_an_error() {
         let e = api_host_from_output(Some(0), true, "embarch-api 0.1.0").unwrap_err();
         assert!(e.contains("no JSON object"), "{e}");
+    }
+
+    fn a_located(path: &str, windows: bool) -> Located {
+        Located {
+            path: PathBuf::from(path),
+            found_by: if windows {
+                locate::FoundBy::WindowsServiceRegistration
+            } else {
+                locate::FoundBy::Path
+            },
+            windows_exe_from_wsl2: windows,
+        }
+    }
+
+    /// The whole of task `umbrella/010`: on `wsl-host` there is no Linux
+    /// `embarch-core` to sit beside `embarch`, `setup` already treats its
+    /// absence as correct, and check 1 was calling the same machine broken.
+    #[test]
+    fn check_1_is_not_a_failure_where_no_local_core_belongs() {
+        let api = a_located("/home/u/.local/share/embarch/bin/embarch-api", false);
+        for class in [TopologyClass::WslHost, TopologyClass::Remote] {
+            let c = check_binaries(None, Some(&api), None, None, class);
+            assert_eq!(c.status, Status::Warn, "{class:?}");
+            assert_eq!(c.code, Some("core-not-local"), "{class:?}");
+            assert!(c.detail.contains(class.as_str()), "{}", c.detail);
+        }
+    }
+
+    /// The half that must not soften: `local` is the topology where a missing
+    /// Core really is a broken install, and `embarch-api` always runs on this
+    /// side of the boundary whatever the class.
+    #[test]
+    fn check_1_still_fails_where_a_binary_really_is_missing() {
+        let api = a_located("/usr/local/bin/embarch-api", false);
+        let core = a_located("/mnt/c/x/embarch-core.exe", true);
+        let local = check_binaries(None, Some(&api), None, None, TopologyClass::Local);
+        assert_eq!(local.status, Status::Fail);
+        assert_eq!(local.code, Some("not-found"));
+        // No `embarch-api`, on the very topology that excuses a missing Core.
+        let no_api = check_binaries(Some(&core), None, None, None, TopologyClass::WslHost);
+        assert_eq!(no_api.status, Status::Fail);
+        assert_eq!(no_api.code, Some("not-found"));
+    }
+
+    /// Only ever asked when nothing was located, so the WSL2 arm wins over a
+    /// `local` winner: decision 30's ambiguity means loopback answering under
+    /// WSL2 does not place Core in the guest.
+    #[test]
+    fn where_core_belongs_prefers_a_declared_host_then_the_wsl2_boundary() {
+        assert_eq!(core_belongs_to(Some(TopologyClass::Local), Some("bench.local"), false), TopologyClass::Remote);
+        assert_eq!(core_belongs_to(None, Some("bench.local"), true), TopologyClass::Remote);
+        assert_eq!(core_belongs_to(Some(TopologyClass::Remote), None, true), TopologyClass::Remote);
+        assert_eq!(core_belongs_to(Some(TopologyClass::Local), None, true), TopologyClass::WslHost);
+        assert_eq!(core_belongs_to(None, None, true), TopologyClass::WslHost);
+        assert_eq!(core_belongs_to(Some(TopologyClass::Local), None, false), TopologyClass::Local);
+        assert_eq!(core_belongs_to(None, None, false), TopologyClass::Local);
+    }
+
+    /// Check 14's skip used to be "see check 1", which on `wsl-host` pointed
+    /// at a check that was itself wrong. Each class now names what is missing.
+    #[test]
+    fn check_14_says_why_it_cannot_run_without_pointing_at_check_1() {
+        for class in [TopologyClass::Local, TopologyClass::WslHost, TopologyClass::Remote] {
+            let c = check_flash_backend(None, class);
+            assert_eq!(c.status, Status::Warn, "{class:?}");
+            assert_eq!(c.code, Some("core-not-located"), "{class:?}");
+            assert!(!c.detail.contains("check 1"), "{}", c.detail);
+        }
+        assert!(check_flash_backend(None, TopologyClass::WslHost).detail.contains("sc.exe qc"));
+        assert!(check_flash_backend(None, TopologyClass::Remote).detail.contains("another machine"));
     }
 
     #[test]

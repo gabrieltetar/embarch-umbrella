@@ -25,6 +25,12 @@ pub enum FoundBy {
     SavedState,
     Path,
     WindowsConventionalDir,
+    /// The Windows service's own `BINARY_PATH_NAME` — the only authoritative
+    /// answer to "which `embarch-core.exe` does this machine run" on a
+    /// `wsl-host` (decision 38). Ranked ahead of the two guesses below it
+    /// because it is a reading rather than a guess, and behind `PATH` because
+    /// a binary this side of the boundary is one `doctor` can run cheaply.
+    WindowsServiceRegistration,
     /// The canonical copy `setup` just installed, this same run (`install.rs`,
     /// decision 28) — used only as a same-process fallback, since a `PATH`
     /// change this run just made isn't visible to this run's own environment
@@ -45,6 +51,7 @@ impl FoundBy {
             FoundBy::SavedState => "recorded by setup",
             FoundBy::Path => "PATH",
             FoundBy::WindowsConventionalDir => "Windows install directory",
+            FoundBy::WindowsServiceRegistration => "the Windows service's own registration",
             FoundBy::JustInstalled => "just installed here",
             FoundBy::PendingInstall => "would be installed by this run",
         }
@@ -203,6 +210,21 @@ pub fn locate_core(saved: Option<&Path>, under_wsl2: bool) -> Option<Located> {
     }
 
     if under_wsl2 {
+        // Decision 38: the service's own registration, before either guess.
+        // `deploy-core` has read it since decision 32 for the same reason —
+        // on this bench the live service runs out of a directory that appears
+        // on no conventional list — and a `doctor` that cannot find the Core
+        // the machine actually runs reports a healthy install as broken.
+        if let Some(path) = windows_core_service_binary_path() {
+            if is_file(&path) {
+                return Some(Located {
+                    path,
+                    found_by: FoundBy::WindowsServiceRegistration,
+                    windows_exe_from_wsl2: true,
+                });
+            }
+        }
+
         #[cfg(unix)]
         if let Some(path) = windows_localappdata_core_path() {
             if is_file(&path) {
@@ -367,8 +389,8 @@ mod tests {
     /// --bind 0.0.0.0` follows the exe), it contains a drive letter's colon
     /// after the field's own colon, and the exe path here appears on no
     /// conventional install list — which is exactly why `deploy-core` reads
-    /// the service's registration instead of guessing (design.md §3 decision
-    /// 37).
+    /// the service's registration instead of guessing (decision 32), and why
+    /// `locate_core` now reads it too (decision 38).
     #[test]
     fn the_services_own_binary_path_is_parsed_out_of_a_command_line() {
         let real = "[SC] QueryServiceConfig SUCCESS\n\n\
@@ -462,6 +484,19 @@ mod tests {
     #[test]
     fn output_with_no_state_line_at_all_is_none_rather_than_a_guess() {
         assert_eq!(parse_sc_query("SERVICE_NAME: com.embarch.core\n"), None);
+    }
+
+    /// The provenance string is user-facing: `doctor`'s check 1 prints it, and
+    /// "found by guessing at a conventional directory" versus "read off the
+    /// service registration" is the difference between a claim about *a*
+    /// binary and a claim about *the* one this machine runs (decision 38).
+    #[test]
+    fn the_service_registration_is_a_distinct_provenance() {
+        assert_ne!(
+            FoundBy::WindowsServiceRegistration.as_str(),
+            FoundBy::WindowsConventionalDir.as_str()
+        );
+        assert!(FoundBy::WindowsServiceRegistration.as_str().contains("service"));
     }
 
     #[test]
