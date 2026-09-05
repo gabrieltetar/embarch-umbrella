@@ -423,13 +423,178 @@ async fn check_token(probe: &CoreProbe, config: Option<&Config>) -> (Check, Opti
 
 // ---- check 5: probe list ----------------------------------------------------
 
-fn check_probes(authed: Option<&AuthedStatus>) -> Check {
-    match authed {
-        None => check(5, "at least one debug probe visible", Status::Warn, "skipped — no authenticated status (see check 4)"),
-        Some(a) if a.probes.is_empty() => {
-            check(5, "at least one debug probe visible", Status::Warn, "no probes reported — fine if none is plugged in right now")
+/// Where a Linux kernel exposes one directory per enumerated USB device, each
+/// with a world-readable `idVendor`. **Reading it needs no permission at all**,
+/// which is the whole reason this check can see a probe the enumeration could
+/// not open (decision 18): sysfs attributes are readable by anyone, while
+/// `/dev/bus/usb/...` is the node a udev rule has to grant.
+const SYSFS_USB_DEVICES: &str = "/sys/bus/usb/devices";
+
+/// USB vendor IDs, lowercase hex as sysfs writes them, that mean "this is a
+/// debug probe" strongly enough to turn a zero-probe warn into a fail.
+///
+/// **Deliberately not here: `0403` (FTDI).** Several JTAG adapters use it, and
+/// so does every third USB-serial cable on the bench — including the outpost
+/// link and the dev-bench console. A vendor ID that is a debug probe *some* of
+/// the time would make this check fail on a machine with no probe at all,
+/// which is worse than the warn it replaces.
+const DEBUG_PROBE_VENDOR_IDS: &[(&str, &str)] = &[
+    ("1366", "SEGGER — J-Link, including the on-board J-Link on every Nordic DK"),
+    ("0d28", "ARM CMSIS-DAP / DAPLink"),
+    ("0483", "STMicroelectronics — ST-Link"),
+    ("1fc9", "NXP — LPC-Link2"),
+    ("03eb", "Microchip/Atmel — EDBG, Atmel-ICE"),
+    ("2e8a", "Raspberry Pi — Debug Probe"),
+    ("1d50", "OpenMoko-assigned — Black Magic Probe"),
+    ("0451", "Texas Instruments — XDS110"),
+    ("c251", "Keil — ULINK"),
+];
+
+/// One USB device whose vendor ID is on the list above.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UsbProbeHit {
+    vendor_id: String,
+    /// What `DEBUG_PROBE_VENDOR_IDS` calls that vendor.
+    vendor: &'static str,
+    /// The kernel's `product` string, when the device published one. Purely
+    /// for the message — the verdict never depends on it.
+    product: Option<String>,
+}
+
+/// What the USB device tree was able to say, which is not the same question as
+/// what it holds. **Both "there is no probe" and "nobody could look" end in the
+/// same warn today**, and the two have to stay distinguishable in `--json`
+/// (decision 37) or a UI cannot tell a clean machine from an unanswerable one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum UsbScan {
+    /// Not a Linux host. macOS and Windows do not have this permission model,
+    /// so decision 18 leaves their behaviour exactly as it was.
+    NotLinux,
+    /// Linux, but Core enumerates probes on a *different* machine — `wsl-host`
+    /// or `remote`. Scanning this host's USB tree would answer confidently
+    /// about the wrong computer, which is check 14's mistake (decision 31)
+    /// repeated with a different peripheral.
+    CoreElsewhere,
+    /// Linux, Core on this machine: every device on the bus whose vendor ID is
+    /// a known debug-probe vendor.
+    Scanned(Vec<UsbProbeHit>),
+}
+
+/// Decides whether the scan can mean anything before running it. `cfg!` rather
+/// than `#[cfg]` so the scanner and every branch below compile — and are
+/// tested — on all three hosts.
+fn usb_scan_for(class: Option<TopologyClass>) -> UsbScan {
+    if !cfg!(target_os = "linux") {
+        return UsbScan::NotLinux;
+    }
+    match class {
+        Some(TopologyClass::Local) => {
+            UsbScan::Scanned(scan_usb_debug_probes(Path::new(SYSFS_USB_DEVICES)))
         }
-        Some(a) => check(5, "at least one debug probe visible", Status::Pass, format!("{} probe(s)", a.probes.len())),
+        _ => UsbScan::CoreElsewhere,
+    }
+}
+
+/// Reads `<devices>/*/idVendor`. Interface directories (`1-2:1.0`) carry no
+/// `idVendor`, so they drop out by failing the read rather than by a name
+/// rule; a missing tree reads as an empty bus, never as an error, because a
+/// diagnostic that fails to diagnose must not fail the run.
+fn scan_usb_debug_probes(devices: &Path) -> Vec<UsbProbeHit> {
+    let Ok(entries) = std::fs::read_dir(devices) else {
+        return Vec::new();
+    };
+    let mut hits = Vec::new();
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        let Ok(raw) = std::fs::read_to_string(dir.join("idVendor")) else {
+            continue;
+        };
+        let vendor_id = raw.trim().to_ascii_lowercase();
+        let Some((_, vendor)) = DEBUG_PROBE_VENDOR_IDS.iter().find(|(id, _)| *id == vendor_id)
+        else {
+            continue;
+        };
+        let product = std::fs::read_to_string(dir.join("product"))
+            .ok()
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty());
+        hits.push(UsbProbeHit { vendor_id, vendor, product });
+    }
+    hits.sort_by(|a, b| (&a.vendor_id, &a.product).cmp(&(&b.vendor_id, &b.product)));
+    hits.dedup();
+    hits
+}
+
+fn describe_hit(hit: &UsbProbeHit) -> String {
+    match &hit.product {
+        Some(p) => format!("{p} ({}, {})", hit.vendor_id, hit.vendor),
+        None => format!("{} ({})", hit.vendor_id, hit.vendor),
+    }
+}
+
+const CHECK_5_NAME: &str = "at least one debug probe visible";
+
+fn check_probes(authed: Option<&AuthedStatus>, scan: &UsbScan) -> Check {
+    let Some(a) = authed else {
+        return with_code(
+            check(5, CHECK_5_NAME, Status::Warn, "skipped — no authenticated status (see check 4)"),
+            "no-status",
+        );
+    };
+    if !a.probes.is_empty() {
+        return with_code(
+            check(5, CHECK_5_NAME, Status::Pass, format!("{} probe(s)", a.probes.len())),
+            "probes-present",
+        );
+    }
+    match scan {
+        UsbScan::Scanned(hits) if !hits.is_empty() => {
+            let listed = hits.iter().map(describe_hit).collect::<Vec<_>>().join("; ");
+            with_code(
+                with_fix(
+                    check(
+                        5,
+                        CHECK_5_NAME,
+                        Status::Fail,
+                        format!(
+                            "Core enumerated no probes, but this machine's USB bus holds {}. \
+                             Attached and not permitted, not unplugged.",
+                            listed
+                        ),
+                    ),
+                    "the current user can't open the probe's USB node. Install debug-probe udev \
+                     rules into /etc/udev/rules.d/ (probe-rs ships 69-probe-rs.rules), then \
+                     `sudo udevadm control --reload && sudo udevadm trigger`, and unplug and \
+                     re-plug the probe. Nothing here can grant that permission for you.",
+                ),
+                "probe-not-permitted",
+            )
+        }
+        UsbScan::Scanned(_) => with_code(
+            check(
+                5,
+                CHECK_5_NAME,
+                Status::Warn,
+                "no probes reported, and no known debug-probe vendor ID on this machine's USB bus \
+                 either — genuinely nothing plugged in",
+            ),
+            "no-probe-found",
+        ),
+        UsbScan::NotLinux => with_code(
+            check(5, CHECK_5_NAME, Status::Warn, "no probes reported — fine if none is plugged in right now"),
+            "no-probe-unchecked",
+        ),
+        UsbScan::CoreElsewhere => with_code(
+            check(
+                5,
+                CHECK_5_NAME,
+                Status::Warn,
+                "no probes reported — fine if none is plugged in right now. Core enumerates on \
+                 another machine, so this host's USB bus can't tell attached-but-not-permitted \
+                 apart from unplugged.",
+            ),
+            "no-probe-unchecked",
+        ),
     }
 }
 
@@ -1859,7 +2024,10 @@ pub async fn doctor(json: bool) -> i32 {
     let check2 = check_service(&core_probe, host.as_deref(), core.as_ref());
     let check3 = check_reachable(&core_probe);
     let (check4, authed) = check_token(&core_probe, config.as_ref()).await;
-    let check5 = check_probes(authed.as_ref());
+    // Decision 18: the USB-tree read only means something where Core
+    // enumerates on *this* machine, and only on Linux.
+    let usb_scan = usb_scan_for(core_probe.winner_class);
+    let check5 = check_probes(authed.as_ref(), &usb_scan);
     let projects: &[ProjectConfig] = config.as_ref().map(|c| c.projects.as_slice()).unwrap_or(&[]);
     let check7 = check_build_commands(projects);
     let check8 = check_chip(projects);
@@ -2046,6 +2214,117 @@ mod tests {
         ));
         std::fs::create_dir_all(&base).unwrap();
         TempDir(base)
+    }
+
+    // ---- check 5: attached-but-not-permitted (decision 18) -----------------
+
+    fn usb_device(root: &Path, name: &str, vid: &str, product: Option<&str>) {
+        let dir = root.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        // The kernel writes a trailing newline; parsing has to survive it.
+        std::fs::write(dir.join("idVendor"), format!("{vid}\n")).unwrap();
+        if let Some(p) = product {
+            std::fs::write(dir.join("product"), format!("{p}\n")).unwrap();
+        }
+    }
+
+    fn no_probes() -> AuthedStatus {
+        AuthedStatus { probes: Vec::new(), study_designer_schema_version: None, core_version: None }
+    }
+
+    #[test]
+    fn check_5_fails_when_a_probe_is_on_the_bus_and_core_enumerated_none() {
+        let dir = tempdir();
+        usb_device(dir.path(), "1-2", "1366", Some("J-Link"));
+        usb_device(dir.path(), "1-2:1.0", "", None); // an interface, no real idVendor
+        let scan = UsbScan::Scanned(scan_usb_debug_probes(dir.path()));
+        let c = check_probes(Some(&no_probes()), &scan);
+        assert_eq!(c.status, Status::Fail);
+        assert_eq!(c.code, Some("probe-not-permitted"));
+        assert!(c.detail.contains("J-Link"), "{}", c.detail);
+        let fix = c.fix.unwrap();
+        assert!(fix.contains("udev"), "{fix}");
+        assert!(fix.contains("udevadm"), "{fix}");
+    }
+
+    #[test]
+    fn check_5_stays_a_warn_when_the_bus_holds_no_probe_vendor() {
+        let dir = tempdir();
+        usb_device(dir.path(), "1-1", "046d", Some("Webcam")); // Logitech, not a probe
+        let scan = UsbScan::Scanned(scan_usb_debug_probes(dir.path()));
+        let c = check_probes(Some(&no_probes()), &scan);
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.code, Some("no-probe-found"));
+        assert!(c.fix.is_none());
+    }
+
+    #[test]
+    fn ftdi_is_not_a_probe_vendor_because_every_serial_cable_shares_it() {
+        let dir = tempdir();
+        usb_device(dir.path(), "1-1", "0403", Some("FT232R USB UART"));
+        assert!(scan_usb_debug_probes(dir.path()).is_empty());
+    }
+
+    #[test]
+    fn a_missing_sysfs_tree_reads_as_an_empty_bus_not_an_error() {
+        let dir = tempdir();
+        assert!(scan_usb_debug_probes(&dir.path().join("no-such-thing")).is_empty());
+    }
+
+    #[test]
+    fn the_usb_scan_only_runs_on_linux_with_core_on_this_machine() {
+        // The one assertion that has to hold on all three hosts: macOS and
+        // Windows never scan, so decision 18 leaves them exactly as they were.
+        let local = usb_scan_for(Some(TopologyClass::Local));
+        if cfg!(target_os = "linux") {
+            assert!(matches!(local, UsbScan::Scanned(_)));
+        } else {
+            assert_eq!(local, UsbScan::NotLinux);
+        }
+        for elsewhere in [TopologyClass::WslHost, TopologyClass::Remote] {
+            let expected =
+                if cfg!(target_os = "linux") { UsbScan::CoreElsewhere } else { UsbScan::NotLinux };
+            assert_eq!(usb_scan_for(Some(elsewhere)), expected);
+        }
+    }
+
+    #[test]
+    fn check_5_on_a_non_linux_host_keeps_the_original_warn_wording() {
+        let c = check_probes(Some(&no_probes()), &UsbScan::NotLinux);
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.code, Some("no-probe-unchecked"));
+        assert_eq!(c.detail, "no probes reported — fine if none is plugged in right now");
+        assert!(c.fix.is_none());
+    }
+
+    #[test]
+    fn check_5_says_so_when_core_enumerates_on_another_machine() {
+        let c = check_probes(Some(&no_probes()), &UsbScan::CoreElsewhere);
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.code, Some("no-probe-unchecked"));
+        assert!(c.detail.contains("another machine"), "{}", c.detail);
+    }
+
+    #[test]
+    fn check_5_passes_and_never_scans_when_core_reports_a_probe() {
+        let authed = AuthedStatus {
+            probes: vec![serde_json::json!({"identifier": "whatever"})],
+            study_designer_schema_version: None,
+            core_version: None,
+        };
+        let dir = tempdir();
+        usb_device(dir.path(), "1-2", "1366", Some("J-Link"));
+        let scan = UsbScan::Scanned(scan_usb_debug_probes(dir.path()));
+        let c = check_probes(Some(&authed), &scan);
+        assert_eq!(c.status, Status::Pass);
+        assert_eq!(c.code, Some("probes-present"));
+    }
+
+    #[test]
+    fn check_5_skips_distinguishably_when_there_is_no_authenticated_status() {
+        let c = check_probes(None, &UsbScan::CoreElsewhere);
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.code, Some("no-status"));
     }
 
     fn git(dir: &Path, args: &[&str]) {
