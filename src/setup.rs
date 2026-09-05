@@ -24,15 +24,30 @@ use crate::state::{self, State};
 /// validating the value is `doctor`'s job (design.md §5 check 4), and needs
 /// the discovery logic `embarch-api` already has.
 pub fn token_path_for(class: TopologyClass, windows: bool) -> Option<PathBuf> {
+    Some(data_dir_for(class, windows)?.join("token"))
+}
+
+/// `embarch-core`'s machine-wide data directory, as seen from here — the one
+/// path convention that holds every artefact Core owns: the token,
+/// `study_results/`, `logs/` and `embarch-topology`'s `enrollment.toml`
+/// ([embarch-core/spec.md](../embarch-doc/embarch-core/spec.md) §6).
+///
+/// Pure, and **class-aware rather than host-aware**, which is the whole
+/// reason `doctor`'s check 16 uses this and not `token.rs`'s discovery: a
+/// `Remote` Core's data directory is not on this filesystem at all, and a
+/// measurement of a directory that happens to exist locally would be a
+/// confident report about the wrong machine.
+pub fn data_dir_for(class: TopologyClass, windows: bool) -> Option<PathBuf> {
     match class {
-        // A Windows-hosted Core from a WSL2 guest: same file, reached through
-        // the /mnt mount. Assumes the standard %ProgramData% location, which
-        // is the same assumption embarch-token.md §6 already records as an
-        // unexercised edge case for relocated ProgramData.
-        TopologyClass::WslHost => Some(PathBuf::from("/mnt/c/ProgramData/embarch/token")),
-        TopologyClass::Local if windows => std::env::var_os("ProgramData")
-            .map(|pd| PathBuf::from(pd).join("embarch").join("token")),
-        TopologyClass::Local => Some(PathBuf::from("/var/lib/embarch/token")),
+        // A Windows-hosted Core from a WSL2 guest: same files, reached
+        // through the /mnt mount. Assumes the standard %ProgramData%
+        // location, which is the same assumption embarch-token.md §6 already
+        // records as an unexercised edge case for relocated ProgramData.
+        TopologyClass::WslHost => Some(PathBuf::from("/mnt/c/ProgramData/embarch")),
+        TopologyClass::Local if windows => {
+            std::env::var_os("ProgramData").map(|pd| PathBuf::from(pd).join("embarch"))
+        }
+        TopologyClass::Local => Some(PathBuf::from("/var/lib/embarch")),
         // No shared filesystem — the token has to be copied by hand
         // (design.md §6), so there is no local path to check.
         TopologyClass::Remote => None,

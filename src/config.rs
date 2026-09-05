@@ -73,6 +73,13 @@ pub struct ProjectConfig {
     /// Only meaningful for `discovery = "zephyr-west"`.
     #[serde(default)]
     pub west_binary: Option<PathBuf>,
+    /// Only meaningful for `discovery = "zephyr-west"`: the parent under
+    /// which `embarch-api` gives each distinct target its own build
+    /// subdirectory (`embarch-api/src/resolve.rs`, named by that crate's
+    /// `zephyr::Target::build_dir_name`). Mirrored here for `doctor`'s
+    /// check 16, which counts those subdirectories.
+    #[serde(default)]
+    pub build_dir_root: Option<PathBuf>,
 }
 
 impl ProjectConfig {
@@ -91,6 +98,23 @@ impl ProjectConfig {
     /// project's artifact path is resolved per call, not stored.
     pub fn resolved_artifact_path(&self) -> Option<PathBuf> {
         self.artifact_path.as_ref().map(|p| self.build_dir().join(p))
+    }
+
+    /// `build_dir_root` as *this* machine reaches it.
+    ///
+    /// `embarch-api` uses the configured value verbatim and runs a
+    /// `zephyr-west` build with `cwd = source_path`, so a **relative** root —
+    /// which is exactly what `init` writes (`embarch/build`) — really lands
+    /// under `source_path`. Resolving it the same way here is what makes
+    /// check 16 count the directories a build would actually create, rather
+    /// than a path relative to wherever `doctor` happened to be run.
+    pub fn resolved_build_dir_root(&self) -> Option<PathBuf> {
+        let root = self.build_dir_root.as_ref()?;
+        Some(if root.is_absolute() {
+            root.clone()
+        } else {
+            self.source_path.join(root)
+        })
     }
 }
 

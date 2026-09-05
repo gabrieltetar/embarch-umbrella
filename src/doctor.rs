@@ -1622,6 +1622,212 @@ fn check_core_build(authed: Option<&AuthedStatus>, core_version_output: Option<&
     }
 }
 
+// ---- check 16: what grows, and by how much ----------------------------------
+
+/// `study_results/` usage, as `doctor` measures it.
+struct ResultsUsage {
+    entries: usize,
+    bytes: u64,
+}
+
+fn human_bytes(n: u64) -> String {
+    const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
+    let mut value = n as f64;
+    let mut unit = 0;
+    while value >= 1024.0 && unit + 1 < UNITS.len() {
+        value /= 1024.0;
+        unit += 1;
+    }
+    if unit == 0 {
+        format!("{n} B")
+    } else {
+        format!("{value:.1} {}", UNITS[unit])
+    }
+}
+
+/// Count `study_results/<study_id>/` entries and the bytes under them.
+/// `None` means the directory does not exist — a machine that has never run
+/// a study, which is a state and not a failure.
+fn measure_results(dir: &Path) -> Option<ResultsUsage> {
+    let read = std::fs::read_dir(dir).ok()?;
+    let mut usage = ResultsUsage { entries: 0, bytes: 0 };
+    for entry in read.flatten() {
+        if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+            usage.entries += 1;
+            usage.bytes += dir_bytes(&entry.path(), 0);
+        }
+    }
+    Some(usage)
+}
+
+/// Sum of regular-file sizes under `dir`.
+///
+/// **`DirEntry::file_type` does not follow symlinks**, so a link into a
+/// parent is neither descended into nor counted as a file — a `doctor` check
+/// must not be the thing that spins forever on somebody's stray symlink. The
+/// depth cap is the second belt: `study_results/<id>/streams/<file>` is three
+/// levels, so six is slack rather than a real limit.
+fn dir_bytes(dir: &Path, depth: usize) -> u64 {
+    const MAX_DEPTH: usize = 6;
+    if depth > MAX_DEPTH {
+        return 0;
+    }
+    let Ok(read) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in read.flatten() {
+        let Ok(kind) = entry.file_type() else { continue };
+        if kind.is_dir() {
+            total += dir_bytes(&entry.path(), depth + 1);
+        } else if kind.is_file() {
+            total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+        }
+    }
+    total
+}
+
+/// How many per-target build directories exist under a project's
+/// `build_dir_root`. `None` means the root does not exist yet.
+fn count_build_dirs(root: &Path) -> Option<usize> {
+    let read = std::fs::read_dir(root).ok()?;
+    Some(
+        read.flatten()
+            .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+            .count(),
+    )
+}
+
+/// Check 16 — decision 26's unconditional half, and **only** that half.
+///
+/// It measures and never deletes. Two separate reasons, worth keeping apart:
+///
+/// - **`study_results/` retention is not this crate's**, and stopped being an
+///   open problem when `embarch-core` shipped `sweep_study_results` /
+///   `EMBARCH_STUDY_RESULTS_KEEP`. What is left for `doctor` is that the
+///   sweep is a *count*, so the bytes behind those 50 runs are still nobody's
+///   bound — which is exactly the number this reports.
+/// - **Nothing here can name a valid build directory**, only count
+///   directories. `crate::zephyr` counts targets and deliberately overcounts
+///   (decision 17's amendment); naming them is `embarch-api list-targets`'s,
+///   which this crate does not yet call. Deleting on an oracle this crate
+///   does not have is what decision 26's "never a currently-valid target's
+///   directory" clause exists to prevent.
+fn check_growth(
+    winner: Option<TopologyClass>,
+    fallback: TopologyClass,
+    projects: &[ProjectConfig],
+) -> Check {
+    let (class, assumed) = match winner {
+        Some(c) => (c, false),
+        None => (fallback, true),
+    };
+    let dir = setup::data_dir_for(class, cfg!(windows)).map(|d| d.join("study_results"));
+    let note = match (class, &dir) {
+        (TopologyClass::Remote, _) => {
+            "study_results/ is on the remote Core's machine and can't be measured from here"
+                .to_string()
+        }
+        (_, None) => format!("no data directory resolves for a {} Core here", class.as_str()),
+        (_, Some(_)) if assumed => format!(
+            "assuming a {} Core — check 3 found no winner to ask",
+            class.as_str()
+        ),
+        _ => String::new(),
+    };
+    judge_growth(dir.as_deref(), &note, projects)
+}
+
+/// The pure half of check 16, so every test can hand it a temp directory.
+/// **Nothing under test ever resolves a real data directory**, which is the
+/// property that keeps `cargo test` off a live bench's captures.
+fn judge_growth(results_dir: Option<&Path>, note: &str, projects: &[ProjectConfig]) -> Check {
+    const NAME: &str = "Result and build-directory growth";
+
+    let mut parts: Vec<String> = Vec::new();
+    let mut measured = false;
+
+    if let Some(dir) = results_dir {
+        match measure_results(dir) {
+            Some(u) => {
+                measured = true;
+                parts.push(format!(
+                    "study_results/: {} entr{}, {} — swept to embarch-core's \
+                     EMBARCH_STUDY_RESULTS_KEEP (default 50), which bounds the count and not the size",
+                    u.entries,
+                    if u.entries == 1 { "y" } else { "ies" },
+                    human_bytes(u.bytes)
+                ));
+            }
+            None => {
+                measured = true;
+                parts.push(format!("study_results/: nothing yet at {}", dir.display()));
+            }
+        }
+    }
+
+    let mut static_projects = 0usize;
+    for project in projects {
+        if !project.is_zephyr_west() {
+            static_projects += 1;
+            continue;
+        }
+        match project.resolved_build_dir_root() {
+            None => parts.push(format!(
+                "{}: zephyr-west with no build_dir_root in config, so nothing to count",
+                project.name
+            )),
+            Some(root) => match count_build_dirs(&root) {
+                Some(n) => {
+                    measured = true;
+                    parts.push(format!(
+                        "{}: {n} build director{} under {} — nothing prunes these (decision 26)",
+                        project.name,
+                        if n == 1 { "y" } else { "ies" },
+                        root.display()
+                    ));
+                }
+                None => {
+                    measured = true;
+                    parts.push(format!(
+                        "{}: no build directories yet under {}",
+                        project.name,
+                        root.display()
+                    ));
+                }
+            },
+        }
+    }
+    if static_projects > 0 {
+        parts.push(format!(
+            "{static_projects} static project(s): one build directory each by construction (decision 10)"
+        ));
+    }
+
+    if !note.is_empty() {
+        parts.push(note.to_string());
+    }
+    let detail = parts.join("; ");
+
+    if measured {
+        check(16, NAME, Status::Pass, detail)
+    } else {
+        check(
+            16,
+            NAME,
+            Status::Warn,
+            format!(
+                "nothing to measure — {}",
+                if detail.is_empty() {
+                    "no config loaded and no reachable data directory".to_string()
+                } else {
+                    detail
+                }
+            ),
+        )
+    }
+}
+
 // ---- driver ------------------------------------------------------------------
 
 pub async fn doctor(json: bool) -> i32 {
@@ -1667,10 +1873,18 @@ pub async fn doctor(json: bool) -> i32 {
     let check13 = check_firmware_version(&hello, &saved);
     let check14 = check_flash_backend(core.as_ref());
     let check15 = check_core_build(authed.as_ref(), core_version_output.as_deref());
+    // Check 3's winner is the honest source for *which machine* holds Core's
+    // data directory; with no winner, this host's own shape is the stated
+    // assumption rather than a silent one.
+    let check16 = check_growth(
+        core_probe.winner_class,
+        if under_wsl2 { TopologyClass::WslHost } else { TopologyClass::Local },
+        projects,
+    );
 
     let checks = vec![
         check1, check2, check3, check4, check5, check6, check7, check8, check9, check10, check11, check12,
-        check13, check14, check15,
+        check13, check14, check15, check16,
     ];
 
     let any_fail = checks.iter().any(|c| c.status == Status::Fail);
@@ -2414,6 +2628,143 @@ mod tests {
             chip: Some(chip.to_string()),
             artifact_path_for_core: None,
             west_binary: None,
+            build_dir_root: None,
         }
+    }
+
+    // ---- check 16 -----------------------------------------------------------
+    //
+    // Every one of these runs against a temp directory. None of them resolves
+    // a real Core data directory, and nothing in check 16 deletes anything —
+    // `--prune` is deliberately not built (decision 26's amendment).
+
+    fn zephyr_west_project(name: &str, source: &Path, build_dir_root: Option<&str>) -> ProjectConfig {
+        ProjectConfig {
+            name: name.to_string(),
+            source_path: source.to_path_buf(),
+            discovery: config::Discovery::ZephyrWest,
+            build_cwd: None,
+            build_command: None,
+            artifact_path: None,
+            chip: None,
+            artifact_path_for_core: None,
+            west_binary: Some(PathBuf::from("west")),
+            build_dir_root: build_dir_root.map(PathBuf::from),
+        }
+    }
+
+    #[test]
+    fn check_16_counts_result_entries_and_their_bytes() {
+        let dir = tempdir();
+        let results = dir.path().join("study_results");
+        for id in ["a", "b"] {
+            let streams = results.join(id).join("streams");
+            std::fs::create_dir_all(&streams).unwrap();
+            std::fs::write(results.join(id).join("events.json"), vec![b'x'; 100]).unwrap();
+            std::fs::write(streams.join("tap.bin"), vec![b'y'; 900]).unwrap();
+        }
+        let c = judge_growth(Some(&results), "", &[]);
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.detail.contains("2 entries"), "{}", c.detail);
+        assert!(c.detail.contains("2.0 KiB"), "{}", c.detail);
+        // Core owns the retention, and the reader is told which knob bounds
+        // it — and that it bounds the count, not the bytes just reported.
+        assert!(c.detail.contains("EMBARCH_STUDY_RESULTS_KEEP"), "{}", c.detail);
+    }
+
+    #[test]
+    fn check_16_reports_a_machine_that_has_never_run_a_study() {
+        let dir = tempdir();
+        let c = judge_growth(Some(&dir.path().join("study_results")), "", &[]);
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.detail.contains("nothing yet"), "{}", c.detail);
+    }
+
+    #[test]
+    fn check_16_counts_build_directories_per_zephyr_west_project() {
+        let dir = tempdir();
+        let root = dir.path().join("embarch").join("build");
+        for target in ["ref_board-default-none-widget", "ref_board-os_5led-evt1-widget"] {
+            std::fs::create_dir_all(root.join(target)).unwrap();
+        }
+        // A stray file beside them is not a build directory.
+        std::fs::write(root.join("notes.txt"), "x").unwrap();
+        let project = zephyr_west_project("fw", dir.path(), Some("embarch/build"));
+        let c = judge_growth(None, "", std::slice::from_ref(&project));
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.detail.contains("fw: 2 build directories"), "{}", c.detail);
+        assert!(c.detail.contains("nothing prunes these"), "{}", c.detail);
+    }
+
+    #[test]
+    fn check_16_resolves_a_relative_build_dir_root_under_source_path() {
+        let dir = tempdir();
+        std::fs::create_dir_all(dir.path().join("embarch/build/a")).unwrap();
+        let project = zephyr_west_project("fw", dir.path(), Some("embarch/build"));
+        assert_eq!(
+            project.resolved_build_dir_root(),
+            Some(dir.path().join("embarch").join("build"))
+        );
+        let c = judge_growth(None, "", std::slice::from_ref(&project));
+        assert!(c.detail.contains("fw: 1 build directory"), "{}", c.detail);
+    }
+
+    #[test]
+    fn check_16_says_a_static_project_has_one_build_directory_by_construction() {
+        let c = judge_growth(None, "", &[sample_project("legacy", "nRF54L15")]);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.detail.contains("by construction"), "{}", c.detail);
+    }
+
+    #[test]
+    fn check_16_never_fails_the_run_even_with_nothing_to_measure() {
+        let c = judge_growth(None, "study_results/ is on the remote Core's machine", &[]);
+        assert_eq!(c.status, Status::Warn);
+        assert_ne!(c.status, Status::Fail);
+        assert!(c.detail.contains("remote Core"), "{}", c.detail);
+    }
+
+    #[test]
+    fn check_16_names_the_assumption_when_check_3_found_no_winner() {
+        let dir = tempdir();
+        let results = dir.path().join("study_results");
+        std::fs::create_dir_all(results.join("s1")).unwrap();
+        let c = judge_growth(Some(&results), "assuming a wsl-host Core — check 3 found no winner to ask", &[]);
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.detail.contains("check 3 found no winner"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_remote_core_has_no_local_data_directory_to_measure() {
+        // The reason check 16 asks `setup::data_dir_for` rather than
+        // `token.rs`: a Remote Core's results are on another machine, and a
+        // local directory that happens to exist would be the wrong answer
+        // reported confidently.
+        assert_eq!(setup::data_dir_for(TopologyClass::Remote, false), None);
+        assert_eq!(
+            setup::data_dir_for(TopologyClass::WslHost, false),
+            Some(PathBuf::from("/mnt/c/ProgramData/embarch"))
+        );
+    }
+
+    #[test]
+    fn dir_bytes_does_not_follow_a_symlink_out_of_the_tree() {
+        let dir = tempdir();
+        let inner = dir.path().join("study_results").join("s1");
+        std::fs::create_dir_all(&inner).unwrap();
+        std::fs::write(inner.join("events.json"), vec![b'x'; 10]).unwrap();
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.path(), inner.join("loop")).unwrap();
+        let usage = measure_results(&dir.path().join("study_results")).unwrap();
+        assert_eq!(usage.entries, 1);
+        assert_eq!(usage.bytes, 10);
+    }
+
+    #[test]
+    fn human_bytes_reads_as_a_size_and_not_a_float_at_zero() {
+        assert_eq!(human_bytes(0), "0 B");
+        assert_eq!(human_bytes(1023), "1023 B");
+        assert_eq!(human_bytes(1024), "1.0 KiB");
+        assert_eq!(human_bytes(1024 * 1024 * 3 / 2), "1.5 MiB");
     }
 }
