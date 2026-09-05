@@ -13,8 +13,11 @@
 //! rule check 11 was violating for months by returning a hardcoded warn whose
 //! stated reason had stopped being true (decision 33).
 
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::time::Duration;
 
 use embarch_topology::software::{self as topology, ProbeOutcome, TopologyClass};
 
@@ -55,6 +58,15 @@ pub struct Check {
     pub status: Status,
     pub detail: String,
     pub fix: Option<String>,
+    /// A stable machine-readable outcome, for a check whose `status` alone
+    /// does not say which state it is in (decision 37). `None` — every check
+    /// but 10 today — renders as JSON `null` rather than being omitted, so
+    /// the key is always present and a consumer never has to distinguish
+    /// "absent" from "no code".
+    ///
+    /// **Never derived from `detail`.** The whole point is that a consumer
+    /// does not have to match on a sentence written for a human.
+    pub code: Option<&'static str>,
 }
 
 fn check(n: u8, name: &'static str, status: Status, detail: impl Into<String>) -> Check {
@@ -64,7 +76,13 @@ fn check(n: u8, name: &'static str, status: Status, detail: impl Into<String>) -
         status,
         detail: detail.into(),
         fix: None,
+        code: None,
     }
+}
+
+fn with_code(mut c: Check, code: &'static str) -> Check {
+    c.code = Some(code);
+    c
 }
 
 fn with_fix(mut c: Check, fix: impl Into<String>) -> Check {
@@ -688,30 +706,337 @@ fn check_artifact_paths(projects: &[ProjectConfig]) -> Check {
     c
 }
 
-// ---- check 10: MCP registration ---------------------------------------------
+// ---- check 10: the MCP server is registered *and* answers --------------------
 
 const MCP_SERVER_NAME: &str = "embarch";
 
-fn check_mcp(config_path: Option<&Path>, api: Option<&Located>) -> Check {
-    let fix = || {
-        format!(
-            "claude mcp add {MCP_SERVER_NAME} -- {} --config {}",
-            api.map(|a| a.path.display().to_string()).unwrap_or_else(|| "<path to embarch-api>".to_string()),
-            config_path.map(|p| p.display().to_string()).unwrap_or_else(|| "<repo>/embarch/embarch.toml".to_string()),
-        )
+/// How long the registered command gets to come up and answer one
+/// `initialize`. Short on purpose: `doctor` is already the heavy command
+/// (decision 11), and a server that needs longer than this to say hello is a
+/// finding rather than a slow success. Measured against nothing — this is an
+/// assumed budget, and the timeout outcome is reported distinctly (decision
+/// 23) precisely so a wrong budget shows up as itself instead of as a failure.
+const MCP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// The MCP protocol revision this handshake asks for. A server that speaks a
+/// different one is expected to answer with the revision it does speak rather
+/// than to error, so this number being stale is not by itself a failure —
+/// what the check reads is whether a well-formed `result` came back at all.
+const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
+
+/// Cap on captured stderr, so a server that fails by printing forever cannot
+/// grow `doctor`'s output without bound.
+const MCP_STDERR_CAP: usize = 2000;
+
+/// What `claude mcp get` said, in the four shapes that lead to different
+/// verdicts. Separated from the verdict so the parse is testable without a
+/// `claude` CLI on the machine running the tests.
+#[derive(Debug, PartialEq, Eq)]
+enum McpRegistration {
+    /// No `claude` on `PATH` at all. Not a fault: `doctor` runs on machines
+    /// that never registered anything.
+    NoCli,
+    /// `claude mcp get` exited non-zero — nothing is registered under this name.
+    NotRegistered,
+    /// Registered, and the entry named a command this check can spawn.
+    Registered { command: String, args: Vec<String> },
+    /// Registered, but nothing in the output looked like a command line.
+    /// **Its own verdict, not a pass**: this check's whole reason for existing
+    /// is that a registration entry proves nothing, so falling back to "well,
+    /// it's registered" would be the bug decision 23 was written against.
+    UnreadableEntry,
+}
+
+/// What one spawn of the registered command did. Three outcomes, kept apart
+/// all the way into `--json` (decision 23, decision 37).
+#[derive(Debug, PartialEq, Eq)]
+enum HandshakeOutcome {
+    /// A JSON-RPC `result` came back for our `initialize`. The string is
+    /// whatever the server called itself, when it said.
+    Answered(String),
+    /// It never started, exited first, or answered an `error`.
+    Failed(String),
+    /// It started and said nothing in time.
+    TimedOut,
+}
+
+/// Pull the command line out of `claude mcp get <name>`'s human output.
+///
+/// **The shape here is assumed, not measured** — see `open.md`: no walk of the
+/// onboarding guide has yet run from an environment with the agent CLI
+/// present, so nothing in this suite has ever seen this output for real. That
+/// is why an output this cannot read is [`McpRegistration::UnreadableEntry`]
+/// and a warn naming the reason, rather than either a pass or a fail: a
+/// wrong guess here must not be able to invent a verdict about the server.
+fn parse_registered_command(out: &str) -> Option<(String, Vec<String>)> {
+    let field = |label: &str| {
+        out.lines().find_map(|line| {
+            let line = line.trim();
+            let rest = line.strip_prefix(label)?.strip_prefix(':')?;
+            Some(rest.trim().to_string())
+        })
     };
 
-    match Command::new("claude").args(["mcp", "get", MCP_SERVER_NAME]).output() {
-        Ok(o) if o.status.success() => check(10, "MCP server registered", Status::Pass, "registered"),
-        Ok(_) => with_fix(
-            check(10, "MCP server registered", Status::Fail, "not registered"),
-            fix(),
-        ),
-        Err(_) => with_fix(
-            check(10, "MCP server registered", Status::Warn, "claude CLI not found here — can't verify"),
-            fix(),
-        ),
+    let command = field("Command").filter(|c| !c.is_empty())?;
+    let args = field("Args").map(|a| split_args(&a)).unwrap_or_default();
+    Some((command, args))
+}
+
+/// Split an argument line on whitespace, honouring double quotes so a config
+/// path with a space in it survives — which on Windows is the common case,
+/// not the exotic one.
+fn split_args(line: &str) -> Vec<String> {
+    let mut args = Vec::new();
+    let mut cur = String::new();
+    let mut quoted = false;
+    let mut started = false;
+    for ch in line.chars() {
+        match ch {
+            '"' => {
+                quoted = !quoted;
+                started = true;
+            }
+            c if c.is_whitespace() && !quoted => {
+                if started {
+                    args.push(std::mem::take(&mut cur));
+                    started = false;
+                }
+            }
+            c => {
+                cur.push(c);
+                started = true;
+            }
+        }
     }
+    if started {
+        args.push(cur);
+    }
+    args
+}
+
+fn mcp_registration() -> McpRegistration {
+    match Command::new("claude").args(["mcp", "get", MCP_SERVER_NAME]).output() {
+        Ok(o) if o.status.success() => {
+            let out = String::from_utf8_lossy(&o.stdout);
+            match parse_registered_command(&out) {
+                Some((command, args)) => McpRegistration::Registered { command, args },
+                None => McpRegistration::UnreadableEntry,
+            }
+        }
+        Ok(_) => McpRegistration::NotRegistered,
+        Err(_) => McpRegistration::NoCli,
+    }
+}
+
+/// Spawn `command` and complete one JSON-RPC `initialize` round trip over its
+/// stdio, giving up after `timeout`.
+///
+/// **A hand-rolled one-shot exchange, deliberately not an MCP client**
+/// (decision 23): one request, one matching response, no session kept. The
+/// process is killed either way — this check starts a server it has no
+/// intention of using.
+fn mcp_initialize(command: &str, args: &[String], timeout: Duration) -> HandshakeOutcome {
+    let mut child = match Command::new(command)
+        .args(args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(e) => return HandshakeOutcome::Failed(format!("couldn't start `{command}`: {e}")),
+    };
+
+    let request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": MCP_PROTOCOL_VERSION,
+            "capabilities": {},
+            "clientInfo": { "name": "embarch-doctor", "version": env!("CARGO_PKG_VERSION") },
+        },
+    })
+    .to_string();
+
+    let mut stdin = child.stdin.take().expect("stdin piped");
+    let stdout = child.stdout.take().expect("stdout piped");
+    let mut stderr = child.stderr.take().expect("stderr piped");
+
+    // Drained on its own thread rather than read at the end: a server that
+    // fails by logging can fill the pipe buffer and block on the write, which
+    // would turn every noisy failure into a timeout.
+    let (err_tx, err_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = stderr.read_to_end(&mut buf);
+        buf.truncate(MCP_STDERR_CAP);
+        let _ = err_tx.send(String::from_utf8_lossy(&buf).trim().to_string());
+    });
+
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        // `stdin` is moved in and held until this thread ends, so the server
+        // does not see EOF — an MCP server reads stdin for the life of the
+        // session, and closing it is a shutdown signal, not a flush.
+        if let Err(e) = writeln!(stdin, "{request}").and_then(|()| stdin.flush()) {
+            let _ = tx.send(HandshakeOutcome::Failed(format!("couldn't write to its stdin: {e}")));
+            return;
+        }
+
+        let mut saw_output = false;
+        for line in BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if line.trim().is_empty() {
+                continue;
+            }
+            saw_output = true;
+            // Anything that is not our answer — a log line, a notification,
+            // a banner — is skipped rather than read as a failure.
+            let Ok(v) = serde_json::from_str::<serde_json::Value>(&line) else { continue };
+            if v.get("id").and_then(|i| i.as_u64()) != Some(1) {
+                continue;
+            }
+            let outcome = if let Some(result) = v.get("result") {
+                let name = result
+                    .get("serverInfo")
+                    .and_then(|s| s.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("no serverInfo");
+                HandshakeOutcome::Answered(name.to_string())
+            } else if let Some(err) = v.get("error") {
+                HandshakeOutcome::Failed(format!("it answered a JSON-RPC error: {err}"))
+            } else {
+                HandshakeOutcome::Failed("it answered without a result or an error".to_string())
+            };
+            let _ = tx.send(outcome);
+            return;
+        }
+
+        let _ = tx.send(HandshakeOutcome::Failed(if saw_output {
+            "it exited without answering initialize".to_string()
+        } else {
+            "it exited without saying anything".to_string()
+        }));
+    });
+
+    let outcome = rx.recv_timeout(timeout);
+    // Killed either way: on success there is a live server we do not want, and
+    // on a timeout killing it is also what unblocks the reader thread on EOF.
+    let _ = child.kill();
+    let _ = child.wait();
+
+    match outcome {
+        Ok(HandshakeOutcome::Failed(why)) => {
+            let stderr = err_rx.recv_timeout(Duration::from_millis(500)).unwrap_or_default();
+            HandshakeOutcome::Failed(if stderr.is_empty() {
+                why
+            } else {
+                format!("{why} — stderr: {}", stderr.replace('\n', " / "))
+            })
+        }
+        Ok(other) => other,
+        Err(_) => HandshakeOutcome::TimedOut,
+    }
+}
+
+/// The verdict, split out from both the `claude` call and the spawn so the
+/// mapping is testable on its own.
+fn judge_mcp(reg: &McpRegistration, handshake: Option<&HandshakeOutcome>, register_fix: &str) -> Check {
+    const NAME: &str = "MCP server registered and answering";
+
+    match (reg, handshake) {
+        (McpRegistration::NoCli, _) => with_code(
+            with_fix(
+                check(10, NAME, Status::Warn, "claude CLI not found here — can't verify"),
+                register_fix.to_string(),
+            ),
+            "no-cli",
+        ),
+        (McpRegistration::NotRegistered, _) => with_code(
+            with_fix(check(10, NAME, Status::Fail, "not registered"), register_fix.to_string()),
+            "not-registered",
+        ),
+        (McpRegistration::UnreadableEntry, _) => with_code(
+            with_fix(
+                check(
+                    10,
+                    NAME,
+                    Status::Warn,
+                    "registered, but `claude mcp get` named no command to spawn — can't handshake",
+                ),
+                format!("re-register it so the entry names the binary: {register_fix}"),
+            ),
+            "unreadable-entry",
+        ),
+        (McpRegistration::Registered { command, args }, outcome) => {
+            let line = || {
+                std::iter::once(command.clone())
+                    .chain(args.iter().cloned())
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            };
+            match outcome {
+                // Only reachable if a caller forgets to run the handshake;
+                // reported as itself rather than defaulting to a pass.
+                None => with_code(
+                    check(10, NAME, Status::Warn, "registered; handshake not attempted"),
+                    "no-handshake",
+                ),
+                Some(HandshakeOutcome::Answered(server)) => with_code(
+                    check(10, NAME, Status::Pass, format!("registered, and it answered initialize ({server})")),
+                    "handshake-ok",
+                ),
+                Some(HandshakeOutcome::Failed(why)) => with_code(
+                    with_fix(
+                        check(10, NAME, Status::Fail, format!("registered, but the handshake failed — {why}")),
+                        format!(
+                            "the registration exists and the command behind it is broken, so re-adding it fixes \
+                             nothing on its own. Run `{}` by hand to see why; if the binary moved, re-register: {register_fix}",
+                            line()
+                        ),
+                    ),
+                    "handshake-failed",
+                ),
+                Some(HandshakeOutcome::TimedOut) => with_code(
+                    with_fix(
+                        check(
+                            10,
+                            NAME,
+                            Status::Fail,
+                            format!(
+                                "registered, but it answered nothing within {}s",
+                                MCP_HANDSHAKE_TIMEOUT.as_secs()
+                            ),
+                        ),
+                        format!(
+                            "run `{}` by hand and send it an initialize — it started, so this is the server \
+                             hanging rather than a missing registration",
+                            line()
+                        ),
+                    ),
+                    "handshake-timeout",
+                ),
+            }
+        }
+    }
+}
+
+fn check_mcp(config_path: Option<&Path>, api: Option<&Located>) -> Check {
+    let register_fix = format!(
+        "claude mcp add {MCP_SERVER_NAME} -- {} --config {}",
+        api.map(|a| a.path.display().to_string()).unwrap_or_else(|| "<path to embarch-api>".to_string()),
+        config_path.map(|p| p.display().to_string()).unwrap_or_else(|| "<repo>/embarch/embarch.toml".to_string()),
+    );
+
+    let reg = mcp_registration();
+    let handshake = match &reg {
+        McpRegistration::Registered { command, args } => {
+            Some(mcp_initialize(command, args, MCP_HANDSHAKE_TIMEOUT))
+        }
+        _ => None,
+    };
+    judge_mcp(&reg, handshake.as_ref(), &register_fix)
 }
 
 // ---- /dev-bench/hello, fetched once for checks 11 and 13 --------------------
@@ -1463,6 +1788,7 @@ fn render_json(checks: &[Check], any_fail: bool) -> String {
                 "status": c.status.as_str(),
                 "detail": c.detail,
                 "fix": c.fix,
+                "code": c.code,
             })
         })
         .collect();
@@ -1846,6 +2172,174 @@ mod tests {
         let unreadable = fake("unreadable", "echo nope", 0o644);
         let e = api_host_schema_version(Some(&unreadable)).unwrap_err();
         assert!(e.contains("couldn't run"), "{e}");
+    }
+
+    // ---- check 10: registered is not the same as working ---------------------
+
+    const SAMPLE_GET: &str = "embarch:\n  \
+        Scope: Local (private to you in this project)\n  \
+        Status: ✓ Connected\n  \
+        Type: stdio\n  \
+        Command: /home/u/.local/bin/embarch-api\n  \
+        Args: --config /repo/embarch/embarch.toml\n  \
+        Environment:\n";
+
+    #[test]
+    fn a_registration_entry_yields_the_exact_command_to_spawn() {
+        let (cmd, args) = parse_registered_command(SAMPLE_GET).unwrap();
+        assert_eq!(cmd, "/home/u/.local/bin/embarch-api");
+        assert_eq!(args, vec!["--config".to_string(), "/repo/embarch/embarch.toml".to_string()]);
+    }
+
+    #[test]
+    fn an_entry_with_no_command_line_is_unreadable_not_a_command() {
+        assert!(parse_registered_command("embarch:\n  Scope: Local\n").is_none());
+        assert!(parse_registered_command("embarch:\n  Command:\n").is_none());
+    }
+
+    #[test]
+    fn a_quoted_argument_with_a_space_survives_the_split() {
+        assert_eq!(
+            split_args("--config \"C:\\Program Files\\embarch\\embarch.toml\" --quiet"),
+            vec![
+                "--config".to_string(),
+                "C:\\Program Files\\embarch\\embarch.toml".to_string(),
+                "--quiet".to_string()
+            ]
+        );
+    }
+
+    fn registered() -> McpRegistration {
+        McpRegistration::Registered {
+            command: "/bin/embarch-api".to_string(),
+            args: vec!["--config".to_string(), "/repo/embarch.toml".to_string()],
+        }
+    }
+
+    /// The regression this check was rebuilt for (decision 23): a registration
+    /// entry that exists while the command behind it does not start must read
+    /// Fail. The old check reported exactly this state as Pass.
+    #[test]
+    fn a_registered_but_unstartable_command_fails_rather_than_passing() {
+        let c = judge_mcp(
+            &registered(),
+            Some(&HandshakeOutcome::Failed("couldn't start `/bin/embarch-api`: No such file".to_string())),
+            "claude mcp add embarch -- ...",
+        );
+        assert_eq!(c.status, Status::Fail);
+        assert_eq!(c.code, Some("handshake-failed"));
+        // The fix must not be "re-register it" — the registration is fine.
+        let fix = c.fix.unwrap();
+        assert!(fix.contains("re-adding it fixes"), "{fix}");
+    }
+
+    #[test]
+    fn the_three_handshake_outcomes_stay_distinct_in_json() {
+        let codes = [
+            HandshakeOutcome::Answered("embarch-api".to_string()),
+            HandshakeOutcome::Failed("boom".to_string()),
+            HandshakeOutcome::TimedOut,
+        ]
+        .iter()
+        .map(|o| {
+            let c = judge_mcp(&registered(), Some(o), "fix");
+            let rendered = render_json(std::slice::from_ref(&c), c.status == Status::Fail);
+            let v: serde_json::Value = serde_json::from_str(&rendered).unwrap();
+            v["checks"][0]["code"].as_str().unwrap().to_string()
+        })
+        .collect::<Vec<_>>();
+
+        assert_eq!(codes, vec!["handshake-ok", "handshake-failed", "handshake-timeout"]);
+    }
+
+    #[test]
+    fn an_answered_handshake_is_the_only_pass() {
+        assert_eq!(
+            judge_mcp(&registered(), Some(&HandshakeOutcome::Answered("x".into())), "fix").status,
+            Status::Pass
+        );
+        assert_eq!(judge_mcp(&registered(), Some(&HandshakeOutcome::TimedOut), "fix").status, Status::Fail);
+        assert_eq!(judge_mcp(&McpRegistration::NotRegistered, None, "fix").status, Status::Fail);
+        // Neither of the two "can't tell" states may invent a verdict.
+        assert_eq!(judge_mcp(&McpRegistration::NoCli, None, "fix").status, Status::Warn);
+        let unreadable = judge_mcp(&McpRegistration::UnreadableEntry, None, "fix");
+        assert_eq!(unreadable.status, Status::Warn);
+        assert_eq!(unreadable.code, Some("unreadable-entry"));
+    }
+
+    /// The handshake against a real spawn, in the three shapes decision 23
+    /// names. Unix-only for the same reason the check-11 spawn test is: it
+    /// fabricates the servers as shell scripts.
+    #[cfg(unix)]
+    #[test]
+    fn a_real_spawn_separates_answering_broken_and_hanging() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempdir();
+        let fake = |name: &str, body: &str| {
+            let p = dir.path().join(name);
+            std::fs::write(&p, format!("#!/bin/sh\n{body}\n")).unwrap();
+            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+            p.to_string_lossy().into_owned()
+        };
+
+        // Answers the request it is actually sent, after a line of noise that
+        // a real server's logging would produce.
+        let answers = fake(
+            "answers",
+            "echo 'starting up' >&2\n\
+             read line\n\
+             echo '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"protocolVersion\":\"2025-06-18\",\
+             \"capabilities\":{},\"serverInfo\":{\"name\":\"embarch-api\",\"version\":\"0.1.0\"}}}'",
+        );
+        assert_eq!(
+            mcp_initialize(&answers, &[], Duration::from_secs(10)),
+            HandshakeOutcome::Answered("embarch-api".to_string())
+        );
+
+        // Registered but broken — the state the old check called Pass.
+        let broken = fake("broken", "echo 'error: --config: no such file' >&2; exit 1");
+        match mcp_initialize(&broken, &[], Duration::from_secs(10)) {
+            HandshakeOutcome::Failed(why) => {
+                assert!(why.contains("exited without"), "{why}");
+                assert!(why.contains("no such file"), "stderr should be reported: {why}");
+            }
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        // A command that is not there at all.
+        match mcp_initialize(&dir.path().join("absent").to_string_lossy(), &[], Duration::from_secs(10)) {
+            HandshakeOutcome::Failed(why) => assert!(why.contains("couldn't start"), "{why}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        // Starts, reads, and never answers. Distinct from Failed.
+        let hangs = fake("hangs", "read line\nsleep 30");
+        assert_eq!(
+            mcp_initialize(&hangs, &[], Duration::from_millis(400)),
+            HandshakeOutcome::TimedOut
+        );
+
+        // Answers something that is not a response to our request: skipped,
+        // then EOF, so it is a failure rather than a false pass.
+        let wrong_id = fake(
+            "wrong-id",
+            "read line\necho '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{}}'",
+        );
+        match mcp_initialize(&wrong_id, &[], Duration::from_secs(10)) {
+            HandshakeOutcome::Failed(why) => assert!(why.contains("without answering"), "{why}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
+
+        // A JSON-RPC error for our id is a failure that quotes it.
+        let errors = fake(
+            "errors",
+            "read line\necho '{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"nope\"}}'",
+        );
+        match mcp_initialize(&errors, &[], Duration::from_secs(10)) {
+            HandshakeOutcome::Failed(why) => assert!(why.contains("nope"), "{why}"),
+            other => panic!("expected Failed, got {other:?}"),
+        }
     }
 
     // ---- check 15: core_version, a different question ------------------------
