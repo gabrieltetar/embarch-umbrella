@@ -879,9 +879,19 @@ fn mcp_initialize(command: &str, args: &[String], timeout: Duration) -> Handshak
         // `stdin` is moved in and held until this thread ends, so the server
         // does not see EOF — an MCP server reads stdin for the life of the
         // session, and closing it is a shutdown signal, not a flush.
+        //
+        // **A broken pipe here is not the finding.** A server that dies on its
+        // own arguments is gone before this write lands, and reporting
+        // "couldn't write to its stdin" would name the symptom while the
+        // reason — its own stderr, and the fact that it exited — is one line
+        // away. So EPIPE falls through into the read loop, which sees EOF and
+        // reports the exit. It also made this racy: whether the write beat the
+        // exit decided which of two messages came out.
         if let Err(e) = writeln!(stdin, "{request}").and_then(|()| stdin.flush()) {
-            let _ = tx.send(HandshakeOutcome::Failed(format!("couldn't write to its stdin: {e}")));
-            return;
+            if e.kind() != std::io::ErrorKind::BrokenPipe {
+                let _ = tx.send(HandshakeOutcome::Failed(format!("couldn't write to its stdin: {e}")));
+                return;
+            }
         }
 
         let mut saw_output = false;
@@ -2297,7 +2307,10 @@ mod tests {
             HandshakeOutcome::Answered("embarch-api".to_string())
         );
 
-        // Registered but broken — the state the old check called Pass.
+        // Registered but broken — the state the old check called Pass. It
+        // never reads stdin, so the `initialize` write races its exit and
+        // usually loses with EPIPE: the assertions below are what pin the
+        // verdict to its exit and its stderr rather than to who won.
         let broken = fake("broken", "echo 'error: --config: no such file' >&2; exit 1");
         match mcp_initialize(&broken, &[], Duration::from_secs(10)) {
             HandshakeOutcome::Failed(why) => {
