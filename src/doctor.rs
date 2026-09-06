@@ -988,23 +988,39 @@ const MCP_PROTOCOL_VERSION: &str = "2025-06-18";
 /// grow `doctor`'s output without bound.
 const MCP_STDERR_CAP: usize = 2000;
 
-/// What `claude mcp get` said, in the four shapes that lead to different
-/// verdicts. Separated from the verdict so the parse is testable without a
-/// `claude` CLI on the machine running the tests.
+/// What the agent CLI's own config said, in the four shapes that lead to
+/// different verdicts. Separated from the verdict so the lookup is testable
+/// against a fabricated config rather than against whatever this machine
+/// happens to have registered.
 #[derive(Debug, PartialEq, Eq)]
 enum McpRegistration {
-    /// No `claude` on `PATH` at all. Not a fault: `doctor` runs on machines
-    /// that never registered anything.
-    NoCli,
-    /// `claude mcp get` exited non-zero — nothing is registered under this name.
-    NotRegistered,
+    /// No readable agent-CLI config on this machine. Not a fault: `doctor`
+    /// runs on machines that never registered anything.
+    NoCli { why: String },
+    /// There is a config, and nothing of ours is registered for this
+    /// directory or for this user.
+    NotRegistered { looked_in: String },
     /// Registered, and the entry named a command this check can spawn.
-    Registered { command: String, args: Vec<String> },
-    /// Registered, but nothing in the output looked like a command line.
-    /// **Its own verdict, not a pass**: this check's whole reason for existing
-    /// is that a registration entry proves nothing, so falling back to "well,
-    /// it's registered" would be the bug decision 23 was written against.
-    UnreadableEntry,
+    Registered {
+        /// The name it is registered under. **Not assumed to be
+        /// [`MCP_SERVER_NAME`]** — decision 40; the registration that works on
+        /// the reference machine is filed under a different key.
+        name: String,
+        scope: &'static str,
+        command: String,
+        args: Vec<String>,
+        /// The entry's own `env`, applied over `doctor`'s environment on the
+        /// spawn — the half of decision 23's stated gap that reading the
+        /// config structurally closed.
+        env: Vec<(String, String)>,
+    },
+    /// Registered, and there is nothing here to spawn: an entry with no
+    /// `command`, or a remote-transport (`http`/`sse`) registration this check
+    /// has no way to start. **Its own verdict, not a pass** — this check's
+    /// whole reason for existing is that a registration entry proves nothing,
+    /// so falling back to "well, it's registered" would be the bug decision 23
+    /// was written against.
+    UnreadableEntry { name: String, why: String },
 }
 
 /// What one spawn of the registered command did. Three outcomes, kept apart
@@ -1020,71 +1036,116 @@ enum HandshakeOutcome {
     TimedOut,
 }
 
-/// Pull the command line out of `claude mcp get <name>`'s human output.
+/// The binary a registration must name for this check to claim it, whatever
+/// key it is filed under. **The name is the weak half of the identity and the
+/// command is the strong half** (decision 40): the registration that works on
+/// the reference machine is `embarch-api`, not [`MCP_SERVER_NAME`], and
+/// reporting *not registered* beside a server the same session is using was
+/// worse than no check.
+const MCP_SERVER_BINARY: &str = "embarch-api";
+
+/// Where the agent CLI keeps what it was told to register.
 ///
-/// **The shape here is assumed, not measured** — see `open.md`: no walk of the
-/// onboarding guide has yet run from an environment with the agent CLI
-/// present, so nothing in this suite has ever seen this output for real. That
-/// is why an output this cannot read is [`McpRegistration::UnreadableEntry`]
-/// and a warn naming the reason, rather than either a pass or a fail: a
-/// wrong guess here must not be able to invent a verdict about the server.
-fn parse_registered_command(out: &str) -> Option<(String, Vec<String>)> {
-    let field = |label: &str| {
-        out.lines().find_map(|line| {
-            let line = line.trim();
-            let rest = line.strip_prefix(label)?.strip_prefix(':')?;
-            Some(rest.trim().to_string())
-        })
+/// **Observed, not assumed** (2026-09-05, Claude Code 2.1.261): one
+/// `~/.claude.json`, whose `projects.<absolute cwd>.mcpServers` map carries
+/// `command` and `args` already structured. `claude mcp get`'s human output
+/// carries neither and has no `--json`, which is what decision 40 replaced.
+fn claude_config_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(PathBuf::from(home).join(".claude.json"))
+}
+
+fn entry_command(entry: &serde_json::Value) -> Option<&str> {
+    entry.get("command")?.as_str().filter(|c| !c.is_empty())
+}
+
+fn names_our_binary(entry: &serde_json::Value) -> bool {
+    entry_command(entry)
+        .and_then(|c| Path::new(c).file_stem().map(|s| s == MCP_SERVER_BINARY))
+        .unwrap_or(false)
+}
+
+fn string_list(entry: &serde_json::Value, key: &str) -> Vec<String> {
+    entry
+        .get(key)
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect())
+        .unwrap_or_default()
+}
+
+/// Find our registration in an already-parsed `.claude.json`: local scope for
+/// `cwd` first, then user scope.
+///
+/// **Three ways for an entry to be ours, in that order** (decision 40): the
+/// canonical name, then any entry whose `command` is an `embarch-api` binary,
+/// then the name the reference machine happens to use. The middle one is why a
+/// server registered under a nickname no longer reads as *not registered*.
+///
+/// Pure over the parsed value so the whole lookup is testable on a machine
+/// that has no `.claude.json` at all.
+fn find_registration(config: &serde_json::Value, cwd: &Path) -> McpRegistration {
+    let cwd = cwd.to_string_lossy().into_owned();
+    let scopes: [(&'static str, Option<&serde_json::Value>); 2] = [
+        (
+            "local",
+            config.get("projects").and_then(|p| p.get(&cwd)).and_then(|p| p.get("mcpServers")),
+        ),
+        ("user", config.get("mcpServers")),
+    ];
+
+    for (scope, servers) in scopes {
+        let Some(servers) = servers.and_then(|s| s.as_object()) else { continue };
+        let pick = servers
+            .iter()
+            .find(|(k, _)| k.as_str() == MCP_SERVER_NAME)
+            .or_else(|| servers.iter().find(|(_, v)| names_our_binary(v)))
+            .or_else(|| servers.iter().find(|(k, _)| k.as_str() == MCP_SERVER_BINARY));
+        let Some((name, entry)) = pick else { continue };
+
+        return match entry_command(entry) {
+            Some(command) => McpRegistration::Registered {
+                name: name.clone(),
+                scope,
+                command: command.to_string(),
+                args: string_list(entry, "args"),
+                env: entry
+                    .get("env")
+                    .and_then(|e| e.as_object())
+                    .map(|e| {
+                        e.iter().filter_map(|(k, v)| v.as_str().map(|v| (k.clone(), v.to_string()))).collect()
+                    })
+                    .unwrap_or_default(),
+            },
+            None => McpRegistration::UnreadableEntry {
+                name: name.clone(),
+                why: match entry.get("type").and_then(|t| t.as_str()) {
+                    // Shares `unreadable-entry`'s code rather than taking a new
+                    // one: `init` only ever writes stdio, so this is a
+                    // defensive branch, and both states are the same
+                    // actionable thing — nothing here to spawn.
+                    Some(t) if t != "stdio" => format!("it is registered over `{t}`, which this check cannot spawn"),
+                    _ => "the entry names no command".to_string(),
+                },
+            },
+        };
+    }
+
+    McpRegistration::NotRegistered { looked_in: cwd }
+}
+
+fn mcp_registration(cwd: &Path) -> McpRegistration {
+    let Some(path) = claude_config_path() else {
+        return McpRegistration::NoCli {
+            why: "neither HOME nor USERPROFILE is set, so there is nowhere to look".to_string(),
+        };
     };
-
-    let command = field("Command").filter(|c| !c.is_empty())?;
-    let args = field("Args").map(|a| split_args(&a)).unwrap_or_default();
-    Some((command, args))
-}
-
-/// Split an argument line on whitespace, honouring double quotes so a config
-/// path with a space in it survives — which on Windows is the common case,
-/// not the exotic one.
-fn split_args(line: &str) -> Vec<String> {
-    let mut args = Vec::new();
-    let mut cur = String::new();
-    let mut quoted = false;
-    let mut started = false;
-    for ch in line.chars() {
-        match ch {
-            '"' => {
-                quoted = !quoted;
-                started = true;
-            }
-            c if c.is_whitespace() && !quoted => {
-                if started {
-                    args.push(std::mem::take(&mut cur));
-                    started = false;
-                }
-            }
-            c => {
-                cur.push(c);
-                started = true;
-            }
-        }
-    }
-    if started {
-        args.push(cur);
-    }
-    args
-}
-
-fn mcp_registration() -> McpRegistration {
-    match Command::new("claude").args(["mcp", "get", MCP_SERVER_NAME]).output() {
-        Ok(o) if o.status.success() => {
-            let out = String::from_utf8_lossy(&o.stdout);
-            match parse_registered_command(&out) {
-                Some((command, args)) => McpRegistration::Registered { command, args },
-                None => McpRegistration::UnreadableEntry,
-            }
-        }
-        Ok(_) => McpRegistration::NotRegistered,
-        Err(_) => McpRegistration::NoCli,
+    let text = match std::fs::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) => return McpRegistration::NoCli { why: format!("no readable {} ({e})", path.display()) },
+    };
+    match serde_json::from_str::<serde_json::Value>(&text) {
+        Ok(v) => find_registration(&v, cwd),
+        Err(e) => McpRegistration::NoCli { why: format!("{} did not parse as JSON ({e})", path.display()) },
     }
 }
 
@@ -1095,9 +1156,19 @@ fn mcp_registration() -> McpRegistration {
 /// (decision 23): one request, one matching response, no session kept. The
 /// process is killed either way — this check starts a server it has no
 /// intention of using.
-fn mcp_initialize(command: &str, args: &[String], timeout: Duration) -> HandshakeOutcome {
+fn mcp_initialize(
+    command: &str,
+    args: &[String],
+    env: &[(String, String)],
+    timeout: Duration,
+) -> HandshakeOutcome {
     let mut child = match Command::new(command)
         .args(args)
+        // The registered `env`, over `doctor`'s own — the same shape the agent
+        // CLI spawns with. It is the whole environment gap decision 23 could
+        // close: the *rest* of the environment is still doctor's, which is
+        // decision 40's stated residue.
+        .envs(env.iter().map(|(k, v)| (k.as_str(), v.as_str())))
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -1210,56 +1281,55 @@ fn mcp_initialize(command: &str, args: &[String], timeout: Duration) -> Handshak
     }
 }
 
-/// The verdict, split out from both the `claude` call and the spawn so the
+/// The verdict, split out from both the config read and the spawn so the
 /// mapping is testable on its own.
 fn judge_mcp(reg: &McpRegistration, handshake: Option<&HandshakeOutcome>, register_fix: &str) -> Check {
     const NAME: &str = "MCP server registered and answering";
 
     match (reg, handshake) {
-        (McpRegistration::NoCli, _) => with_code(
+        (McpRegistration::NoCli { why }, _) => with_code(
             with_fix(
-                check(10, NAME, Status::Warn, "claude CLI not found here — can't verify"),
+                check(10, NAME, Status::Warn, format!("no agent-CLI config to read — {why}")),
                 register_fix.to_string(),
             ),
             "no-cli",
         ),
-        (McpRegistration::NotRegistered, _) => with_code(
-            with_fix(check(10, NAME, Status::Fail, "not registered"), register_fix.to_string()),
+        (McpRegistration::NotRegistered { looked_in }, _) => with_code(
+            with_fix(
+                check(10, NAME, Status::Fail, format!("nothing registered for {looked_in}, under any name")),
+                register_fix.to_string(),
+            ),
             "not-registered",
         ),
-        (McpRegistration::UnreadableEntry, _) => with_code(
+        (McpRegistration::UnreadableEntry { name, why }, _) => with_code(
             with_fix(
-                check(
-                    10,
-                    NAME,
-                    Status::Warn,
-                    "registered, but `claude mcp get` named no command to spawn — can't handshake",
-                ),
-                format!("re-register it so the entry names the binary: {register_fix}"),
+                check(10, NAME, Status::Warn, format!("registered as `{name}`, but {why} — can't handshake")),
+                format!("re-register it as a stdio server naming the binary: {register_fix}"),
             ),
             "unreadable-entry",
         ),
-        (McpRegistration::Registered { command, args }, outcome) => {
+        (McpRegistration::Registered { name, scope, command, args, .. }, outcome) => {
             let line = || {
                 std::iter::once(command.clone())
                     .chain(args.iter().cloned())
                     .collect::<Vec<_>>()
                     .join(" ")
             };
+            let as_ = format!("registered as `{name}` ({scope} scope)");
             match outcome {
                 // Only reachable if a caller forgets to run the handshake;
                 // reported as itself rather than defaulting to a pass.
                 None => with_code(
-                    check(10, NAME, Status::Warn, "registered; handshake not attempted"),
+                    check(10, NAME, Status::Warn, format!("{as_}; handshake not attempted")),
                     "no-handshake",
                 ),
                 Some(HandshakeOutcome::Answered(server)) => with_code(
-                    check(10, NAME, Status::Pass, format!("registered, and it answered initialize ({server})")),
+                    check(10, NAME, Status::Pass, format!("{as_}, and it answered initialize ({server})")),
                     "handshake-ok",
                 ),
                 Some(HandshakeOutcome::Failed(why)) => with_code(
                     with_fix(
-                        check(10, NAME, Status::Fail, format!("registered, but the handshake failed — {why}")),
+                        check(10, NAME, Status::Fail, format!("{as_}, but the handshake failed — {why}")),
                         format!(
                             "the registration exists and the command behind it is broken, so re-adding it fixes \
                              nothing on its own. Run `{}` by hand to see why; if the binary moved, re-register: {register_fix}",
@@ -1274,10 +1344,7 @@ fn judge_mcp(reg: &McpRegistration, handshake: Option<&HandshakeOutcome>, regist
                             10,
                             NAME,
                             Status::Fail,
-                            format!(
-                                "registered, but it answered nothing within {}s",
-                                MCP_HANDSHAKE_TIMEOUT.as_secs()
-                            ),
+                            format!("{as_}, but it answered nothing within {}s", MCP_HANDSHAKE_TIMEOUT.as_secs()),
                         ),
                         format!(
                             "run `{}` by hand and send it an initialize — it started, so this is the server \
@@ -1299,10 +1366,17 @@ fn check_mcp(config_path: Option<&Path>, api: Option<&Located>) -> Check {
         config_path.map(|p| p.display().to_string()).unwrap_or_else(|| "<repo>/embarch/embarch.toml".to_string()),
     );
 
-    let reg = mcp_registration();
+    // Local scope is keyed by absolute working directory, so a registration is
+    // about *where doctor is run from* — the same directory the agent CLI
+    // would resolve it in. An unreadable cwd is reported as its own reason
+    // rather than silently searching the wrong key.
+    let reg = match std::env::current_dir() {
+        Ok(cwd) => mcp_registration(&cwd),
+        Err(e) => McpRegistration::NoCli { why: format!("could not read the working directory ({e})") },
+    };
     let handshake = match &reg {
-        McpRegistration::Registered { command, args } => {
-            Some(mcp_initialize(command, args, MCP_HANDSHAKE_TIMEOUT))
+        McpRegistration::Registered { command, args, env, .. } => {
+            Some(mcp_initialize(command, args, env, MCP_HANDSHAKE_TIMEOUT))
         }
         _ => None,
     };
@@ -2916,43 +2990,129 @@ mod tests {
 
     // ---- check 10: registered is not the same as working ---------------------
 
-    const SAMPLE_GET: &str = "embarch:\n  \
-        Scope: Local (private to you in this project)\n  \
-        Status: ✓ Connected\n  \
-        Type: stdio\n  \
-        Command: /home/u/.local/bin/embarch-api\n  \
-        Args: --config /repo/embarch/embarch.toml\n  \
-        Environment:\n";
+    /// The real shape, read off this machine on 2026-09-05 (Claude Code
+    /// 2.1.261) and reduced to what the lookup needs: `command` and `args`
+    /// already structured, under an absolute working directory, filed under a
+    /// name that is *not* `MCP_SERVER_NAME`. Fabricated here rather than read
+    /// from `$HOME` — these tests run on machines with no `.claude.json`.
+    fn sample_config() -> serde_json::Value {
+        serde_json::json!({
+            "projects": {
+                "/repo": {
+                    "mcpServers": {
+                        "embarch-api": {
+                            "command": "/home/u/.local/bin/embarch-api",
+                            "args": ["--config", "/repo/embarch/embarch.toml"],
+                        }
+                    }
+                }
+            }
+        })
+    }
 
+    /// The second of the three things `open.md` recorded as wrong: `doctor`
+    /// reported *not registered* beside a server the same session was using,
+    /// because it looked up one name and the working registration carries
+    /// another (decision 40).
     #[test]
-    fn a_registration_entry_yields_the_exact_command_to_spawn() {
-        let (cmd, args) = parse_registered_command(SAMPLE_GET).unwrap();
-        assert_eq!(cmd, "/home/u/.local/bin/embarch-api");
-        assert_eq!(args, vec!["--config".to_string(), "/repo/embarch/embarch.toml".to_string()]);
+    fn a_registration_under_another_name_is_found_by_the_binary_it_names() {
+        match find_registration(&sample_config(), Path::new("/repo")) {
+            McpRegistration::Registered { name, scope, command, args, env } => {
+                assert_eq!(name, "embarch-api");
+                assert_eq!(scope, "local");
+                assert_eq!(command, "/home/u/.local/bin/embarch-api");
+                assert_eq!(args, vec!["--config".to_string(), "/repo/embarch/embarch.toml".to_string()]);
+                assert!(env.is_empty());
+            }
+            other => panic!("expected Registered, got {other:?}"),
+        }
+    }
+
+    /// A `.exe` suffix and a Windows path still name the same binary, and the
+    /// canonical name outranks a match on the command.
+    #[test]
+    fn the_canonical_name_wins_over_a_command_match() {
+        let config = serde_json::json!({
+            "projects": {
+                "C:\\repo": {
+                    "mcpServers": {
+                        "embarch-api": { "command": "C:\\bin\\embarch-api.exe" },
+                        "embarch": { "command": "C:\\bin\\embarch-api.exe", "args": ["--config", "c.toml"] },
+                    }
+                }
+            }
+        });
+        match find_registration(&config, Path::new("C:\\repo")) {
+            McpRegistration::Registered { name, args, .. } => {
+                assert_eq!(name, MCP_SERVER_NAME);
+                assert_eq!(args, vec!["--config".to_string(), "c.toml".to_string()]);
+            }
+            other => panic!("expected Registered, got {other:?}"),
+        }
+    }
+
+    /// Local scope is keyed by directory, so a registration made in another
+    /// repo is not this one's — the same answer the agent CLI would give.
+    #[test]
+    fn a_registration_for_another_directory_is_not_this_directorys() {
+        match find_registration(&sample_config(), Path::new("/somewhere/else")) {
+            McpRegistration::NotRegistered { looked_in } => assert_eq!(looked_in, "/somewhere/else"),
+            other => panic!("expected NotRegistered, got {other:?}"),
+        }
+        // And an empty config is the same answer, not a crash.
+        assert!(matches!(
+            find_registration(&serde_json::json!({}), Path::new("/repo")),
+            McpRegistration::NotRegistered { .. }
+        ));
     }
 
     #[test]
-    fn an_entry_with_no_command_line_is_unreadable_not_a_command() {
-        assert!(parse_registered_command("embarch:\n  Scope: Local\n").is_none());
-        assert!(parse_registered_command("embarch:\n  Command:\n").is_none());
+    fn user_scope_is_searched_when_this_directory_has_nothing() {
+        let config = serde_json::json!({
+            "projects": { "/repo": { "mcpServers": {} } },
+            "mcpServers": { "embarch": { "command": "/bin/embarch-api", "env": { "RUST_LOG": "warn" } } },
+        });
+        match find_registration(&config, Path::new("/repo")) {
+            McpRegistration::Registered { scope, env, .. } => {
+                assert_eq!(scope, "user");
+                assert_eq!(env, vec![("RUST_LOG".to_string(), "warn".to_string())]);
+            }
+            other => panic!("expected Registered, got {other:?}"),
+        }
     }
 
+    /// An entry with nothing to spawn stays its own warn rather than becoming
+    /// "well, it's registered" — including a remote transport, which is
+    /// readable but unspawnable and deliberately shares the code.
     #[test]
-    fn a_quoted_argument_with_a_space_survives_the_split() {
-        assert_eq!(
-            split_args("--config \"C:\\Program Files\\embarch\\embarch.toml\" --quiet"),
-            vec![
-                "--config".to_string(),
-                "C:\\Program Files\\embarch\\embarch.toml".to_string(),
-                "--quiet".to_string()
-            ]
-        );
+    fn an_entry_with_no_command_is_unreadable_not_a_command() {
+        let config = serde_json::json!({
+            "projects": { "/repo": { "mcpServers": { "embarch": { "type": "http", "url": "http://x" } } } }
+        });
+        match find_registration(&config, Path::new("/repo")) {
+            McpRegistration::UnreadableEntry { name, why } => {
+                assert_eq!(name, "embarch");
+                assert!(why.contains("http"), "{why}");
+            }
+            other => panic!("expected UnreadableEntry, got {other:?}"),
+        }
+
+        let empty = serde_json::json!({
+            "projects": { "/repo": { "mcpServers": { "embarch": { "command": "" } } } }
+        });
+        assert!(matches!(
+            find_registration(&empty, Path::new("/repo")),
+            McpRegistration::UnreadableEntry { .. }
+        ));
     }
 
     fn registered() -> McpRegistration {
         McpRegistration::Registered {
+            name: MCP_SERVER_NAME.to_string(),
+            scope: "local",
             command: "/bin/embarch-api".to_string(),
             args: vec!["--config".to_string(), "/repo/embarch.toml".to_string()],
+            env: Vec::new(),
         }
     }
 
@@ -2999,10 +3159,10 @@ mod tests {
             Status::Pass
         );
         assert_eq!(judge_mcp(&registered(), Some(&HandshakeOutcome::TimedOut), "fix").status, Status::Fail);
-        assert_eq!(judge_mcp(&McpRegistration::NotRegistered, None, "fix").status, Status::Fail);
+        assert_eq!(judge_mcp(&McpRegistration::NotRegistered { looked_in: "/repo".to_string() }, None, "fix").status, Status::Fail);
         // Neither of the two "can't tell" states may invent a verdict.
-        assert_eq!(judge_mcp(&McpRegistration::NoCli, None, "fix").status, Status::Warn);
-        let unreadable = judge_mcp(&McpRegistration::UnreadableEntry, None, "fix");
+        assert_eq!(judge_mcp(&McpRegistration::NoCli { why: "nowhere to look".to_string() }, None, "fix").status, Status::Warn);
+        let unreadable = judge_mcp(&McpRegistration::UnreadableEntry { name: "embarch".to_string(), why: "the entry names no command".to_string() }, None, "fix");
         assert_eq!(unreadable.status, Status::Warn);
         assert_eq!(unreadable.code, Some("unreadable-entry"));
     }
@@ -3033,7 +3193,7 @@ mod tests {
              \"capabilities\":{},\"serverInfo\":{\"name\":\"embarch-api\",\"version\":\"0.1.0\"}}}'",
         );
         assert_eq!(
-            mcp_initialize(&answers, &[], Duration::from_secs(10)),
+            mcp_initialize(&answers, &[], &[], Duration::from_secs(10)),
             HandshakeOutcome::Answered("embarch-api".to_string())
         );
 
@@ -3042,7 +3202,7 @@ mod tests {
         // usually loses with EPIPE: the assertions below are what pin the
         // verdict to its exit and its stderr rather than to who won.
         let broken = fake("broken", "echo 'error: --config: no such file' >&2; exit 1");
-        match mcp_initialize(&broken, &[], Duration::from_secs(10)) {
+        match mcp_initialize(&broken, &[], &[], Duration::from_secs(10)) {
             HandshakeOutcome::Failed(why) => {
                 assert!(why.contains("exited without"), "{why}");
                 assert!(why.contains("no such file"), "stderr should be reported: {why}");
@@ -3051,7 +3211,7 @@ mod tests {
         }
 
         // A command that is not there at all.
-        match mcp_initialize(&dir.path().join("absent").to_string_lossy(), &[], Duration::from_secs(10)) {
+        match mcp_initialize(&dir.path().join("absent").to_string_lossy(), &[], &[], Duration::from_secs(10)) {
             HandshakeOutcome::Failed(why) => assert!(why.contains("couldn't start"), "{why}"),
             other => panic!("expected Failed, got {other:?}"),
         }
@@ -3059,7 +3219,7 @@ mod tests {
         // Starts, reads, and never answers. Distinct from Failed.
         let hangs = fake("hangs", "read line\nsleep 30");
         assert_eq!(
-            mcp_initialize(&hangs, &[], Duration::from_millis(400)),
+            mcp_initialize(&hangs, &[], &[], Duration::from_millis(400)),
             HandshakeOutcome::TimedOut
         );
 
@@ -3069,17 +3229,35 @@ mod tests {
             "wrong-id",
             "read line\necho '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{}}'",
         );
-        match mcp_initialize(&wrong_id, &[], Duration::from_secs(10)) {
+        match mcp_initialize(&wrong_id, &[], &[], Duration::from_secs(10)) {
             HandshakeOutcome::Failed(why) => assert!(why.contains("without answering"), "{why}"),
             other => panic!("expected Failed, got {other:?}"),
         }
+
+        // The registered entry's own `env` reaches the spawn — the half of
+        // decision 23's environment gap that decision 40 closed. A server that
+        // only answers when its variable is set proves it arrived.
+        let needs_env = fake(
+            "needs-env",
+            "read line\necho \"{\\\"jsonrpc\\\":\\\"2.0\\\",\\\"id\\\":1,\\\"result\\\":\
+             {\\\"serverInfo\\\":{\\\"name\\\":\\\"$EMBARCH_DOCTOR_TEST\\\"}}}\"",
+        );
+        assert_eq!(
+            mcp_initialize(
+                &needs_env,
+                &[],
+                &[("EMBARCH_DOCTOR_TEST".to_string(), "from-the-entry".to_string())],
+                Duration::from_secs(10),
+            ),
+            HandshakeOutcome::Answered("from-the-entry".to_string())
+        );
 
         // A JSON-RPC error for our id is a failure that quotes it.
         let errors = fake(
             "errors",
             "read line\necho '{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"nope\"}}'",
         );
-        match mcp_initialize(&errors, &[], Duration::from_secs(10)) {
+        match mcp_initialize(&errors, &[], &[], Duration::from_secs(10)) {
             HandshakeOutcome::Failed(why) => assert!(why.contains("nope"), "{why}"),
             other => panic!("expected Failed, got {other:?}"),
         }
