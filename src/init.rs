@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 
@@ -16,6 +17,12 @@ use crate::locate;
 const EXCLUDE_MARKER: &str = "# added by `embarch init`";
 const EXCLUDE_ENTRY: &str = "embarch/";
 const MCP_SERVER_NAME: &str = "embarch";
+
+/// The one sentinel this file uses for "`init` could not know this — you do".
+/// Deliberately the same string `chip` has always used: a scaffolded config
+/// already ships in a state that cannot run until a human edits it, and the
+/// board is now in that class too (decisions/projects.md 41).
+const BOARD_PLACEHOLDER: &str = "CHANGE-ME";
 
 /// Walk up from `start` looking for a `.git`, returning the repo root.
 pub fn find_repo_root(start: &Path) -> Option<PathBuf> {
@@ -171,6 +178,280 @@ pub fn find_artifact(build_dir: &Path, file_name: &str) -> Option<PathBuf> {
     best
 }
 
+/// The `-b`/`--board` value in a recorded build argv, if it named one.
+pub fn board_in_argv(argv: &[String]) -> Option<String> {
+    let mut it = argv.iter();
+    while let Some(arg) = it.next() {
+        if arg == "-b" || arg == "--board" {
+            return it.next().filter(|v| !v.is_empty()).cloned();
+        }
+        if let Some(v) = arg.strip_prefix("--board=") {
+            if !v.is_empty() {
+                return Some(v.to_string());
+            }
+        }
+    }
+    None
+}
+
+/// Replace the board in a build argv with [`BOARD_PLACEHOLDER`], returning
+/// whatever it displaced.
+///
+/// This is the whole of decision 41's mechanism. The recorded command is kept
+/// otherwise verbatim — the west binary, the app path, the pristine flag are
+/// all *this repo's* facts and `build_info.yml` is authoritative for them. The
+/// board is the one field that is a claim about **hardware on a desk**, which
+/// the file cannot know, so it is the one field redacted.
+pub fn redact_board(argv: &[String]) -> (Vec<String>, Option<String>) {
+    let mut out: Vec<String> = Vec::with_capacity(argv.len());
+    let mut displaced = None;
+    let mut take_next = false;
+    for arg in argv {
+        if take_next {
+            take_next = false;
+            if !arg.is_empty() {
+                displaced = Some(arg.clone());
+                out.push(BOARD_PLACEHOLDER.to_string());
+                continue;
+            }
+        }
+        if arg == "-b" || arg == "--board" {
+            take_next = true;
+            out.push(arg.clone());
+            continue;
+        }
+        if let Some(v) = arg.strip_prefix("--board=") {
+            if !v.is_empty() {
+                displaced = Some(v.to_string());
+                out.push(format!("--board={BOARD_PLACEHOLDER}"));
+                continue;
+            }
+        }
+        out.push(arg.clone());
+    }
+    (out, displaced)
+}
+
+/// How stale a recorded build is, phrased the way the question is actually
+/// asked: "is this still the board on the desk?"
+///
+/// **An age, deliberately, and not a calendar date.** `init` runs today
+/// whichever way, so a date stamped at write time dates the *scaffolding*, not
+/// the build it inferred from — the number that matters. Turning an mtime into
+/// a civil date also needs calendar arithmetic this crate has no dependency
+/// for, and would not be worth adding one. `None` for a clock that makes the
+/// answer nonsense (a file from the future, a reset RTC).
+pub fn recorded_age(recorded: SystemTime, now: SystemTime) -> Option<String> {
+    let days = now.duration_since(recorded).ok()?.as_secs() / 86_400;
+    Some(match days {
+        0 => "today".to_string(),
+        1 => "yesterday".to_string(),
+        n => format!("{n} days ago"),
+    })
+}
+
+/// Every recorded build in the repo, not only `build/build_info.yml`.
+///
+/// Bounded like [`find_artifact`] and for the same reason — a firmware repo's
+/// tree is not something to walk unbounded. Sorted, so the report `init`
+/// prints is stable between runs.
+pub fn find_build_infos(repo: &Path) -> Vec<PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![(repo.to_path_buf(), 0usize)];
+    while let Some((dir, depth)) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if path.is_dir() {
+                // `.git` holds no builds, and a dotted directory is somebody
+                // else's cache far more often than it is a build tree.
+                if depth < 4 && !name.starts_with('.') {
+                    stack.push((path, depth + 1));
+                }
+            } else if name == "build_info.yml" {
+                found.push(path);
+            }
+        }
+    }
+    found.sort();
+    found
+}
+
+/// One recorded build, as `init` will describe it to the user.
+///
+/// Holds the *contents* rather than a path so that [`scaffold_build_command`]
+/// — where the whole of decision 41 lives — is pure and testable without a
+/// repo on disk.
+pub struct RecordedBuild {
+    /// How to name this file to the user; repo-relative where possible.
+    pub label: String,
+    /// `west.command` from the file, if it had one.
+    pub command: Option<String>,
+    /// [`recorded_age`] of the file, if the filesystem would say.
+    pub age: Option<String>,
+}
+
+/// What `init` writes for `build_command`, and what it says about it.
+pub struct BuildCommandPlan {
+    pub argv: Vec<String>,
+    /// Comment lines emitted directly above `build_command` in the config.
+    pub notes: Vec<String>,
+    /// Lines for `init`'s own stdout, under "before this works, edit ...".
+    pub warnings: Vec<String>,
+}
+
+/// Decide what `build_command` to scaffold from the builds the repo recorded.
+///
+/// **Decision 41.** Three cases, and none of them writes a board as fact:
+///
+/// - **None recorded** — a bare template, exactly as before.
+/// - **One** — the recorded command, verbatim except that its board is
+///   redacted to [`BOARD_PLACEHOLDER`] and quoted back in a comment with the
+///   build's age. A wrong board can no longer build silently; it costs one
+///   paste to confirm.
+/// - **Several** — nothing is chosen. Every candidate is named with the board
+///   it recorded, in the config and on stdout, and the command is the same
+///   bare template as the none case.
+pub fn scaffold_build_command(recorded: &[RecordedBuild], build_dir_rel: &str) -> BuildCommandPlan {
+    let template = || -> Vec<String> {
+        ["west", "build", "-d", build_dir_rel, "-b", BOARD_PLACEHOLDER]
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    };
+    let describe = |b: &RecordedBuild| -> String {
+        let board = b
+            .command
+            .as_deref()
+            .map(split_argv)
+            .and_then(|a| board_in_argv(&a))
+            .unwrap_or_else(|| "no board recorded".to_string());
+        let age = b
+            .age
+            .as_deref()
+            .map(|a| format!(", built {a}"))
+            .unwrap_or_default();
+        format!("{} — {board}{age}", b.label)
+    };
+
+    match recorded {
+        [] => BuildCommandPlan {
+            argv: template(),
+            notes: vec![
+                "`init` found no recorded build in this repo, so the command below is a".to_string(),
+                "template rather than anything observed. Check it against how you actually"
+                    .to_string(),
+                "build, and replace the board.".to_string(),
+            ],
+            warnings: vec![
+                "no build_info.yml anywhere in this repo, so the build command below is a \
+                 template — check it against how you actually build."
+                    .to_string(),
+            ],
+        },
+        [only] => {
+            let Some(command) = only.command.as_deref() else {
+                return BuildCommandPlan {
+                    argv: template(),
+                    notes: vec![
+                        format!("`init` found {} but it records no west command, so the", only.label),
+                        "command below is a template rather than anything observed.".to_string(),
+                    ],
+                    warnings: vec![format!(
+                        "{} records no west command, so the build command below is a template — \
+                         check it against how you actually build.",
+                        only.label
+                    )],
+                };
+            };
+            let age = only
+                .age
+                .as_deref()
+                .map(|a| format!(", built {a}"))
+                .unwrap_or_default();
+            let (argv, board) = redact_board(&with_build_dir(&split_argv(command), build_dir_rel));
+            let mut notes = vec![
+                format!("`init` derived this from {}{age}.", only.label),
+                "That file records whatever was LAST built in this repo, which is not the"
+                    .to_string(),
+                "same fact as which board is wired to your probe — so the board is not"
+                    .to_string(),
+                "written below as though it were (embarch-api/spec.md §2).".to_string(),
+            ];
+            let warnings = match &board {
+                Some(board) => {
+                    notes.push(format!("The board it recorded was: {board}"));
+                    notes.push(format!(
+                        "Confirm that is the board on your desk, then paste it over {BOARD_PLACEHOLDER}."
+                    ));
+                    vec![format!(
+                        "set the board in `build_command` (it's {BOARD_PLACEHOLDER} right now). {} \
+                         recorded `-b {board}`{age}, but that is whatever was last built here, not \
+                         what is on your probe — confirm it before you paste it in.",
+                        only.label
+                    )]
+                }
+                None => {
+                    notes.push(format!(
+                        "It named no board, so one was added as {BOARD_PLACEHOLDER}."
+                    ));
+                    vec![format!(
+                        "{} recorded no board, so `build_command` has none to check — add \
+                         `-b <your board>` to it.",
+                        only.label
+                    )]
+                }
+            };
+            // A recorded command with no `-b` at all still must not ship
+            // boardless: west would take its default and that is a guess too.
+            let argv = if board.is_none() && board_in_argv(&argv).is_none() {
+                let mut argv = argv;
+                argv.push("-b".to_string());
+                argv.push(BOARD_PLACEHOLDER.to_string());
+                argv
+            } else {
+                argv
+            };
+            BuildCommandPlan {
+                argv,
+                notes,
+                warnings,
+            }
+        }
+        several => {
+            let mut notes = vec![format!(
+                "`init` found {} recorded builds in this repo and chose none of them:",
+                several.len()
+            )];
+            let mut warning = vec![format!(
+                "{} recorded builds here, and `init` will not pick one for you:",
+                several.len()
+            )];
+            for b in several {
+                notes.push(format!("  {}", describe(b)));
+                warning.push(format!("      {}", describe(b)));
+            }
+            notes.push(
+                "The command below is a template. Paste the right one over it, keeping".to_string(),
+            );
+            notes.push(format!("`-d {build_dir_rel}`."));
+            warning.push(format!(
+                "    paste the one matching the board on your desk into `build_command`, keeping \
+                 `-d {build_dir_rel}`."
+            ));
+            BuildCommandPlan {
+                argv: template(),
+                notes,
+                warnings: vec![warning.join("\n")],
+            }
+        }
+    }
+}
+
 pub struct Scaffold {
     pub toml: String,
     /// Things `init` could not work out, to print rather than guess at
@@ -225,6 +506,7 @@ pub fn render_config(
     name: &str,
     source_path: &Path,
     build_command: &[String],
+    build_command_notes: &[String],
     artifact_path: &str,
     unc_artifact: Option<&str>,
 ) -> String {
@@ -233,6 +515,19 @@ pub fn render_config(
         .map(|a| format!("{a:?}"))
         .collect::<Vec<_>>()
         .join(", ");
+    // Where `build_command` came from and how far it can be trusted, in the
+    // file the user will actually open — decision 41. `init`'s stdout says the
+    // same thing, and scrolls away.
+    let notes = build_command_notes
+        .iter()
+        .map(|l| {
+            if l.is_empty() {
+                "#\n".to_string()
+            } else {
+                format!("# {l}\n")
+            }
+        })
+        .collect::<String>();
     let unc_line = match unc_artifact {
         Some(p) => format!(
             "# Windows-visible form of the same file, for a Core running on the Windows\n\
@@ -253,6 +548,7 @@ pub fn render_config(
          [[projects]]\n\
          name = {name:?}\n\
          source_path = {source:?}\n\
+         {notes}\
          build_command = [{argv}]\n\
          artifact_path = {artifact_path:?}\n\
          # A probe-rs target name, NOT your Zephyr board name. Find it with:\n\
@@ -263,6 +559,7 @@ pub fn render_config(
          {unc_line}",
         name = name,
         source = source_path.to_string_lossy(),
+        notes = notes,
         argv = argv,
         artifact_path = artifact_path,
         unc_line = unc_line,
@@ -443,36 +740,44 @@ pub fn init(uninstall: bool) -> i32 {
         return 0;
     }
 
-    // Derive the build command from what west actually ran, when it can.
-    let build_command = match std::fs::read_to_string(&build_info)
-        .ok()
-        .and_then(|y| parse_west_command(&y))
-    {
-        Some(recorded) => {
-            println!("Derived the build command from {}", build_info.display());
-            let argv = with_build_dir(&split_argv(&recorded), build_dir_rel);
-            if argv.iter().any(|a| a == "always") && argv.iter().any(|a| a == "-p") {
-                warnings.push(
-                    "your build command has `-p always`, so every EmbArch build is a full \
-                     rebuild. Now that EmbArch has its own build directory, you can probably \
-                     drop it."
-                        .to_string(),
-                );
-            }
-            argv
-        }
-        None => {
-            warnings.push(format!(
-                "no {} found, so the build command below is a guess — check it against how you \
-                 actually build.",
-                build_info.display()
-            ));
-            ["west", "build", "-d", build_dir_rel, "-b", "CHANGE-ME"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect()
-        }
-    };
+    // Derive the build command from what west actually ran, when it can — and
+    // from *every* recorded build, not just the one at `build/`, so a repo
+    // holding several is reported rather than silently resolved (decision 41).
+    let now = SystemTime::now();
+    let recorded: Vec<RecordedBuild> = find_build_infos(&repo)
+        .into_iter()
+        .map(|path| RecordedBuild {
+            label: path
+                .strip_prefix(&repo)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string(),
+            command: std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|y| parse_west_command(&y)),
+            age: std::fs::metadata(&path)
+                .and_then(|m| m.modified())
+                .ok()
+                .and_then(|t| recorded_age(t, now)),
+        })
+        .collect();
+
+    match recorded.len() {
+        0 => {}
+        1 => println!("Derived the build command from {}", recorded[0].label),
+        n => println!("Found {n} recorded builds — see below; `init` picked none of them."),
+    }
+    let plan = scaffold_build_command(&recorded, build_dir_rel);
+    let build_command = plan.argv;
+    warnings.extend(plan.warnings);
+    if build_command.iter().any(|a| a == "always") && build_command.iter().any(|a| a == "-p") {
+        warnings.push(
+            "your build command has `-p always`, so every EmbArch build is a full \
+             rebuild. Now that EmbArch has its own build directory, you can probably \
+             drop it."
+                .to_string(),
+        );
+    }
 
     // Look for where a real build put its artifact rather than assuming.
     let artifact_path = match find_artifact(&repo.join("build"), "zephyr.hex") {
@@ -500,7 +805,14 @@ pub fn init(uninstall: bool) -> i32 {
         .map(|distro| wsl_unc_path(&distro, &repo.join(&artifact_path)));
 
     let scaffold = Scaffold {
-        toml: render_config(&name, &repo, &build_command, &artifact_path, unc.as_deref()),
+        toml: render_config(
+            &name,
+            &repo,
+            &build_command,
+            &plan.notes,
+            &artifact_path,
+            unc.as_deref(),
+        ),
         warnings,
     };
 
@@ -575,6 +887,7 @@ fn uninit(repo: &Path) -> i32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     // Shaped exactly like a real west build_info.yml, including the `cmake:`
     // block ahead of it that a naive "find command:" search would trip over.
@@ -641,6 +954,7 @@ mod tests {
             "fw",
             Path::new("/home/me/fw"),
             &["west".to_string(), "build".to_string()],
+            &[],
             "embarch/build/zephyr/zephyr.hex",
             Some("\\\\wsl.localhost\\Ubuntu\\home\\me\\fw\\x.hex"),
         );
@@ -657,11 +971,218 @@ mod tests {
             "fw",
             Path::new("/home/me/fw"),
             &["west".to_string(), "build".to_string(), "-d".to_string(), "embarch/build".to_string()],
+            &["derived from build/build_info.yml".to_string(), String::new()],
             "embarch/build/zephyr/zephyr.hex",
             None,
         );
         let parsed: toml::Value = toml::from_str(&cfg).expect("scaffolded config must be valid TOML");
         assert_eq!(parsed["core"]["base_url"].as_str(), Some("auto"));
         assert_eq!(parsed["projects"][0]["name"].as_str(), Some("fw"));
+        // Notes are comments, so they can say anything without breaking the
+        // one property every other test here depends on.
+        assert!(cfg.contains("# derived from build/build_info.yml\n#\n"), "{cfg}");
+    }
+
+    // ---- decision 41: an inferred board is never written as fact ----------
+
+    fn recorded(label: &str, command: Option<&str>, age: Option<&str>) -> RecordedBuild {
+        RecordedBuild {
+            label: label.to_string(),
+            command: command.map(str::to_string),
+            age: age.map(str::to_string),
+        }
+    }
+
+    fn rendered(plan: &BuildCommandPlan) -> String {
+        render_config(
+            "fw",
+            Path::new("/home/me/fw"),
+            &plan.argv,
+            &plan.notes,
+            "embarch/build/zephyr/zephyr.hex",
+            None,
+        )
+    }
+
+    #[test]
+    fn the_board_is_the_only_field_redacted_out_of_a_recorded_command() {
+        let (argv, board) = redact_board(&split_argv(
+            "/ws/.venv/bin/west build -p always -b roadrunner@2/nrf54l15/cpuapp app/reference-dut",
+        ));
+        assert_eq!(board.as_deref(), Some("roadrunner@2/nrf54l15/cpuapp"));
+        assert_eq!(
+            argv,
+            split_argv("/ws/.venv/bin/west build -p always -b CHANGE-ME app/reference-dut")
+        );
+
+        let (argv, board) = redact_board(&split_argv("west build --board=nrf52dk/nrf52832 app"));
+        assert_eq!(board.as_deref(), Some("nrf52dk/nrf52832"));
+        assert!(argv.contains(&"--board=CHANGE-ME".to_string()));
+
+        // Nothing to displace, nothing changed.
+        let argv = split_argv("west build app");
+        assert_eq!(redact_board(&argv), (argv.clone(), None));
+    }
+
+    #[test]
+    fn one_recorded_build_is_inferred_and_marked_never_asserted() {
+        let plan = scaffold_build_command(
+            &[recorded("build/build_info.yml", Some("west build -b roadrunner@2/nrf54l15/cpuapp app/hb"), Some("7 days ago"))],
+            "embarch/build",
+        );
+        // The recorded command survives except for the one hardware claim.
+        assert!(plan.argv.contains(&"app/hb".to_string()));
+        assert!(plan.argv.contains(&BOARD_PLACEHOLDER.to_string()));
+        assert!(!plan.argv.iter().any(|a| a.contains("roadrunner")));
+
+        let cfg = rendered(&plan);
+        let parsed: toml::Value = toml::from_str(&cfg).expect("must stay valid TOML");
+        let cmd = parsed["projects"][0]["build_command"].as_array().unwrap();
+        // The load-bearing assertion of this whole task: the board `init`
+        // inferred is nowhere in the config except inside a comment.
+        assert!(
+            !cmd.iter().any(|v| v.as_str().unwrap().contains("roadrunner")),
+            "{cfg}"
+        );
+        for line in cfg.lines().filter(|l| l.contains("roadrunner")) {
+            assert!(line.trim_start().starts_with('#'), "{line}");
+        }
+        // ...but it is still there to paste, with how stale it is.
+        assert!(cfg.contains("The board it recorded was: roadrunner@2/nrf54l15/cpuapp"), "{cfg}");
+        assert!(cfg.contains("built 7 days ago"), "{cfg}");
+        assert!(
+            plan.warnings.iter().any(|w| w.contains("roadrunner") && w.contains("confirm")),
+            "{:?}",
+            plan.warnings
+        );
+    }
+
+    #[test]
+    fn a_recorded_command_with_no_board_still_never_ships_boardless() {
+        let plan = scaffold_build_command(
+            &[recorded("build/build_info.yml", Some("west build app/hb"), None)],
+            "embarch/build",
+        );
+        assert_eq!(board_in_argv(&plan.argv).as_deref(), Some(BOARD_PLACEHOLDER));
+    }
+
+    #[test]
+    fn several_recorded_builds_are_all_named_and_none_is_picked() {
+        let plan = scaffold_build_command(
+            &[
+                recorded("build/build_info.yml", Some("west build -b devkit/nrf52840 app/hb"), Some("today")),
+                recorded("build-prod/build_info.yml", Some("west build -b roadrunner@2/nrf54l15/cpuapp app/hb"), Some("30 days ago")),
+                recorded("twister-out/x/build_info.yml", None, None),
+            ],
+            "embarch/build",
+        );
+        // Nothing chosen: the command is the same template the no-build case
+        // gets, and carries neither candidate's board or app path.
+        assert_eq!(
+            plan.argv,
+            scaffold_build_command(&[], "embarch/build").argv,
+            "a several-builds repo must not inherit one of them"
+        );
+
+        let cfg = rendered(&plan);
+        toml::from_str::<toml::Value>(&cfg).expect("must stay valid TOML");
+        let warning = plan.warnings.join("\n");
+        for text in [&cfg, &warning] {
+            for candidate in [
+                "build/build_info.yml",
+                "build-prod/build_info.yml",
+                "twister-out/x/build_info.yml",
+                "devkit/nrf52840",
+                "roadrunner@2/nrf54l15/cpuapp",
+            ] {
+                assert!(text.contains(candidate), "missing {candidate} in:\n{text}");
+            }
+        }
+        assert!(warning.contains("will not pick one for you"), "{warning}");
+        assert!(cfg.contains("chose none of them"), "{cfg}");
+        // The one with no west command is named too, rather than dropped.
+        assert!(warning.contains("no board recorded"), "{warning}");
+    }
+
+    #[test]
+    fn no_recorded_build_keeps_the_behaviour_it_always_had() {
+        let plan = scaffold_build_command(&[], "embarch/build");
+        assert_eq!(
+            plan.argv,
+            split_argv("west build -d embarch/build -b CHANGE-ME")
+        );
+        assert!(plan.warnings.iter().any(|w| w.contains("template")));
+        toml::from_str::<toml::Value>(&rendered(&plan)).expect("must stay valid TOML");
+    }
+
+    #[test]
+    fn an_age_is_days_since_the_build_and_nothing_when_the_clock_is_nonsense() {
+        let now = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
+        let ago = |secs: u64| recorded_age(now - std::time::Duration::from_secs(secs), now);
+        assert_eq!(ago(0).as_deref(), Some("today"));
+        assert_eq!(ago(86_400).as_deref(), Some("yesterday"));
+        assert_eq!(ago(7 * 86_400 + 5).as_deref(), Some("7 days ago"));
+        assert_eq!(
+            recorded_age(now + std::time::Duration::from_secs(86_400), now),
+            None
+        );
+    }
+
+    #[test]
+    fn every_recorded_build_in_the_tree_is_found_not_only_the_one_at_build() {
+        let dir = tempdir();
+        let write = |rel: &str| {
+            let p = dir.path().join(rel);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(&p, "west:\n  command: 'west build -b b app'\n").unwrap();
+        };
+        write("build/build_info.yml");
+        write("build-prod/build_info.yml");
+        write("twister-out/a/b/build_info.yml");
+        // Dotted directories are somebody else's cache, and `.git` holds no
+        // builds — neither is walked.
+        write(".cache/build/build_info.yml");
+        // Deeper than the walk's bound.
+        write("a/b/c/d/e/build_info.yml");
+
+        let found: Vec<String> = find_build_infos(dir.path())
+            .iter()
+            .map(|p| p.strip_prefix(dir.path()).unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            found,
+            // Component-wise, which is how `PathBuf` orders: `build` sorts
+            // before `build-prod` even though `build/` does not.
+            vec![
+                "build/build_info.yml",
+                "build-prod/build_info.yml",
+                "twister-out/a/b/build_info.yml",
+            ]
+        );
+    }
+
+    struct TempDir(PathBuf);
+    impl TempDir {
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+    impl Drop for TempDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+    fn tempdir() -> TempDir {
+        let base = std::env::temp_dir().join(format!(
+            "embarch-umbrella-init-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&base).unwrap();
+        TempDir(base)
     }
 }
+
