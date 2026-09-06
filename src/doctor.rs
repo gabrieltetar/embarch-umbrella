@@ -2308,6 +2308,216 @@ fn judge_growth(
     }
 }
 
+// ---- check 17: Core's bind address versus what this topology needs ----------
+
+const CHECK_17_NAME: &str = "Core's bind address matches what this topology needs";
+
+/// Everything check 17 compares. Pure, so every branch below is testable
+/// without an `sc.exe`, a service, or a listening Core.
+struct BindEvidence<'a> {
+    /// The class `setup` concluded and wrote into machine state — the
+    /// *independent* half of the comparison. Deriving "what this topology
+    /// needs" from the winning candidate instead would be tautological: the
+    /// candidate that answered always agrees with itself.
+    recorded: Option<TopologyClass>,
+    /// Check 3's winner: the class and the address `/status` was actually
+    /// reached at.
+    reached: Option<(TopologyClass, &'a str)>,
+    /// `--bind` out of the Windows service's own registration, read **only
+    /// when nothing answered** (see the driver). `None` everywhere else, and
+    /// on every machine whose Core is not a Windows service.
+    registered: Option<&'a str>,
+}
+
+/// Is this bind address one that only the same machine can reach?
+///
+/// Deliberately a small explicit set rather than a parse: these are the
+/// values `embarch-core install --bind` is ever given, and a hostname this
+/// does not recognise falls through to "not loopback", which downgrades a
+/// Fail to a Warn. That direction is the safe one — a wrong Fail on a working
+/// machine costs more than a missed diagnosis on a hand-edited registration.
+fn is_loopback_bind(addr: &str) -> bool {
+    matches!(addr.trim(), "127.0.0.1" | "localhost" | "::1" | "[::1]")
+}
+
+/// Decision 22(a): the address Core answered on, against what the topology
+/// this machine was set up for actually needs.
+///
+/// **The failure it exists for.** `embarch-core`'s `--bind` default narrowed
+/// to loopback, and on a `wsl-host` machine `setup` is what widens it back to
+/// `0.0.0.0`. A Core that got installed without that widening is *reachable
+/// from the interface it bound and from no other* — including the WSL2
+/// gateway hop that is the only route a guest has to its Windows host. That
+/// is not "Core is down", and check 3 reporting bare unreachability sends
+/// someone to restart a service that is already running.
+///
+/// **Why the recorded class is the thing compared against.** `setup` writes
+/// the class it concluded into machine state; check 3 rediscovers a class
+/// from whichever candidate answered. Comparing the winner against itself
+/// says nothing, so the recorded class is the only independent statement of
+/// what this machine is *supposed* to be, and with none recorded this check
+/// has nothing to do.
+///
+/// **Two disagreements, and only one of them is a Fail.** Recorded wide
+/// (`0.0.0.0`) but reached at loopback is the failure above: a real breakage
+/// for anything that is not on this interface. Recorded narrow
+/// (`127.0.0.1`) but reached over a gateway is the *opposite* — Core is bound
+/// wider than needed, everything works, and failing a `doctor` run over it
+/// would be a red on a machine with nothing wrong. It warns and says which
+/// direction it is. The losing argument is recorded in decision 22.
+///
+/// **What it refuses to restate.** With no winner and no registration to
+/// read, this is a Warn that points at check 3 rather than a second Fail for
+/// the same unreachability — the decision's "rather than reporting bare
+/// unreachability".
+fn judge_bind_address(e: &BindEvidence<'_>) -> Check {
+    const N: u8 = 17;
+
+    let Some(recorded) = e.recorded else {
+        return with_fix(
+            with_code(
+                check(
+                    N,
+                    CHECK_17_NAME,
+                    Status::Warn,
+                    "no topology class has been recorded for this machine, so there is nothing to \
+                     compare a bind address against",
+                ),
+                "no-recorded-class",
+            ),
+            "run `embarch setup` (or `embarch setup --dry-run` to see the plan first); it records \
+             the class it detects.",
+        );
+    };
+    let needed = topology::recommended_bind_address(recorded);
+    let recorded_str = recorded.as_str();
+
+    if let Some((reached_class, url)) = e.reached {
+        let reached_needs = topology::recommended_bind_address(reached_class);
+        if reached_needs == needed {
+            return with_code(
+                check(
+                    N,
+                    CHECK_17_NAME,
+                    Status::Pass,
+                    format!(
+                        "reached at {url} ({}), and this machine was set up as {recorded_str}, which \
+                         needs Core bound {needed} — a Core answering there is bound at least that wide",
+                        reached_class.as_str()
+                    ),
+                ),
+                "bind-matches",
+            );
+        }
+        if needed == "0.0.0.0" && is_loopback_bind_url(url) {
+            return with_fix(
+                with_code(
+                    check(
+                        N,
+                        CHECK_17_NAME,
+                        Status::Fail,
+                        format!(
+                            "reached at {url} ({}) only, but this machine was set up as \
+                             {recorded_str}, which needs Core bound {needed}. Core is answering on \
+                             an interface this process can use and the one a WSL2 guest reaches its \
+                             Windows host over — the default gateway — is not it. This is not an \
+                             unreachable Core; it is a Core reachable from the wrong side",
+                            reached_class.as_str()
+                        ),
+                    ),
+                    "bind-too-narrow",
+                ),
+                format!(
+                    "reinstall the service with the wide bind, in an elevated shell on the machine \
+                     running Core: `embarch-core install --bind {needed}` — or re-run `embarch \
+                     setup`, which passes it for you."
+                ),
+            );
+        }
+        return with_code(
+            check(
+                N,
+                CHECK_17_NAME,
+                Status::Warn,
+                format!(
+                    "reached at {url} ({}), but this machine was set up as {recorded_str}, which \
+                     only needs Core bound {needed} — Core is listening wider than this topology \
+                     requires. Nothing is broken by that; it is exposure, not breakage, so this is \
+                     not a failure",
+                    reached_class.as_str()
+                ),
+            ),
+            "bind-wider-than-needed",
+        );
+    }
+
+    match e.registered {
+        Some(addr) if needed == "0.0.0.0" && is_loopback_bind(addr) => with_fix(
+            with_code(
+                check(
+                    N,
+                    CHECK_17_NAME,
+                    Status::Fail,
+                    format!(
+                        "nothing answered on any candidate, and the Core service is registered \
+                         `--bind {addr}` while this machine was set up as {recorded_str}, which \
+                         needs {needed}. The bind is why, not a stopped service — `setup` did not \
+                         widen it"
+                    ),
+                ),
+                "bound-narrow",
+            ),
+            format!(
+                "reinstall the service with the wide bind, in an elevated shell on the machine \
+                 running Core: `embarch-core install --bind {needed}` — or re-run `embarch setup`, \
+                 which passes it for you."
+            ),
+        ),
+        Some(addr) => with_code(
+            check(
+                N,
+                CHECK_17_NAME,
+                Status::Warn,
+                format!(
+                    "nothing answered on any candidate, but the Core service is registered `--bind \
+                     {addr}`, which covers what a {recorded_str} machine needs ({needed}) — the \
+                     bind address is not why. See checks 2 and 3"
+                ),
+            ),
+            "bind-not-the-cause",
+        ),
+        None => with_code(
+            check(
+                N,
+                CHECK_17_NAME,
+                Status::Warn,
+                format!(
+                    "nothing answered on any candidate and no service registration could be read, \
+                     so the address Core is bound to is unknown and cannot be compared against what \
+                     a {recorded_str} machine needs ({needed}). Check 3 owns bare unreachability"
+                ),
+            ),
+            "no-address",
+        ),
+    }
+}
+
+/// Is the address inside a probed candidate's base URL a loopback one?
+///
+/// The candidate list holds `http://127.0.0.1:4884`-shaped URLs, so the host
+/// is cut out before `is_loopback_bind` judges it. Kept separate from that
+/// function because the registration side is a bare address, not a URL.
+fn is_loopback_bind_url(base_url: &str) -> bool {
+    let rest = base_url.split("://").nth(1).unwrap_or(base_url);
+    let host = rest.split('/').next().unwrap_or(rest);
+    let host = match host.rsplit_once(':') {
+        // `[::1]:4884` — the port, not the address's own colons.
+        Some((h, p)) if p.chars().all(|c| c.is_ascii_digit()) && !p.is_empty() => h,
+        _ => host,
+    };
+    is_loopback_bind(host)
+}
+
 // ---- driver ------------------------------------------------------------------
 
 pub async fn doctor(json: bool) -> i32 {
@@ -2370,9 +2580,23 @@ pub async fn doctor(json: bool) -> i32 {
         projects,
     );
 
+    // Decision 22(a). The service registration is read **only when nothing
+    // answered**: with a winner the address it answered at is the better
+    // evidence and already proves the bind covers that route, so the
+    // subprocess is spent exactly where it can change the verdict.
+    let registered_bind =
+        if core_probe.winner_base_url.is_none() { locate::windows_core_service_bind_address() } else { None };
+    let check17 = judge_bind_address(&BindEvidence {
+        recorded: saved.topology.as_deref().and_then(setup::topology_class_from_str),
+        reached: core_probe
+            .winner_class
+            .zip(core_probe.winner_base_url.as_deref()),
+        registered: registered_bind.as_deref(),
+    });
+
     let checks = vec![
         check1, check2, check3, check4, check5, check6, check7, check8, check9, check10, check11, check12,
-        check13, check14, check15, check16,
+        check13, check14, check15, check16, check17,
     ];
 
     let any_fail = checks.iter().any(|c| c.status == Status::Fail);
@@ -3702,5 +3926,146 @@ mod tests {
         assert_eq!(human_bytes(1023), "1023 B");
         assert_eq!(human_bytes(1024), "1.0 KiB");
         assert_eq!(human_bytes(1024 * 1024 * 3 / 2), "1.5 MiB");
+    }
+
+    // ---- check 17: bind address versus topology (decision 22(a)) -----------
+
+    fn bind_evidence<'a>(
+        recorded: Option<TopologyClass>,
+        reached: Option<(TopologyClass, &'a str)>,
+        registered: Option<&'a str>,
+    ) -> BindEvidence<'a> {
+        BindEvidence { recorded, reached, registered }
+    }
+
+    /// **The check's reason for existing, and the state that must be a Fail
+    /// and not a Warn.** A `wsl-host` machine needs Core bound `0.0.0.0`;
+    /// this one answered on loopback and nowhere else, which is exactly
+    /// "reachable from this interface but not the one WSL2 can actually
+    /// use". A Warn here would sit in a list of warns nobody reads while
+    /// every flash from the guest fails.
+    #[test]
+    fn check_17_fails_when_the_address_reached_is_narrower_than_the_topology_needs() {
+        let c = judge_bind_address(&bind_evidence(
+            Some(TopologyClass::WslHost),
+            Some((TopologyClass::Local, "http://127.0.0.1:4884")),
+            None,
+        ));
+        assert_eq!(c.n, 17);
+        assert_eq!(c.status, Status::Fail);
+        assert_eq!(c.code, Some("bind-too-narrow"));
+        assert!(c.detail.contains("wsl-host"), "{}", c.detail);
+        assert!(c.detail.contains("0.0.0.0"), "{}", c.detail);
+        assert!(c.fix.unwrap().contains("--bind 0.0.0.0"));
+    }
+
+    /// The second Fail path, and the one the decision's "rather than
+    /// reporting bare unreachability" is about: nothing answered anywhere,
+    /// and the service's own registration says why.
+    #[test]
+    fn check_17_fails_when_nothing_answered_and_the_service_is_registered_narrow() {
+        let c = judge_bind_address(&bind_evidence(
+            Some(TopologyClass::WslHost),
+            None,
+            Some("127.0.0.1"),
+        ));
+        assert_eq!(c.status, Status::Fail);
+        assert_eq!(c.code, Some("bound-narrow"));
+        assert!(c.detail.contains("not a stopped service"), "{}", c.detail);
+    }
+
+    /// The same unreachability with a *wide* registration is a useful
+    /// negative, not a second Fail — checks 2 and 3 own it, and saying so is
+    /// what keeps this check from being a duplicate red.
+    #[test]
+    fn check_17_says_the_bind_is_not_the_cause_when_the_registration_is_wide() {
+        let c = judge_bind_address(&bind_evidence(
+            Some(TopologyClass::WslHost),
+            None,
+            Some("0.0.0.0"),
+        ));
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.code, Some("bind-not-the-cause"));
+        assert!(c.detail.contains("checks 2 and 3"), "{}", c.detail);
+    }
+
+    #[test]
+    fn check_17_warns_rather_than_repeating_check_3_when_there_is_no_address_at_all() {
+        let c = judge_bind_address(&bind_evidence(Some(TopologyClass::WslHost), None, None));
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.code, Some("no-address"));
+    }
+
+    /// A `wsl-host` machine reached over its gateway, and a `local` one
+    /// reached at loopback, are both the agreeing case.
+    #[test]
+    fn check_17_passes_when_the_address_reached_is_what_the_recorded_class_needs() {
+        let wsl = judge_bind_address(&bind_evidence(
+            Some(TopologyClass::WslHost),
+            Some((TopologyClass::WslHost, "http://172.24.16.1:4884")),
+            None,
+        ));
+        assert_eq!(wsl.status, Status::Pass);
+        assert_eq!(wsl.code, Some("bind-matches"));
+
+        let local = judge_bind_address(&bind_evidence(
+            Some(TopologyClass::Local),
+            Some((TopologyClass::Local, "http://127.0.0.1:4884")),
+            None,
+        ));
+        assert_eq!(local.status, Status::Pass);
+    }
+
+    /// The other direction of disagreement, and deliberately **not** a Fail:
+    /// Core bound wider than a `local` machine needs still answers
+    /// everything that asks. Failing here would put a red on a machine with
+    /// nothing wrong, which is decision 22(a)'s recorded carve-out.
+    #[test]
+    fn check_17_only_warns_when_core_is_bound_wider_than_the_topology_needs() {
+        let c = judge_bind_address(&bind_evidence(
+            Some(TopologyClass::Local),
+            Some((TopologyClass::WslHost, "http://172.24.16.1:4884")),
+            None,
+        ));
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.code, Some("bind-wider-than-needed"));
+        assert!(c.detail.contains("exposure, not breakage"), "{}", c.detail);
+    }
+
+    /// With no class recorded there is no independent statement of what this
+    /// machine is supposed to be, and comparing check 3's winner against
+    /// itself would pass unconditionally.
+    #[test]
+    fn check_17_skips_distinguishably_when_setup_recorded_no_class() {
+        let c = judge_bind_address(&bind_evidence(
+            None,
+            Some((TopologyClass::Local, "http://127.0.0.1:4884")),
+            Some("127.0.0.1"),
+        ));
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.code, Some("no-recorded-class"));
+        assert!(c.fix.unwrap().contains("embarch setup"));
+    }
+
+    /// A `remote` Core is reached at the host the operator named, whose class
+    /// recommends the same wide bind — so it agrees, and this check never
+    /// tells someone to reinstall a service on a machine they are not on.
+    #[test]
+    fn check_17_passes_for_a_remote_core_reached_at_its_named_host() {
+        let c = judge_bind_address(&bind_evidence(
+            Some(TopologyClass::Remote),
+            Some((TopologyClass::Remote, "http://build-box.local:4884")),
+            None,
+        ));
+        assert_eq!(c.status, Status::Pass);
+    }
+
+    #[test]
+    fn a_loopback_candidate_url_is_recognised_through_its_scheme_and_port() {
+        assert!(is_loopback_bind_url("http://127.0.0.1:4884"));
+        assert!(is_loopback_bind_url("http://localhost:4884"));
+        assert!(is_loopback_bind_url("http://[::1]:4884"));
+        assert!(!is_loopback_bind_url("http://172.24.16.1:4884"));
+        assert!(!is_loopback_bind_url("http://0.0.0.0:4884"));
     }
 }

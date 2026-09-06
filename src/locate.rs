@@ -329,6 +329,61 @@ pub fn windows_core_service_binary_path() -> Option<PathBuf> {
     None
 }
 
+/// The `--bind <addr>` the Core service was actually *registered* with, read
+/// off the same `sc.exe qc` line `windows_core_service_binary_path` reads the
+/// exe out of.
+///
+/// `doctor` check 17 is the only caller, and only when nothing answered on
+/// any candidate: an installed-and-running service that no candidate could
+/// reach is either down or listening somewhere this machine cannot get to,
+/// and the registration is the one place that distinguishes those without a
+/// successful HTTP call (decision 22(a)).
+///
+/// Not `#[cfg(unix)]`, unlike its sibling above — the question "which address
+/// was this service installed with" is the same question from a native
+/// Windows `embarch` as from a WSL2 guest, and `sc.exe` answers it in both.
+/// On a machine with no `sc.exe` the spawn fails and this is `None`, which is
+/// the same answer as "no such service".
+pub fn windows_core_service_bind_address() -> Option<String> {
+    let output = std::process::Command::new("sc.exe")
+        .args(["qc", WINDOWS_CORE_SERVICE_LABEL])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_sc_qc_bind_address(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// Pulls `--bind`'s value out of `sc.exe qc`'s `BINARY_PATH_NAME` command
+/// line.
+///
+/// Both spellings, because `install` writes the spaced one and a human
+/// re-registering by hand may not: `--bind 0.0.0.0` and `--bind=0.0.0.0`.
+/// A `--bind` with nothing after it is `None` rather than an empty string —
+/// an address the check would then compare against is worse than admitting it
+/// could not read one.
+///
+/// Absent entirely is also `None`, and that is a real state rather than a
+/// parse failure: an older `install` that predates `--bind` registered no
+/// such flag, and Core's own default is what it then bound.
+fn parse_sc_qc_bind_address(stdout: &str) -> Option<String> {
+    const FIELD: &str = "BINARY_PATH_NAME";
+    let line = stdout.lines().find(|l| l.contains(FIELD))?;
+    let mut words = line.split_whitespace();
+    while let Some(w) = words.next() {
+        if let Some(v) = w.strip_prefix("--bind=") {
+            let v = v.trim_matches('"');
+            return (!v.is_empty()).then(|| v.to_string());
+        }
+        if w == "--bind" {
+            let v = words.next()?.trim_matches('"');
+            return (!v.is_empty()).then(|| v.to_string());
+        }
+    }
+    None
+}
+
 /// Pulls the executable out of `sc.exe qc`'s `BINARY_PATH_NAME` line.
 ///
 /// Two things make this less trivial than a `split(':')`. The value is a
@@ -405,6 +460,38 @@ mod tests {
                 r"C:\Users\tmp12\embarch-setup\embarch-0.1.0-x86_64-pc-windows-msvc\embarch-core.exe"
             )
         );
+    }
+
+    /// The same real capture, read for the other half of the command line:
+    /// check 17 wants the address the service was *registered* with, and
+    /// this bench's is the widened one `setup` is supposed to pass.
+    #[test]
+    fn the_registered_bind_address_is_read_off_the_same_line() {
+        let real = "[SC] QueryServiceConfig SUCCESS\n\n\
+             SERVICE_NAME: com.embarch.core\n        \
+             BINARY_PATH_NAME   : C:\\Users\\tmp12\\embarch-setup\\embarch-0.1.0-x86_64-pc-windows-msvc\\embarch-core.exe run --bind 0.0.0.0\n";
+        assert_eq!(parse_sc_qc_bind_address(real).as_deref(), Some("0.0.0.0"));
+    }
+
+    #[test]
+    fn an_equals_spelled_bind_is_read_too() {
+        let line = "        BINARY_PATH_NAME   : \"C:\\Program Files\\embarch\\embarch-core.exe\" run --bind=127.0.0.1\n";
+        assert_eq!(parse_sc_qc_bind_address(line).as_deref(), Some("127.0.0.1"));
+    }
+
+    /// A registration that names no `--bind` at all — an `install` predating
+    /// the flag. `None`, not a guess at Core's default: check 17 warns that
+    /// it could not read one rather than comparing against a fiction.
+    #[test]
+    fn a_registration_with_no_bind_flag_reads_as_none() {
+        let line = "        BINARY_PATH_NAME   : C:\\embarch\\embarch-core.exe run\n";
+        assert_eq!(parse_sc_qc_bind_address(line), None);
+    }
+
+    #[test]
+    fn a_dangling_bind_flag_reads_as_none_rather_than_an_empty_address() {
+        let line = "        BINARY_PATH_NAME   : C:\\embarch\\embarch-core.exe run --bind\n";
+        assert_eq!(parse_sc_qc_bind_address(line), None);
     }
 
     /// A path with a space in it — the case a whitespace split would

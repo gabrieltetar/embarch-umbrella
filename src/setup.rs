@@ -424,7 +424,7 @@ pub fn uninstall() -> i32 {
     0
 }
 
-fn topology_class_from_str(s: &str) -> Option<TopologyClass> {
+pub fn topology_class_from_str(s: &str) -> Option<TopologyClass> {
     match s {
         "local" => Some(TopologyClass::Local),
         "wsl-host" => Some(TopologyClass::WslHost),
