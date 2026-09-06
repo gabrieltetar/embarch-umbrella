@@ -2330,13 +2330,18 @@ struct BindEvidence<'a> {
     /// neither holds, and on every machine whose Core is not a Windows
     /// service.
     registered: Option<&'a str>,
-    /// The class a re-run of `embarch setup` **here** would infer, out of
-    /// the same `setup::infer_class` that command calls — shared rather
-    /// than mirrored so the two can never disagree. Only the `bound-narrow`
-    /// fix line reads it, and only to decide whether `setup` is an honest
-    /// alternative to the reinstall: run natively on the Windows side of a
-    /// `wsl-host` machine it infers `local`, installs the narrow bind again
-    /// and overwrites the recorded class.
+    /// The class a re-run of **bare `embarch setup` here** would infer, out
+    /// of the same `setup::infer_class` that command calls, **fed the
+    /// arguments that command feeds it** — shared function *and* shared
+    /// inputs, which is what makes "the two cannot disagree" true rather
+    /// than merely intended (decision 22(a)'s 2026-09-06 input amendment).
+    /// Notably **not** doctor's own `host`: that is `config.core.host` or a
+    /// sticky `saved.host`, and `setup` reads neither — only its own
+    /// `--host` flag, which the command this fix line names does not carry.
+    /// Only the `bound-narrow` fix line reads it, and only to decide whether
+    /// `setup` is an honest alternative to the reinstall: run natively on
+    /// the Windows side of a `wsl-host` machine it infers `local`, installs
+    /// the narrow bind again and overwrites the recorded class.
     setup_would_infer: TopologyClass,
 }
 
@@ -2576,24 +2581,39 @@ fn judge_bind_address(e: &BindEvidence<'_>) -> Check {
                 ),
                 "bound-narrow",
             ),
-            if topology::recommended_bind_address(e.setup_would_infer) == needed {
-                format!(
+            // **The question is "would `setup` install a wide-bound Core
+            // here", not "does the class it infers want one".** Those read
+            // as the same test and are not: `recommended_bind_address` says
+            // `0.0.0.0` for `remote` as well, and a `setup` that infers
+            // `remote` installs *nothing* — umbrella does no remote
+            // orchestration at all (design.md §3 decision 8). Asking the
+            // bind constant therefore offered the command in the one state
+            // where it cannot possibly help, which is the same defect
+            // `bind-too-narrow` was stripped of one arm over. So the class
+            // is matched directly, exhaustively, and each arm says what
+            // that run would really do.
+            match e.setup_would_infer {
+                TopologyClass::WslHost => format!(
                     "reinstall the service with the wide bind, in an elevated shell on the machine \
                      running Core: `embarch-core install --bind {needed}` — or re-run `embarch \
-                     setup` from here, which infers {} and passes it for you.",
-                    e.setup_would_infer.as_str()
-                )
-            } else {
-                format!(
+                     setup` from here, which infers wsl-host and passes it for you."
+                ),
+                TopologyClass::Local => format!(
                     "reinstall the service with the wide bind, in an elevated shell on the machine \
                      running Core: `embarch-core install --bind {needed}`. Do not re-run `embarch \
-                     setup` from here: run on this side it infers {}, which needs {}, so it \
+                     setup` from here: run on this side it infers local, which needs {}, so it \
                      installs the narrow bind again and then rewrites the recorded class — after \
                      which this check passes `bind-matches` with the bind untouched. Run it from \
                      the WSL2 guest, or reinstall.",
-                    e.setup_would_infer.as_str(),
-                    topology::recommended_bind_address(e.setup_would_infer)
-                )
+                    topology::recommended_bind_address(TopologyClass::Local)
+                ),
+                TopologyClass::Remote => format!(
+                    "reinstall the service with the wide bind, in an elevated shell on the machine \
+                     running Core: `embarch-core install --bind {needed}`. Do not re-run `embarch \
+                     setup` from here: run on this side it infers remote, and a remote setup \
+                     installs nothing at all — it records where Core lives and leaves the bind \
+                     exactly as narrow as it is. Run it from the WSL2 guest, or reinstall."
+                ),
             },
         ),
         Some(addr) => with_code(
@@ -2757,10 +2777,17 @@ pub async fn doctor(json: bool) -> i32 {
             .winner_class
             .zip(core_probe.winner_base_url.as_deref()),
         registered: registered_bind.as_deref(),
-        // `setup`'s own inference, not a copy of it — the `bound-narrow` fix
-        // line offers `embarch setup` and is only right where that command
-        // would infer a class needing the wide bind.
-        setup_would_infer: setup::infer_class(host.as_deref(), core.as_ref()),
+        // `setup`'s own inference, not a copy of it — and fed `setup`'s own
+        // inputs, which sharing the function alone did not give it. The fix
+        // line names one exact command, bare `embarch setup`, so the only
+        // honest prediction is the one that command will make: `None` for
+        // the host, because a bare run passes no `--host`, and the same
+        // `core` this run already located. Doctor's `host` above is
+        // `config.core.host` or `saved.host`; `setup` reads neither, and
+        // `saved.host` is sticky across a reclassification, so passing it
+        // here made the fix line name `remote` for a command that would
+        // infer `wsl-host` (decision 22(a)).
+        setup_would_infer: setup::infer_class(None, core.as_ref()),
     });
 
     let checks = vec![
@@ -4405,6 +4432,66 @@ mod tests {
         assert!(fix.contains("local"), "{fix}");
         assert!(fix.contains("127.0.0.1"), "{fix}");
         assert!(fix.contains("--bind 0.0.0.0"), "{fix}");
+    }
+
+    /// **And the same hole one path further over — the one `020` left as an
+    /// absence in these tests.** The withdrawal above used to be keyed on
+    /// `recommended_bind_address(setup_would_infer) == needed`, which is
+    /// `0.0.0.0` for `remote` as well as for `wsl-host`, so a `remote`
+    /// inference kept the `setup` offer. But `setup` inferring `remote`
+    /// installs *nothing* — umbrella does no remote orchestration (design.md
+    /// §3 decision 8) — so that is the one class where the offer cannot
+    /// possibly widen the bind, and it must be withdrawn for a different
+    /// reason than `local`'s: not "it reinstalls narrow" but "it reinstalls
+    /// nothing".
+    #[test]
+    fn check_17s_bound_narrow_fix_withdraws_setup_where_setup_would_infer_remote() {
+        let c = judge_bind_address(&BindEvidence {
+            recorded: Some(TopologyClass::WslHost),
+            reached: None,
+            registered: Some("127.0.0.1"),
+            setup_would_infer: TopologyClass::Remote,
+        });
+        assert_eq!(c.status, Status::Fail);
+        assert_eq!(c.code, Some("bound-narrow"));
+        let fix = c.fix.as_deref().unwrap();
+        assert!(fix.contains("Do not re-run `embarch setup` from here"), "{fix}");
+        assert!(fix.contains("remote"), "{fix}");
+        assert!(fix.contains("installs nothing at all"), "{fix}");
+        assert!(fix.contains("--bind 0.0.0.0"), "{fix}");
+        // The `local` arm's reason would be a false statement here.
+        assert!(!fix.contains("installs the narrow bind again"), "{fix}");
+    }
+
+    /// **What the fix line is actually predicting, pinned at the input.**
+    /// It names one exact command — bare `embarch setup`, run here — so the
+    /// only honest value for `setup_would_infer` is what *that* invocation
+    /// concludes: `infer_class(None, core)`, the host argument absent
+    /// because a bare run passes no `--host`. The driver used to hand it
+    /// doctor's own `host`, which is `config.core.host` or a `saved.host`
+    /// that survives a later reclassification, and the two therefore
+    /// disagreed in exactly the state check 17 fires in.
+    ///
+    /// The consequence worth writing down: with the host fixed at `None`,
+    /// `remote` is not reachable from the driver at all. The `remote` arm
+    /// above is a guard against a future call site, not a live branch — so
+    /// this test is what says which, rather than leaving the reader to
+    /// re-derive it from `infer_class`.
+    #[test]
+    fn a_bare_setup_run_never_infers_remote_whatever_this_machine_has_saved() {
+        let windows_core = crate::locate::Located {
+            path: std::path::PathBuf::from("/mnt/c/Program Files/embarch/embarch-core.exe"),
+            found_by: crate::locate::FoundBy::WindowsConventionalDir,
+            windows_exe_from_wsl2: true,
+        };
+        assert_eq!(setup::infer_class(None, Some(&windows_core)), TopologyClass::WslHost);
+        assert_eq!(setup::infer_class(None, None), TopologyClass::Local);
+        // The input the driver used to pass, and the class it produced for a
+        // command that would not have inferred it.
+        assert_eq!(
+            setup::infer_class(Some("bench.local"), Some(&windows_core)),
+            TopologyClass::Remote
+        );
     }
 
     /// The same unreachability with a *wide* registration is a useful
