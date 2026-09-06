@@ -59,14 +59,22 @@ pub struct Check {
     pub detail: String,
     pub fix: Option<String>,
     /// A stable machine-readable outcome, for a check whose `status` alone
-    /// does not say which state it is in (decision 37). `None` — every check
-    /// but 10 today — renders as JSON `null` rather than being omitted, so
-    /// the key is always present and a consumer never has to distinguish
-    /// "absent" from "no code".
+    /// does not say which state it is in (decision 37). Checks 1, 5, 10 and
+    /// 14 carry one today; `None` renders as JSON `null` rather than being
+    /// omitted, so the key is always present and a consumer never has to
+    /// distinguish "absent" from "no code".
     ///
     /// **Never derived from `detail`.** The whole point is that a consumer
     /// does not have to match on a sentence written for a human.
     pub code: Option<&'static str>,
+    /// The one filesystem path this check's verdict is *about*, when it
+    /// resolved exactly one (decision 39). Check 16 carries the
+    /// `study_results/` directory it measured; every other check is `None`,
+    /// which renders as JSON `null` for the same reason `code` does.
+    ///
+    /// Not every path a check mentions — check 16's per-project build-dir
+    /// roots are several and stay in `detail`.
+    pub path: Option<String>,
 }
 
 fn check(n: u8, name: &'static str, status: Status, detail: impl Into<String>) -> Check {
@@ -77,11 +85,17 @@ fn check(n: u8, name: &'static str, status: Status, detail: impl Into<String>) -
         detail: detail.into(),
         fix: None,
         code: None,
+        path: None,
     }
 }
 
 fn with_code(mut c: Check, code: &'static str) -> Check {
     c.code = Some(code);
+    c
+}
+
+fn with_path(mut c: Check, path: &Path) -> Check {
+    c.path = Some(path.display().to_string());
     c
 }
 
@@ -1981,13 +1995,39 @@ fn check_growth(
         ),
         _ => String::new(),
     };
-    judge_growth(dir.as_deref(), &note, projects)
+    judge_growth(dir.as_deref(), &note, absent_note(class), projects)
+}
+
+/// The extra sentence check 16 owes a reader **only when the directory it
+/// resolved is not there** (decision 39).
+///
+/// On `wsl-host` the path is `setup::data_dir_for`'s hardcoded
+/// `/mnt/c/ProgramData/embarch` — an *assumed* standard `%ProgramData%`,
+/// where `embarch-api`'s token discovery resolves the real value from the
+/// Windows side ([embarch-token.md](../embarch-doc/embarch-token.md) §5's
+/// last gap). So a relocated `ProgramData` reads here as "no studies yet"
+/// rather than as "wrong directory", and those are the two states a reader
+/// has to tell apart. When the directory *does* exist and holds runs, it is
+/// self-evidently the right one and the sentence is noise.
+fn absent_note(class: TopologyClass) -> &'static str {
+    match class {
+        TopologyClass::WslHost => {
+            "that path assumes the standard %ProgramData% rather than resolving it, so a \
+             relocated one would look exactly like this"
+        }
+        _ => "",
+    }
 }
 
 /// The pure half of check 16, so every test can hand it a temp directory.
 /// **Nothing under test ever resolves a real data directory**, which is the
 /// property that keeps `cargo test` off a live bench's captures.
-fn judge_growth(results_dir: Option<&Path>, note: &str, projects: &[ProjectConfig]) -> Check {
+fn judge_growth(
+    results_dir: Option<&Path>,
+    note: &str,
+    absent_note: &str,
+    projects: &[ProjectConfig],
+) -> Check {
     const NAME: &str = "Result and build-directory growth";
 
     let mut parts: Vec<String> = Vec::new();
@@ -1998,8 +2038,9 @@ fn judge_growth(results_dir: Option<&Path>, note: &str, projects: &[ProjectConfi
             Some(u) => {
                 measured = true;
                 parts.push(format!(
-                    "study_results/: {} entr{}, {} — swept to embarch-core's \
+                    "study_results/ at {}: {} entr{}, {} — swept to embarch-core's \
                      EMBARCH_STUDY_RESULTS_KEEP (default 50), which bounds the count and not the size",
+                    dir.display(),
                     u.entries,
                     if u.entries == 1 { "y" } else { "ies" },
                     human_bytes(u.bytes)
@@ -2007,7 +2048,12 @@ fn judge_growth(results_dir: Option<&Path>, note: &str, projects: &[ProjectConfi
             }
             None => {
                 measured = true;
-                parts.push(format!("study_results/: nothing yet at {}", dir.display()));
+                let mut absent = format!("study_results/: nothing yet at {}", dir.display());
+                if !absent_note.is_empty() {
+                    absent.push_str(" — ");
+                    absent.push_str(absent_note);
+                }
+                parts.push(absent);
             }
         }
     }
@@ -2055,7 +2101,7 @@ fn judge_growth(results_dir: Option<&Path>, note: &str, projects: &[ProjectConfi
     }
     let detail = parts.join("; ");
 
-    if measured {
+    let verdict = if measured {
         check(16, NAME, Status::Pass, detail)
     } else {
         check(
@@ -2071,6 +2117,13 @@ fn judge_growth(results_dir: Option<&Path>, note: &str, projects: &[ProjectConfi
                 }
             ),
         )
+    };
+    // The `--json` half of decision 39. It rides on `results_dir` rather than
+    // on the verdict, so a machine that has never run a study still says
+    // *where* it looked — that is the state the path is most needed for.
+    match results_dir {
+        Some(dir) => with_path(verdict, dir),
+        None => verdict,
     }
 }
 
@@ -2290,6 +2343,7 @@ fn render_json(checks: &[Check], any_fail: bool) -> String {
                 "detail": c.detail,
                 "fix": c.fix,
                 "code": c.code,
+                "path": c.path,
             })
         })
         .collect();
@@ -2415,7 +2469,11 @@ mod tests {
     }
 
     #[test]
-    fn check_5_passes_and_never_scans_when_core_reports_a_probe() {
+    // Named for what it pins: the *verdict*, not the syscall. `usb_scan_for`
+    // runs in the driver before the probe count is ever consulted, so the
+    // sysfs read does happen when Core reports probes — decision 18's "after
+    // zero probes are reported" describes the verdict only.
+    fn check_5_verdict_ignores_the_usb_scan_when_core_reports_a_probe() {
         let authed = AuthedStatus {
             probes: vec![serde_json::json!({"identifier": "whatever"})],
             study_designer_schema_version: None,
@@ -3121,7 +3179,7 @@ mod tests {
             std::fs::write(results.join(id).join("events.json"), vec![b'x'; 100]).unwrap();
             std::fs::write(streams.join("tap.bin"), vec![b'y'; 900]).unwrap();
         }
-        let c = judge_growth(Some(&results), "", &[]);
+        let c = judge_growth(Some(&results), "", "", &[]);
         assert_eq!(c.status, Status::Pass);
         assert!(c.detail.contains("2 entries"), "{}", c.detail);
         assert!(c.detail.contains("2.0 KiB"), "{}", c.detail);
@@ -3133,9 +3191,70 @@ mod tests {
     #[test]
     fn check_16_reports_a_machine_that_has_never_run_a_study() {
         let dir = tempdir();
-        let c = judge_growth(Some(&dir.path().join("study_results")), "", &[]);
+        let c = judge_growth(Some(&dir.path().join("study_results")), "", "", &[]);
         assert_eq!(c.status, Status::Pass);
         assert!(c.detail.contains("nothing yet"), "{}", c.detail);
+    }
+
+    #[test]
+    fn check_16_names_the_results_directory_it_resolved_in_detail_and_in_json() {
+        let dir = tempdir();
+        let results = dir.path().join("study_results");
+        std::fs::create_dir_all(results.join("s1")).unwrap();
+        let c = judge_growth(Some(&results), "", "", &[]);
+        let shown = results.display().to_string();
+        // Both halves, because the human line and the machine field are read
+        // by different readers and only one of them can parse a sentence.
+        assert!(c.detail.contains(&shown), "{}", c.detail);
+        assert_eq!(c.path.as_deref(), Some(shown.as_str()));
+        let v: serde_json::Value =
+            serde_json::from_str(&render_json(std::slice::from_ref(&c), false)).unwrap();
+        assert_eq!(v["checks"][0]["path"], serde_json::json!(shown));
+    }
+
+    #[test]
+    fn check_16_carries_the_path_even_when_no_study_has_ever_run() {
+        let dir = tempdir();
+        let results = dir.path().join("study_results");
+        let c = judge_growth(Some(&results), "", "", &[]);
+        assert_eq!(c.path.as_deref(), Some(results.display().to_string().as_str()));
+    }
+
+    #[test]
+    fn check_16_has_no_path_when_no_data_directory_resolves() {
+        let c = judge_growth(None, "study_results/ is on the remote Core's machine", "", &[]);
+        assert_eq!(c.path, None);
+        let v: serde_json::Value =
+            serde_json::from_str(&render_json(std::slice::from_ref(&c), false)).unwrap();
+        // Present-and-null, never absent — decision 37's rule, and the same
+        // one applies to `path`.
+        assert!(v["checks"][0].get("path").is_some());
+        assert!(v["checks"][0]["path"].is_null());
+    }
+
+    #[test]
+    fn check_16_warns_about_an_assumed_program_data_only_when_the_directory_is_missing() {
+        let dir = tempdir();
+        let results = dir.path().join("study_results");
+        let note = absent_note(TopologyClass::WslHost);
+        assert!(!note.is_empty());
+
+        let missing = judge_growth(Some(&results), "", note, &[]);
+        assert!(missing.detail.contains("relocated one"), "{}", missing.detail);
+
+        std::fs::create_dir_all(results.join("s1")).unwrap();
+        let present = judge_growth(Some(&results), "", note, &[]);
+        assert!(!present.detail.contains("relocated one"), "{}", present.detail);
+    }
+
+    #[test]
+    fn only_a_wsl_host_core_owes_the_program_data_caveat() {
+        // `Local` resolves %ProgramData% or /var/lib for real; `Remote` has no
+        // local path at all. Only `WslHost` hardcodes the assumption.
+        assert!(absent_note(TopologyClass::WslHost).contains("%ProgramData%"));
+        for class in [TopologyClass::Local, TopologyClass::Remote] {
+            assert_eq!(absent_note(class), "");
+        }
     }
 
     #[test]
@@ -3148,7 +3267,7 @@ mod tests {
         // A stray file beside them is not a build directory.
         std::fs::write(root.join("notes.txt"), "x").unwrap();
         let project = zephyr_west_project("fw", dir.path(), Some("embarch/build"));
-        let c = judge_growth(None, "", std::slice::from_ref(&project));
+        let c = judge_growth(None, "", "", std::slice::from_ref(&project));
         assert_eq!(c.status, Status::Pass);
         assert!(c.detail.contains("fw: 2 build directories"), "{}", c.detail);
         assert!(c.detail.contains("nothing prunes these"), "{}", c.detail);
@@ -3163,20 +3282,20 @@ mod tests {
             project.resolved_build_dir_root(),
             Some(dir.path().join("embarch").join("build"))
         );
-        let c = judge_growth(None, "", std::slice::from_ref(&project));
+        let c = judge_growth(None, "", "", std::slice::from_ref(&project));
         assert!(c.detail.contains("fw: 1 build directory"), "{}", c.detail);
     }
 
     #[test]
     fn check_16_says_a_static_project_has_one_build_directory_by_construction() {
-        let c = judge_growth(None, "", &[sample_project("legacy", "nRF54L15")]);
+        let c = judge_growth(None, "", "", &[sample_project("legacy", "nRF54L15")]);
         assert_eq!(c.status, Status::Warn);
         assert!(c.detail.contains("by construction"), "{}", c.detail);
     }
 
     #[test]
     fn check_16_never_fails_the_run_even_with_nothing_to_measure() {
-        let c = judge_growth(None, "study_results/ is on the remote Core's machine", &[]);
+        let c = judge_growth(None, "study_results/ is on the remote Core's machine", "", &[]);
         assert_eq!(c.status, Status::Warn);
         assert_ne!(c.status, Status::Fail);
         assert!(c.detail.contains("remote Core"), "{}", c.detail);
@@ -3187,7 +3306,7 @@ mod tests {
         let dir = tempdir();
         let results = dir.path().join("study_results");
         std::fs::create_dir_all(results.join("s1")).unwrap();
-        let c = judge_growth(Some(&results), "assuming a wsl-host Core — check 3 found no winner to ask", &[]);
+        let c = judge_growth(Some(&results), "assuming a wsl-host Core — check 3 found no winner to ask", "", &[]);
         assert_eq!(c.status, Status::Pass);
         assert!(c.detail.contains("check 3 found no winner"), "{}", c.detail);
     }

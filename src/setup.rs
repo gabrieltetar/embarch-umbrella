@@ -41,8 +41,12 @@ pub fn data_dir_for(class: TopologyClass, windows: bool) -> Option<PathBuf> {
     match class {
         // A Windows-hosted Core from a WSL2 guest: same files, reached
         // through the /mnt mount. Assumes the standard %ProgramData%
-        // location, which is the same assumption embarch-token.md §6 already
-        // records as an unexercised edge case for relocated ProgramData.
+        // location, which embarch-token.md §5's last gap records as an
+        // unexercised edge case for relocated ProgramData — and note the
+        // assumption is *stronger* here than there: that doc's mitigation is
+        // resolving the real value from the Windows side, which token
+        // discovery does and this does not. `doctor`'s check 16 says so in
+        // its output when this directory turns out not to exist (decision 39).
         TopologyClass::WslHost => Some(PathBuf::from("/mnt/c/ProgramData/embarch")),
         TopologyClass::Local if windows => {
             std::env::var_os("ProgramData").map(|pd| PathBuf::from(pd).join("embarch"))
