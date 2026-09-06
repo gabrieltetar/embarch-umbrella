@@ -1,77 +1,37 @@
-//! Zephyr/west detection and live target validation — the `embarch-umbrella`
-//! half of `design.md` §3 decision 17 (`embarch-api/design.md` §3 decision
-//! 12 is the full design, including the parts umbrella doesn't need).
+//! Zephyr/west **shape** detection — the `embarch-umbrella` half of
+//! `design.md` §3 decision 17 (`embarch-api/design.md` §3 decision 12 is the
+//! full design, including the parts umbrella doesn't need).
 //!
-//! Two callers, both read-only, neither building or flashing anything:
-//! `init` (does this repo look Zephyr/west-shaped, so a `discovery =
-//! "zephyr-west"` project should be scaffolded instead of a guessed static
-//! one) and `doctor` check 8 (is at least one live-discovered target actually
-//! file-backing-valid, i.e. is `boards/`/`app/` non-empty and not broken).
+//! One caller, read-only, building and flashing nothing: `init`, answering
+//! "does this repo look Zephyr/west-shaped, so a `discovery = "zephyr-west"`
+//! project should be scaffolded instead of a guessed static one".
 //!
-//! This is a liftable copy of `embarch-api/src/zephyr.rs`'s scanning half
-//! (`design.md` §3 decision 15's pattern, applied again — the same reasoning
-//! that already justified copying topology detection and token/config
-//! reading rather than extracting a shared crate): the two copies are
-//! expected to drift if Zephyr's board-revision file-naming convention ever
-//! changes, and that's an accepted, documented risk, not an oversight.
-//! `embarch-api`'s copy is the one that actually assembles build commands and
-//! selects a target for a real build — this one only counts and detects.
+//! **This is deliberately not a target scanner, as of 2026-09-05.** It used
+//! to carry a trimmed copy of `embarch-api/src/zephyr.rs`'s scanning half
+//! that counted (board, soc, cpucluster, variant, revision, app) tuples for
+//! `doctor` check 8, with a documented overcount: a revision counted as
+//! backed if *any* revision-suffixed file in the board directory named it.
+//! Check 8 now asks `embarch-api list-targets` instead (decision 17's
+//! amendment, and `doctor::check_chip`'s comment for why the bootstrapping
+//! objection does not apply there), so the copy is gone and with it the
+//! drift risk this header used to accept as a known cost.
+//!
+//! Shape detection stays local because it genuinely does run before a
+//! config exists — `init` is deciding what to *write* — so there is nothing
+//! to shell out with. It asks strictly less than a scan: is there a
+//! parseable `board.yml` under `boards/`, and an `app/*/CMakeLists.txt`.
 
 use serde::Deserialize;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
+/// Only the `board:` key's presence and parseability matter here — no field
+/// under it is read. `embarch-api`'s copy is the one that models socs,
+/// variants, cpuclusters and revisions, because it assembles real board
+/// qualifiers; this one is answering a yes/no question about a directory.
 #[derive(Debug, Deserialize)]
 struct BoardYml {
-    board: BoardSection,
-}
-
-#[derive(Debug, Deserialize)]
-struct BoardSection {
-    #[serde(default)]
-    socs: Vec<SocSection>,
-    /// Nested under `board:`, not a sibling top-level key — confirmed
-    /// against the real reference-dut repo's `board.yml` files. An earlier
-    /// version of this module assumed a top-level `revision:` key instead,
-    /// which silently discarded every real board's revision data instead of
-    /// erroring — a real bug, found and fixed in `embarch-api/src/zephyr.rs`
-    /// first (its `list_targets` surfaced it directly), then here too.
-    #[serde(default)]
-    revision: Option<RevisionSection>,
-}
-
-// Only the count of variants matters here (unlike embarch-api's zephyr.rs,
-// which needs each one's name and cpucluster to assemble a real board
-// qualifier) — an empty struct still deserializes a `{name: ..., cpucluster:
-// ...}` YAML mapping fine, serde just ignores the fields it doesn't ask for.
-// (Confirmed against the real repo: `cpucluster` lives on each variant, not
-// on a separate nesting level above it — irrelevant here since only the
-// count matters, but worth noting since embarch-api/src/zephyr.rs had to
-// model it for real.)
-#[derive(Debug, Deserialize)]
-struct SocSection {
-    #[serde(default)]
-    variants: Vec<VariantSection>,
-}
-
-#[derive(Debug, Deserialize)]
-struct VariantSection {}
-
-#[derive(Debug, Deserialize)]
-struct RevisionSection {
-    #[serde(default)]
-    default: Option<String>,
-    #[serde(default)]
-    revisions: Vec<RevisionEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-struct RevisionEntry {
-    name: String,
-}
-
-struct BoardDef {
-    dir: PathBuf,
-    yml: BoardYml,
+    #[allow(dead_code)]
+    board: serde_yaml::Value,
 }
 
 /// Whether `source_path` looks like a Zephyr/west project at all: at least
@@ -79,93 +39,11 @@ struct BoardDef {
 /// one `app/*/CMakeLists.txt`. Used by `init` to decide whether to scaffold
 /// `discovery = "zephyr-west"` instead of guessing a single board.
 pub fn looks_zephyr_west_shaped(source_path: &Path) -> bool {
-    !scan_boards(source_path).is_empty() && !scan_apps(source_path).is_empty()
+    has_parseable_board_yml(source_path) && has_app_with_cmakelists(source_path)
 }
 
-/// How many distinct, file-backing-validated (board, soc, cpucluster,
-/// variant, revision, app) targets this repo actually has — `doctor` check
-/// 8's pass/fail signal for a `discovery = "zephyr-west"` project. Zero
-/// means `boards/`/`app/` are empty or nothing in them validated (e.g. every
-/// declared revision is missing its overlay/defconfig file), which is worth
-/// a fail even though the repo is structurally Zephyr/west-shaped.
-pub fn count_valid_targets(source_path: &Path) -> usize {
-    let boards = scan_boards(source_path);
-    let apps = scan_apps(source_path);
-    if apps.is_empty() {
-        return 0;
-    }
-
-    let mut count = 0;
-    for board in &boards {
-        for soc in &board.yml.board.socs {
-            count += count_for_variants(board, &soc.variants, &apps);
-        }
-    }
-    count
-}
-
-fn count_for_variants(board: &BoardDef, variants: &[VariantSection], apps: &[String]) -> usize {
-    let variant_count = variants.len().max(1);
-    let revisions = candidate_revisions(&board.yml.board.revision);
-
-    let revision_count = if revisions.is_empty() {
-        // No revision section at all -> one implicit revision, always backed
-        // by the board's plain base files.
-        1
-    } else {
-        // A revision-suffixed file check needs the full (board, soc,
-        // cpucluster, variant) tuple in a real repo; here we only need a
-        // count, and this check's job is "is there at least one real
-        // target," not "list every one precisely" (`embarch-api
-        // list-targets` is the precise answer) — so a revision counts as
-        // backed if it's the declared default (always true) or *any*
-        // revision-suffixed file anywhere in the board directory names it.
-        // This can overcount relative to embarch-api's per-tuple check (a
-        // real repo might have the overlay for one variant but not
-        // another, at the same revision), which is an accepted
-        // approximation for a doctor pass/fail signal.
-        let default_revision = board.yml.board.revision.as_ref().and_then(|r| r.default.as_deref());
-        revisions
-            .iter()
-            .filter(|r| Some(r.as_str()) == default_revision || revision_file_exists(&board.dir, r))
-            .count()
-    };
-
-    variant_count * revision_count * apps.len()
-}
-
-fn candidate_revisions(revision: &Option<RevisionSection>) -> Vec<String> {
-    match revision {
-        None => Vec::new(),
-        Some(r) => {
-            let mut names: Vec<String> = r.revisions.iter().map(|e| e.name.clone()).collect();
-            if let Some(default) = &r.default {
-                if !names.contains(default) {
-                    names.push(default.clone());
-                }
-            }
-            names
-        }
-    }
-}
-
-fn revision_file_exists(board_dir: &Path, revision: &str) -> bool {
-    let rev_token = format!("_{}", revision.replace('.', "_"));
-    let Ok(entries) = std::fs::read_dir(board_dir) else {
-        return false;
-    };
-    entries.flatten().any(|e| {
-        let name = e.file_name();
-        let name = name.to_string_lossy();
-        (name.ends_with(".overlay") || name.ends_with(".defconfig"))
-            && name.contains(&rev_token)
-    })
-}
-
-fn scan_boards(source_path: &Path) -> Vec<BoardDef> {
-    let boards_dir = source_path.join("boards");
-    let mut out = Vec::new();
-    let mut stack = vec![boards_dir];
+fn has_parseable_board_yml(source_path: &Path) -> bool {
+    let mut stack = vec![source_path.join("boards")];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
@@ -186,33 +64,28 @@ fn scan_boards(source_path: &Path) -> Vec<BoardDef> {
             let Ok(raw) = std::fs::read_to_string(&path) else {
                 continue;
             };
-            if let Ok(yml) = serde_yaml::from_str::<BoardYml>(&raw) {
-                out.push(BoardDef {
-                    dir: path.parent().map(Path::to_path_buf).unwrap_or(dir.clone()),
-                    yml,
-                });
+            if serde_yaml::from_str::<BoardYml>(&raw).is_ok() {
+                return true;
             }
         }
     }
-    out
+    false
 }
 
-fn scan_apps(source_path: &Path) -> Vec<String> {
-    let app_dir = source_path.join("app");
-    let Ok(entries) = std::fs::read_dir(&app_dir) else {
-        return Vec::new();
+fn has_app_with_cmakelists(source_path: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(source_path.join("app")) else {
+        return false;
     };
     entries
         .flatten()
-        .filter(|e| e.path().is_dir() && e.path().join("CMakeLists.txt").is_file())
-        .filter_map(|e| e.file_name().into_string().ok())
-        .collect()
+        .any(|e| e.path().is_dir() && e.path().join("CMakeLists.txt").is_file())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::fs;
+    use std::path::PathBuf;
 
     struct TempDir(PathBuf);
     impl TempDir {
@@ -239,69 +112,65 @@ mod tests {
         TempDir(base)
     }
 
+    fn write_board(dir: &TempDir, body: &str) {
+        let board_dir = dir.path().join("boards/acme/single");
+        fs::create_dir_all(&board_dir).unwrap();
+        fs::write(board_dir.join("single.yml"), body).unwrap();
+    }
+
+    fn write_app(dir: &TempDir) {
+        fs::create_dir_all(dir.path().join("app/foo")).unwrap();
+        fs::write(dir.path().join("app/foo/CMakeLists.txt"), "").unwrap();
+    }
+
     #[test]
     fn not_zephyr_west_when_no_boards_dir() {
         let dir = tempdir();
-        fs::create_dir_all(dir.path().join("app/foo")).unwrap();
+        write_app(&dir);
         assert!(!looks_zephyr_west_shaped(dir.path()));
-        assert_eq!(count_valid_targets(dir.path()), 0);
     }
 
     #[test]
     fn not_zephyr_west_when_no_app_dir() {
         let dir = tempdir();
-        let board_dir = dir.path().join("boards/acme/single");
-        fs::create_dir_all(&board_dir).unwrap();
-        fs::write(
-            board_dir.join("single.yml"),
-            "board:\n  name: single\n  socs:\n    - name: nrf54l15\n",
-        )
-        .unwrap();
+        write_board(&dir, "board:\n  name: single\n  socs:\n    - name: nrf54l15\n");
+        assert!(!looks_zephyr_west_shaped(dir.path()));
+    }
+
+    #[test]
+    fn not_zephyr_west_when_the_app_dir_has_no_cmakelists() {
+        let dir = tempdir();
+        write_board(&dir, "board:\n  name: single\n  socs:\n    - name: nrf54l15\n");
+        fs::create_dir_all(dir.path().join("app/foo")).unwrap();
         assert!(!looks_zephyr_west_shaped(dir.path()));
     }
 
     #[test]
     fn zephyr_west_shaped_with_boards_and_app() {
         let dir = tempdir();
-        let board_dir = dir.path().join("boards/acme/single");
-        fs::create_dir_all(&board_dir).unwrap();
-        fs::write(
-            board_dir.join("single.yml"),
-            "board:\n  name: single\n  socs:\n    - name: nrf54l15\n",
-        )
-        .unwrap();
-        fs::create_dir_all(dir.path().join("app/foo")).unwrap();
-        fs::write(dir.path().join("app/foo/CMakeLists.txt"), "").unwrap();
-
+        write_board(&dir, "board:\n  name: single\n  socs:\n    - name: nrf54l15\n");
+        write_app(&dir);
         assert!(looks_zephyr_west_shaped(dir.path()));
-        assert_eq!(count_valid_targets(dir.path()), 1);
     }
 
+    /// A `board.yml` with nothing but the top-level key is still a shape
+    /// signal — how many real targets it declares is `embarch-api
+    /// list-targets`' question, not this module's (decision 17's amendment).
     #[test]
-    fn counts_every_variant_and_app_combination() {
+    fn a_board_yml_with_no_socs_still_counts_as_shape() {
         let dir = tempdir();
-        let board_dir = dir.path().join("boards/acme/roadrunner");
-        fs::create_dir_all(&board_dir).unwrap();
-        fs::write(
-            board_dir.join("roadrunner.yml"),
-            r#"
-board:
-  name: roadrunner
-  socs:
-    - name: nrf54l15
-      variants:
-        - name: os_5led
-          cpucluster: cpuapp
-        - name: os_3led
-          cpucluster: cpuapp
-"#,
-        )
-        .unwrap();
-        fs::create_dir_all(dir.path().join("app/reference-dut")).unwrap();
-        fs::write(dir.path().join("app/reference-dut/CMakeLists.txt"), "").unwrap();
+        write_board(&dir, "board:\n  name: single\n");
+        write_app(&dir);
+        assert!(looks_zephyr_west_shaped(dir.path()));
+    }
 
-        // No revision section at all -> treated as one implicit revision;
-        // 2 variants * 1 revision * 1 app = 2.
-        assert_eq!(count_valid_targets(dir.path()), 2);
+    /// A file that is YAML but has no `board:` key is not a board
+    /// definition, so it must not by itself make a repo look Zephyr-shaped.
+    #[test]
+    fn a_yaml_file_without_a_board_key_is_not_a_board() {
+        let dir = tempdir();
+        write_board(&dir, "twister:\n  platform: single\n");
+        write_app(&dir);
+        assert!(!looks_zephyr_west_shaped(dir.path()));
     }
 }

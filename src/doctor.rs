@@ -825,42 +825,149 @@ fn check_build_commands(projects: &[ProjectConfig]) -> Check {
 
 const CHIP_PLACEHOLDER: &str = "CHANGE-ME";
 
+const CHECK8_NAME: &str = "chip resolvable (static: not a placeholder; zephyr-west: a real target exists)";
+
+/// What the located `embarch-api` said when asked to list a project's
+/// targets. Three outcomes, not two, because "the repo has no valid target"
+/// and "nobody could be asked" are different facts and only the first is a
+/// verdict about the machine being diagnosed.
+#[derive(Debug, PartialEq, Eq)]
+enum TargetAnswer {
+    /// It answered, with this many file-backing-validated targets.
+    Count(usize),
+    /// It answered, and its answer is that the project cannot be scanned —
+    /// `embarch-api`'s own error text, which is more specific than anything
+    /// this crate could say about someone else's repo layout.
+    Rejected(String),
+    /// The number could not be obtained at all. A warn naming why, never a
+    /// pass ([`spec.md`'s rule for the whole chain](../../embarch-doc/embarch-umbrella/spec.md)).
+    Unanswerable(String),
+}
+
+/// Parse one `embarch-api --config <path> --json list-targets <project>` run.
+///
+/// Split out from the spawn for the same reason check 11's
+/// `api_host_from_output` is: the interesting behaviour is the decoding of
+/// somebody else's exit code and stdout, and that is testable with no
+/// `embarch-api` on the machine.
+///
+/// `--json` puts the result on **stdout** whether it succeeded or not
+/// (`embarch-api`'s `finish`/`error_result`), exiting 1 on failure, so a
+/// non-zero exit with a parseable object is still an answer.
+fn api_targets_from_output(exit_code: Option<i32>, stdout: &str) -> TargetAnswer {
+    if exit_code == Some(2) {
+        return TargetAnswer::Unanswerable(
+            "the located embarch-api rejected `list-targets` (clap exited 2)".to_string(),
+        );
+    }
+    let parsed = match serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+        Ok(v) => v,
+        Err(e) => {
+            return TargetAnswer::Unanswerable(format!(
+                "`embarch-api --json list-targets` printed no JSON object ({e})"
+            ))
+        }
+    };
+    if parsed.get("success").and_then(serde_json::Value::as_bool) == Some(false) {
+        let why = parsed
+            .get("error")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("no reason given");
+        return TargetAnswer::Rejected(why.to_string());
+    }
+    match parsed.get("targets").and_then(serde_json::Value::as_array) {
+        Some(targets) => TargetAnswer::Count(targets.len()),
+        None => TargetAnswer::Unanswerable(
+            "`embarch-api --json list-targets` answered without a `targets` array".to_string(),
+        ),
+    }
+}
+
+/// Ask the **located** `embarch-api` how many real targets a zephyr-west
+/// project has.
+///
+/// Decision 17's amendment, built 2026-09-05. Unlike topology detection or
+/// token reading — copied into this crate because they must work *before*
+/// there is anything to ask — this runs after `init`, against a config that
+/// exists, so there is a real scanner one process away and no reason to
+/// keep a second, coarser one here. It needs no Core: `list_targets` is a
+/// filesystem scan plus the project's own config.
+fn api_target_answer(
+    api: Option<&Located>,
+    config_path: Option<&Path>,
+    project: &str,
+) -> TargetAnswer {
+    let Some(api) = api else {
+        return TargetAnswer::Unanswerable("embarch-api not located (see check 1)".to_string());
+    };
+    let Some(config_path) = config_path else {
+        return TargetAnswer::Unanswerable("no embarch-api config found (see check 6)".to_string());
+    };
+    // `--config` and `--json` are top-level flags on `embarch-api`'s parser
+    // and neither is `global`, so both go **before** the subcommand or clap
+    // exits 2 — the same ordering trap check 11 documents.
+    let out = Command::new(&api.path)
+        .arg("--config")
+        .arg(config_path)
+        .args(["--json", "list-targets", project])
+        .output();
+    match out {
+        Ok(o) => api_targets_from_output(o.status.code(), &String::from_utf8_lossy(&o.stdout)),
+        Err(e) => TargetAnswer::Unanswerable(format!(
+            "couldn't run `{} list-targets`: {e}",
+            api.path.display()
+        )),
+    }
+}
+
 /// For a `discovery = "static"` project: `chip` isn't still `init`'s
 /// placeholder. For a `discovery = "zephyr-west"` project (`design.md` §3
 /// decision 17): there's nowhere for a placeholder to live at all — `chip`
 /// is resolved per call — so this checks the thing that actually matters
-/// instead, that at least one live-discovered target is file-backing-valid,
-/// i.e. `boards/`/`app/` aren't empty or broken.
-fn check_chip(projects: &[ProjectConfig]) -> Check {
+/// instead, that at least one real target exists, by asking `embarch-api`'s
+/// own listing rather than approximating it here.
+fn check_chip(projects: &[ProjectConfig], config_path: Option<&Path>, api: Option<&Located>) -> Check {
     if projects.is_empty() {
-        return check(8, "chip resolvable (static: not a placeholder; zephyr-west: a real target exists)", Status::Warn, "no projects configured");
+        return check(8, CHECK8_NAME, Status::Warn, "no projects configured");
     }
 
     let mut problems = Vec::new();
+    let mut unanswered = Vec::new();
     for p in projects {
         if p.is_zephyr_west() {
-            let count = crate::zephyr::count_valid_targets(&p.source_path);
-            if count == 0 {
-                problems.push(format!(
-                    "{}: no valid targets found under boards/ + app/ — run `embarch-api list-targets {}` for detail",
-                    p.name, p.name
-                ));
+            match api_target_answer(api, config_path, &p.name) {
+                TargetAnswer::Count(0) => problems.push(format!(
+                    "{}: embarch-api list-targets found no valid target under boards/ + app/",
+                    p.name
+                )),
+                TargetAnswer::Count(_) => {}
+                TargetAnswer::Rejected(why) => {
+                    problems.push(format!("{}: embarch-api could not list targets — {why}", p.name))
+                }
+                TargetAnswer::Unanswerable(why) => unanswered.push(format!("{}: {why}", p.name)),
             }
         } else if p.chip.as_deref() == Some(CHIP_PLACEHOLDER) {
             problems.push(format!("{}: chip still CHANGE-ME", p.name));
         }
     }
 
-    if problems.is_empty() {
-        check(8, "chip resolvable (static: not a placeholder; zephyr-west: a real target exists)", Status::Pass, format!("{} project(s) checked", projects.len()))
-    } else {
-        with_fix(
-            check(8, "chip resolvable (static: not a placeholder; zephyr-west: a real target exists)", Status::Fail, problems.join("; ")),
+    if !problems.is_empty() {
+        return with_fix(
+            check(8, CHECK8_NAME, Status::Fail, problems.join("; ")),
             "static: cargo install probe-rs-tools && probe-rs chip list | grep -i <your soc>, then set \
-             `chip` in embarch/embarch.toml. zephyr-west: confirm boards/*/*.yml and app/*/CMakeLists.txt \
-             exist and declare at least one real, file-backed target.",
-        )
+             `chip` in embarch/embarch.toml. zephyr-west: run `embarch-api list-targets <project>` and \
+             fix what it reports — boards/*/*.yml and app/*/CMakeLists.txt must declare at least one \
+             real, file-backed target.",
+        );
     }
+    if !unanswered.is_empty() {
+        return with_fix(
+            check(8, CHECK8_NAME, Status::Warn, unanswered.join("; ")),
+            "this check asks the located embarch-api rather than guessing — fix checks 1 and 6 first, \
+             then re-run `embarch doctor`.",
+        );
+    }
+    check(8, CHECK8_NAME, Status::Pass, format!("{} project(s) checked", projects.len()))
 }
 
 // ---- check 9: artifact_path / artifact_path_for_core -----------------------
@@ -2243,7 +2350,7 @@ pub async fn doctor(json: bool) -> i32 {
     let check5 = check_probes(authed.as_ref(), &usb_scan);
     let projects: &[ProjectConfig] = config.as_ref().map(|c| c.projects.as_slice()).unwrap_or(&[]);
     let check7 = check_build_commands(projects);
-    let check8 = check_chip(projects);
+    let check8 = check_chip(projects, config_path.as_deref(), api.as_ref());
     let check9 = check_artifact_paths(projects);
     let check10 = check_mcp(config_path.as_deref(), api.as_ref());
     // One handshake, two checks: `/dev-bench/hello` opens the serial link, so
@@ -2673,7 +2780,7 @@ mod tests {
     #[test]
     fn chip_placeholder_is_caught() {
         let projects = vec![sample_project("fw", "CHANGE-ME")];
-        let c = check_chip(&projects);
+        let c = check_chip(&projects, None, None);
         assert_eq!(c.status, Status::Fail);
         assert!(c.fix.is_some());
     }
@@ -2681,8 +2788,82 @@ mod tests {
     #[test]
     fn a_real_chip_passes() {
         let projects = vec![sample_project("fw", "nRF54L15_M33")];
-        let c = check_chip(&projects);
+        let c = check_chip(&projects, None, None);
         assert_eq!(c.status, Status::Pass);
+    }
+
+    // ---- check 8: decoding embarch-api's own listing (decision 17's
+    // amendment) -------------------------------------------------------------
+
+    #[test]
+    fn a_target_list_is_counted_from_its_array() {
+        let out = r#"{"success": true, "targets": [{"board": "a"}, {"board": "b"}],
+                      "snippets_by_app": {}, "default_snippets": []}"#;
+        assert_eq!(api_targets_from_output(Some(0), out), TargetAnswer::Count(2));
+    }
+
+    /// The state the check exists to catch, and the one the old local
+    /// scanner could not reach: a structurally Zephyr-shaped repo whose
+    /// declared targets are not actually backed by files. It counted the
+    /// declared default revision as backed unconditionally, so it returned
+    /// zero only for an empty `boards/` or `app/`.
+    #[test]
+    fn an_empty_target_list_is_a_real_zero() {
+        assert_eq!(
+            api_targets_from_output(Some(0), r#"{"success": true, "targets": []}"#),
+            TargetAnswer::Count(0)
+        );
+    }
+
+    /// A failed `list-targets` still prints its object on stdout and exits
+    /// 1, so a non-zero exit is an answer, not a lost one.
+    #[test]
+    fn a_refused_listing_carries_embarch_apis_own_reason() {
+        let out = r#"{"success": false, "error": "no board.yml under boards/"}"#;
+        assert_eq!(
+            api_targets_from_output(Some(1), out),
+            TargetAnswer::Rejected("no board.yml under boards/".to_string())
+        );
+    }
+
+    #[test]
+    fn a_clap_rejection_is_unanswerable_not_a_verdict() {
+        assert!(matches!(
+            api_targets_from_output(Some(2), ""),
+            TargetAnswer::Unanswerable(_)
+        ));
+    }
+
+    #[test]
+    fn non_json_stdout_is_unanswerable() {
+        assert!(matches!(
+            api_targets_from_output(Some(0), "3 targets\n"),
+            TargetAnswer::Unanswerable(_)
+        ));
+    }
+
+    /// An object with neither `success: false` nor a `targets` array is a
+    /// contract this binary does not recognise — a warn naming that, never
+    /// a silent pass.
+    #[test]
+    fn a_json_object_without_targets_is_unanswerable() {
+        assert!(matches!(
+            api_targets_from_output(Some(0), r#"{"success": true, "projects": []}"#),
+            TargetAnswer::Unanswerable(_)
+        ));
+    }
+
+    /// A zephyr-west project with nothing to ask warns; it must not pass on
+    /// the strength of having asked nobody, and must not fail as though the
+    /// repo were the problem.
+    #[test]
+    fn a_zephyr_west_project_warns_when_embarch_api_is_not_located() {
+        let mut p = sample_project("fw", "nRF54L15_M33");
+        p.discovery = config::Discovery::ZephyrWest;
+        p.chip = None;
+        let c = check_chip(&[p], None, None);
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.detail.contains("embarch-api not located"));
     }
 
     // ---- check 11: the comparison, with every number injected ---------------
