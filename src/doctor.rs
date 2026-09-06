@@ -2330,6 +2330,14 @@ struct BindEvidence<'a> {
     /// neither holds, and on every machine whose Core is not a Windows
     /// service.
     registered: Option<&'a str>,
+    /// The class a re-run of `embarch setup` **here** would infer, out of
+    /// the same `setup::infer_class` that command calls — shared rather
+    /// than mirrored so the two can never disagree. Only the `bound-narrow`
+    /// fix line reads it, and only to decide whether `setup` is an honest
+    /// alternative to the reinstall: run natively on the Windows side of a
+    /// `wsl-host` machine it infers `local`, installs the narrow bind again
+    /// and overwrites the recorded class.
+    setup_would_infer: TopologyClass,
 }
 
 /// Is this bind address one that only the same machine can reach?
@@ -2404,6 +2412,39 @@ fn judge_bind_address(e: &BindEvidence<'_>) -> Check {
     };
     let needed = topology::recommended_bind_address(recorded);
     let recorded_str = recorded.as_str();
+
+    // Decision 31, as decision 38 generalised it: the registration this run
+    // can read is *this* machine's service, and on a `remote` machine the
+    // Core whose bind matters is another computer's. Judging one by the
+    // other is the confident verdict about the wrong machine. Skipped when
+    // something already answered on a route that needs the same bind —
+    // that is evidence about the right machine, and it Passes below.
+    if matches!(recorded, TopologyClass::Remote)
+        && !e
+            .reached
+            .is_some_and(|(c, _)| topology::recommended_bind_address(c) == needed)
+    {
+        return with_fix(
+            with_code(
+                check(
+                    N,
+                    CHECK_17_NAME,
+                    Status::Warn,
+                    format!(
+                        "this machine was set up as {recorded_str}, so the Core whose bind matters runs \
+                         on another computer and needs {needed} there. Nothing \
+                         readable from here describes it: a service registration on \
+                         this host is a different machine's service, and no \
+                         candidate answered on a route that would prove the bind"
+                    ),
+                ),
+                "bind-elsewhere",
+            ),
+            "ask the machine that runs Core: `embarch doctor` there, where check 17 can read \
+             its own service registration. Check 3 owns whether it is reachable from \
+             here at all.",
+        );
+    }
 
     if let Some((reached_class, url)) = e.reached {
         let reached_needs = topology::recommended_bind_address(reached_class);
@@ -2535,11 +2576,25 @@ fn judge_bind_address(e: &BindEvidence<'_>) -> Check {
                 ),
                 "bound-narrow",
             ),
-            format!(
-                "reinstall the service with the wide bind, in an elevated shell on the machine \
-                 running Core: `embarch-core install --bind {needed}` — or re-run `embarch setup`, \
-                 which passes it for you."
-            ),
+            if topology::recommended_bind_address(e.setup_would_infer) == needed {
+                format!(
+                    "reinstall the service with the wide bind, in an elevated shell on the machine \
+                     running Core: `embarch-core install --bind {needed}` — or re-run `embarch \
+                     setup` from here, which infers {} and passes it for you.",
+                    e.setup_would_infer.as_str()
+                )
+            } else {
+                format!(
+                    "reinstall the service with the wide bind, in an elevated shell on the machine \
+                     running Core: `embarch-core install --bind {needed}`. Do not re-run `embarch \
+                     setup` from here: run on this side it infers {}, which needs {}, so it \
+                     installs the narrow bind again and then rewrites the recorded class — after \
+                     which this check passes `bind-matches` with the bind untouched. Run it from \
+                     the WSL2 guest, or reinstall.",
+                    e.setup_would_infer.as_str(),
+                    topology::recommended_bind_address(e.setup_would_infer)
+                )
+            },
         ),
         Some(addr) => with_code(
             check(
@@ -2599,10 +2654,20 @@ fn is_loopback_bind_url(base_url: &str) -> bool {
 /// Everywhere else the subprocess cannot move the verdict: a winner reached
 /// over the gateway has *proved* the bind covers the route that matters, and
 /// a `local` machine's need is loopback, which the hit already demonstrates.
+///
+/// **And a `remote` machine is not one of the two, though its need is
+/// `0.0.0.0` too.** The registration is *this* host's service; the Core being
+/// judged is somebody else's. Reading it there would only let the check say
+/// something confident about the wrong machine (decision 31, generalised by
+/// decision 38), so the subprocess is not spent and `judge_bind_address`
+/// answers `bind-elsewhere`.
 fn bind_registration_can_change_the_verdict(
     recorded: Option<TopologyClass>,
     winner_base_url: Option<&str>,
 ) -> bool {
+    if matches!(recorded, Some(TopologyClass::Remote)) {
+        return false;
+    }
     match winner_base_url {
         None => true,
         Some(url) => {
@@ -2692,6 +2757,10 @@ pub async fn doctor(json: bool) -> i32 {
             .winner_class
             .zip(core_probe.winner_base_url.as_deref()),
         registered: registered_bind.as_deref(),
+        // `setup`'s own inference, not a copy of it — the `bound-narrow` fix
+        // line offers `embarch setup` and is only right where that command
+        // would infer a class needing the wide bind.
+        setup_would_infer: setup::infer_class(host.as_deref(), core.as_ref()),
     });
 
     let checks = vec![
@@ -4131,12 +4200,21 @@ mod tests {
 
     // ---- check 17: bind address versus topology (decision 22(a)) -----------
 
+    /// The default `setup_would_infer` is `WslHost` — the class a guest-side
+    /// re-run infers on the topology every one of these cases is about, so
+    /// the `bound-narrow` fix keeps its `setup` half unless a test says
+    /// otherwise.
     fn bind_evidence<'a>(
         recorded: Option<TopologyClass>,
         reached: Option<(TopologyClass, &'a str)>,
         registered: Option<&'a str>,
     ) -> BindEvidence<'a> {
-        BindEvidence { recorded, reached, registered }
+        BindEvidence {
+            recorded,
+            reached,
+            registered,
+            setup_would_infer: TopologyClass::WslHost,
+        }
     }
 
     /// **The check's reason for existing, and the state that must be a Fail
@@ -4245,7 +4323,44 @@ mod tests {
             None,
             Some("http://127.0.0.1:4884")
         ));
+        // `remote` needs `0.0.0.0` like `wsl-host` does, and is *not* one of
+        // the two states the registration can move: it describes this host's
+        // service, and the Core being judged is another machine's. Neither
+        // the nothing-answered case nor the loopback-winner one spends it.
+        assert!(!bind_registration_can_change_the_verdict(
+            Some(TopologyClass::Remote),
+            None
+        ));
+        assert!(!bind_registration_can_change_the_verdict(
+            Some(TopologyClass::Remote),
+            Some("http://127.0.0.1:4884")
+        ));
     }
+
+    /// **Decision 31's shape, one peripheral over.** On a machine set up as
+    /// `remote` the local `sc.exe qc` line says nothing about the Core being
+    /// judged, so neither Fail arm may fire off it. Both the nothing-answered
+    /// and the loopback-winner states resolve to one Warn that names whose
+    /// question it is — and a registration handed in anyway is ignored, which
+    /// is what makes this a guard rather than a saving.
+    #[test]
+    fn check_17_refuses_to_judge_a_remote_cores_bind_by_this_machines_registration() {
+        for reached in [None, Some((TopologyClass::Local, "http://127.0.0.1:4884"))] {
+            let c = judge_bind_address(&bind_evidence(
+                Some(TopologyClass::Remote),
+                reached,
+                Some("127.0.0.1"),
+            ));
+            assert_eq!(c.status, Status::Warn, "{}", c.detail);
+            assert_eq!(c.code, Some("bind-elsewhere"));
+            assert!(c.detail.contains("another computer"), "{}", c.detail);
+            // A wrapped literal that lost a `\` reads as a run of spaces in
+            // the rendered report and nothing else notices.
+            assert!(!c.detail.contains("  "), "{}", c.detail);
+            assert!(!c.fix.as_deref().unwrap().contains("  "), "{:?}", c.fix);
+        }
+    }
+
 
     /// The second Fail path, and the one the decision's "rather than
     /// reporting bare unreachability" is about: nothing answered anywhere,
@@ -4260,6 +4375,36 @@ mod tests {
         assert_eq!(c.status, Status::Fail);
         assert_eq!(c.code, Some("bound-narrow"));
         assert!(c.detail.contains("not a stopped service"), "{}", c.detail);
+        // Nothing answered, so `setup` really would install — and from the
+        // guest it infers `wsl-host` and passes the wide bind. Here, and only
+        // here, the one-command remedy is honest.
+        let fix = c.fix.as_deref().unwrap();
+        assert!(fix.contains("re-run `embarch setup` from here"), "{fix}");
+    }
+
+    /// **The same hole `018` closed one arm over.** `bound-narrow`'s fix
+    /// offers `embarch setup` as an alternative, which is right from the WSL2
+    /// guest and wrong run natively on the Windows side of the same machine:
+    /// there `infer_class` sees no `windows_exe_from_wsl2` and returns
+    /// `local`, so `setup` installs `--bind 127.0.0.1` again and writes
+    /// `topology: "local"` — after which check 17 Passes `bind-matches` with
+    /// the bind untouched. A fix line that can green its own check is worse
+    /// than none, so this side gets the reinstall and a reason.
+    #[test]
+    fn check_17s_bound_narrow_fix_withdraws_setup_where_setup_would_infer_local() {
+        let c = judge_bind_address(&BindEvidence {
+            recorded: Some(TopologyClass::WslHost),
+            reached: None,
+            registered: Some("127.0.0.1"),
+            setup_would_infer: TopologyClass::Local,
+        });
+        assert_eq!(c.status, Status::Fail);
+        assert_eq!(c.code, Some("bound-narrow"));
+        let fix = c.fix.as_deref().unwrap();
+        assert!(fix.contains("Do not re-run `embarch setup` from here"), "{fix}");
+        assert!(fix.contains("local"), "{fix}");
+        assert!(fix.contains("127.0.0.1"), "{fix}");
+        assert!(fix.contains("--bind 0.0.0.0"), "{fix}");
     }
 
     /// The same unreachability with a *wide* registration is a useful
@@ -4338,6 +4483,8 @@ mod tests {
     /// A `remote` Core is reached at the host the operator named, whose class
     /// recommends the same wide bind — so it agrees, and this check never
     /// tells someone to reinstall a service on a machine they are not on.
+    /// **The `bind-elsewhere` guard must not cost this Pass:** the winner is
+    /// evidence about the right machine, which is the whole difference.
     #[test]
     fn check_17_passes_for_a_remote_core_reached_at_its_named_host() {
         let c = judge_bind_address(&bind_evidence(
@@ -4346,6 +4493,7 @@ mod tests {
             None,
         ));
         assert_eq!(c.status, Status::Pass);
+        assert_eq!(c.code, Some("bind-matches"));
     }
 
     #[test]
