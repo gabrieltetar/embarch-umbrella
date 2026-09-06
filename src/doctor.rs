@@ -2189,7 +2189,9 @@ fn check_flash_backend(core: Option<&Located>, class: TopologyClass) -> Check {
                 "skipped — Core runs on another machine, and only its own binary can say which                  flashing program it would resolve there"
             }
             TopologyClass::WslHost => {
-                "skipped — no embarch-core binary this host can run: nothing is registered as the                  Windows service (`sc.exe qc com.embarch.core`), no copy sits in a conventional                  Windows location, and EMBARCH_CORE_EXE is unset"
+                "skipped — no embarch-core binary this host can run: nothing is registered \
+                 as the Windows service (`sc.exe qc com.embarch.core`), no copy sits in a \
+                 conventional Windows location, and EMBARCH_CORE_EXE is unset"
             }
             TopologyClass::Local => {
                 "skipped — no embarch-core binary on this machine to ask; `embarch setup` installs one"
