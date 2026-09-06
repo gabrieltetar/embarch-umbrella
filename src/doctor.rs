@@ -2884,6 +2884,87 @@ mod tests {
         TempDir(base)
     }
 
+    /// 50 attempts 20 ms apart: a ~1 s ceiling on `past_text_file_busy`.
+    const TEXT_FILE_BUSY_TRIES: u32 = 50;
+
+    /// A file this test module wrote itself, and then spawns, loses its own
+    /// `exec` to `ETXTBSY` about one `cargo test` in twenty (task
+    /// `umbrella/019`; seen on both spawn tests below). `std::fs::write`
+    /// closes its descriptor before we return, but the suite is
+    /// multithreaded: a `fork` in another test thread copies the descriptor
+    /// table while that write is still open, and Linux refuses to `exec` a
+    /// file any process holds open for writing until that copy is gone.
+    ///
+    /// Nothing on this side closes that window — the descriptor belongs to a
+    /// process we did not start and cannot wait on — so the spawn is retried
+    /// while its verdict is "Text file busy". The copy dies at the other
+    /// child's own `exec`, microseconds later, so a retry beats it where
+    /// writing more carefully only narrows it.
+    ///
+    /// **What the bound costs.** After `TEXT_FILE_BUSY_TRIES` the last
+    /// verdict is returned unchanged, so a *genuine* `ETXTBSY` — a binary
+    /// truly held open for writing — still fails the assertion, with the same
+    /// message, up to a second later. It is never masked into a pass and
+    /// never turned into a hang.
+    fn past_text_file_busy<T>(mut spawn: impl FnMut() -> T, verdict: impl Fn(&T) -> Option<&str>) -> T {
+        for _ in 1..TEXT_FILE_BUSY_TRIES {
+            let out = spawn();
+            if !verdict(&out).is_some_and(|why| why.contains("Text file busy")) {
+                return out;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        spawn()
+    }
+
+    /// The bound, asserted rather than only described: a busy that clears is
+    /// retried past, and one that never clears is still returned — the same
+    /// verdict, later, never a pass and never a hang.
+    #[test]
+    fn a_text_file_busy_spawn_is_retried_until_it_clears_and_no_further() {
+        fn err(r: &Result<u32, String>) -> Option<&str> {
+            r.as_ref().err().map(String::as_str)
+        }
+
+        let tries = std::cell::Cell::new(0u32);
+        let cleared = past_text_file_busy(
+            || {
+                tries.set(tries.get() + 1);
+                if tries.get() < 3 {
+                    Err("couldn't start `x`: Text file busy (os error 26)".to_string())
+                } else {
+                    Ok(17)
+                }
+            },
+            err,
+        );
+        assert_eq!(cleared, Ok(17));
+        assert_eq!(tries.get(), 3);
+
+        let tries = std::cell::Cell::new(0u32);
+        let stuck = past_text_file_busy(
+            || {
+                tries.set(tries.get() + 1);
+                Err::<u32, String>("couldn't start `x`: Text file busy (os error 26)".to_string())
+            },
+            err,
+        );
+        assert!(stuck.unwrap_err().contains("Text file busy"));
+        assert_eq!(tries.get(), TEXT_FILE_BUSY_TRIES);
+
+        // Any other failure is not retried at all.
+        let tries = std::cell::Cell::new(0u32);
+        let denied = past_text_file_busy(
+            || {
+                tries.set(tries.get() + 1);
+                Err::<u32, String>("couldn't start `x`: Permission denied".to_string())
+            },
+            err,
+        );
+        assert!(denied.is_err());
+        assert_eq!(tries.get(), 1);
+    }
+
     // ---- check 5: attached-but-not-permitted (decision 18) -----------------
 
     fn usb_device(root: &Path, name: &str, vid: &str, product: Option<&str>) {
@@ -3474,22 +3555,31 @@ mod tests {
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(mode)).unwrap();
             Located { path: p, found_by: locate::FoundBy::EnvVar, windows_exe_from_wsl2: false }
         };
+        // Spawned through `past_text_file_busy`: these fakes are written by
+        // this thread and exec'd immediately, which is exactly the shape that
+        // loses to another thread's inherited write descriptor.
+        let versions = |l: &Located| {
+            past_text_file_busy(
+                || api_host_schema_version(Some(l)),
+                |r| r.as_ref().err().map(String::as_str),
+            )
+        };
 
         let answers = fake(
             "answers",
             r#"echo '{"schema_version":1,"success":true,"api_version":"0.1.0","host_type_schema_version":17}'"#,
             0o755,
         );
-        assert_eq!(api_host_schema_version(Some(&answers)), Ok(17));
+        assert_eq!(versions(&answers), Ok(17));
 
         let too_old = fake("too-old", "echo \"error: unrecognized subcommand\" >&2; exit 2", 0o755);
-        let e = api_host_schema_version(Some(&too_old)).unwrap_err();
+        let e = versions(&too_old).unwrap_err();
         assert!(e.contains("no `versions` subcommand"), "{e}");
 
         // No execute bit for anyone, which `execve` refuses even for root —
         // so this stays deterministic wherever the suite runs.
         let unreadable = fake("unreadable", "echo nope", 0o644);
-        let e = api_host_schema_version(Some(&unreadable)).unwrap_err();
+        let e = versions(&unreadable).unwrap_err();
         assert!(e.contains("couldn't run"), "{e}");
     }
 
@@ -3687,6 +3777,18 @@ mod tests {
             std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
             p.to_string_lossy().into_owned()
         };
+        // Every spawn below goes through `past_text_file_busy`: the fakes are
+        // written by this thread and exec'd at once, the shape that loses to
+        // another thread's inherited write descriptor.
+        let handshake = |command: &str, env: &[(String, String)], timeout: Duration| {
+            past_text_file_busy(
+                || mcp_initialize(command, &[], env, timeout),
+                |o| match o {
+                    HandshakeOutcome::Failed(why) => Some(why.as_str()),
+                    _ => None,
+                },
+            )
+        };
 
         // Answers the request it is actually sent, after a line of noise that
         // a real server's logging would produce.
@@ -3698,7 +3800,7 @@ mod tests {
              \"capabilities\":{},\"serverInfo\":{\"name\":\"embarch-api\",\"version\":\"0.1.0\"}}}'",
         );
         assert_eq!(
-            mcp_initialize(&answers, &[], &[], Duration::from_secs(10)),
+            handshake(&answers, &[], Duration::from_secs(10)),
             HandshakeOutcome::Answered("embarch-api".to_string())
         );
 
@@ -3707,7 +3809,7 @@ mod tests {
         // usually loses with EPIPE: the assertions below are what pin the
         // verdict to its exit and its stderr rather than to who won.
         let broken = fake("broken", "echo 'error: --config: no such file' >&2; exit 1");
-        match mcp_initialize(&broken, &[], &[], Duration::from_secs(10)) {
+        match handshake(&broken, &[], Duration::from_secs(10)) {
             HandshakeOutcome::Failed(why) => {
                 assert!(why.contains("exited without"), "{why}");
                 assert!(why.contains("no such file"), "stderr should be reported: {why}");
@@ -3716,7 +3818,7 @@ mod tests {
         }
 
         // A command that is not there at all.
-        match mcp_initialize(&dir.path().join("absent").to_string_lossy(), &[], &[], Duration::from_secs(10)) {
+        match handshake(&dir.path().join("absent").to_string_lossy(), &[], Duration::from_secs(10)) {
             HandshakeOutcome::Failed(why) => assert!(why.contains("couldn't start"), "{why}"),
             other => panic!("expected Failed, got {other:?}"),
         }
@@ -3724,7 +3826,7 @@ mod tests {
         // Starts, reads, and never answers. Distinct from Failed.
         let hangs = fake("hangs", "read line\nsleep 30");
         assert_eq!(
-            mcp_initialize(&hangs, &[], &[], Duration::from_millis(400)),
+            handshake(&hangs, &[], Duration::from_millis(400)),
             HandshakeOutcome::TimedOut
         );
 
@@ -3734,7 +3836,7 @@ mod tests {
             "wrong-id",
             "read line\necho '{\"jsonrpc\":\"2.0\",\"method\":\"notifications/message\",\"params\":{}}'",
         );
-        match mcp_initialize(&wrong_id, &[], &[], Duration::from_secs(10)) {
+        match handshake(&wrong_id, &[], Duration::from_secs(10)) {
             HandshakeOutcome::Failed(why) => assert!(why.contains("without answering"), "{why}"),
             other => panic!("expected Failed, got {other:?}"),
         }
@@ -3748,9 +3850,8 @@ mod tests {
              {\\\"serverInfo\\\":{\\\"name\\\":\\\"$EMBARCH_DOCTOR_TEST\\\"}}}\"",
         );
         assert_eq!(
-            mcp_initialize(
+            handshake(
                 &needs_env,
-                &[],
                 &[("EMBARCH_DOCTOR_TEST".to_string(), "from-the-entry".to_string())],
                 Duration::from_secs(10),
             ),
@@ -3762,7 +3863,7 @@ mod tests {
             "errors",
             "read line\necho '{\"jsonrpc\":\"2.0\",\"id\":1,\"error\":{\"code\":-32601,\"message\":\"nope\"}}'",
         );
-        match mcp_initialize(&errors, &[], &[], Duration::from_secs(10)) {
+        match handshake(&errors, &[], Duration::from_secs(10)) {
             HandshakeOutcome::Failed(why) => assert!(why.contains("nope"), "{why}"),
             other => panic!("expected Failed, got {other:?}"),
         }
