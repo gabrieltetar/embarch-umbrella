@@ -212,6 +212,38 @@ fn core_belongs_to(winner: Option<TopologyClass>, host: Option<&str>, under_wsl2
     }
 }
 
+/// What to say about *which* `embarch-api` was located, when it was not the
+/// one a reader would assume.
+///
+/// Silent for `PATH` and for an explicit `EMBARCH_API_BIN`, which say
+/// themselves. Explicit for decision 42's two new sources, because after it
+/// check 1 can locate a binary that is not the installed copy, and checks 8,
+/// 10 and 11 are all statements about the copy it picked.
+fn api_provenance_note(a: &Located) -> String {
+    match a.found_by {
+        locate::FoundBy::AgentCliRegistration => {
+            let mut note = " Located via the agent CLI's own MCP registration, which is the \
+                            embarch-api an agent actually runs."
+                .to_string();
+            if let Some(installed) = locate::canonical_api_path() {
+                if installed.is_file() && installed != a.path {
+                    note.push_str(&format!(
+                        " A different copy is installed at {} — that is a mixed install, and \
+                         checks 8, 10 and 11 are about the registered one.",
+                        installed.display()
+                    ));
+                }
+            }
+            note
+        }
+        locate::FoundBy::CanonicalInstall => " Found where `setup` installed it rather than on PATH: \
+                                              the suite's env file is sourced from a shell rc, so a \
+                                              non-interactive shell cannot run it by name."
+            .to_string(),
+        _ => String::new(),
+    }
+}
+
 fn check_binaries(
     core: Option<&Located>,
     api: Option<&Located>,
@@ -228,6 +260,7 @@ fn check_binaries(
                 c.path.display(),
                 a.path.display()
             );
+            let api_note = api_provenance_note(a);
 
             let manifest = crate::manifest::find_next_to_me().and_then(|p| crate::manifest::load(&p));
             match manifest {
@@ -239,7 +272,7 @@ fn check_binaries(
                         format!(
                             "{found}. No suite manifest next to this binary — either not installed from a \
                              suite archive (milestone-6.md §3.7), or a per-repo/debug build; \
-                             version-vs-manifest comparison skipped."
+                             version-vs-manifest comparison skipped.{api_note}"
                         ),
                     ),
                     "no-manifest",
@@ -269,7 +302,7 @@ fn check_binaries(
                                 "binaries found",
                                 Status::Pass,
                                 format!(
-                                    "{found}. Matches suite manifest v{} ({}).{note}",
+                                    "{found}. Matches suite manifest v{} ({}).{note}{api_note}",
                                     m.suite_version, m.target
                                 ),
                             ),
@@ -283,7 +316,7 @@ fn check_binaries(
                                     "binaries found",
                                     Status::Fail,
                                     format!(
-                                        "{found}. Suite manifest v{} mismatch: {}.{note}",
+                                        "{found}. Suite manifest v{} mismatch: {}.{note}{api_note}",
                                         m.suite_version,
                                         mismatches.join("; ")
                                     ),
@@ -1466,28 +1499,47 @@ fn judge_mcp(reg: &McpRegistration, handshake: Option<&HandshakeOutcome>, regist
     }
 }
 
-fn check_mcp(config_path: Option<&Path>, api: Option<&Located>) -> Check {
+/// The registration for `doctor`'s own working directory.
+///
+/// Local scope is keyed by absolute working directory, so a registration is
+/// about *where doctor is run from* — the same directory the agent CLI would
+/// resolve it in. An unreadable cwd is reported as its own reason rather than
+/// silently searching the wrong key.
+///
+/// **Read once, in the driver** (decision 42): check 10 spawns what this
+/// names and check 1 now *locates* what this names, and two reads of the same
+/// file could disagree about which binary the run is talking about.
+fn mcp_registration_for_cwd() -> McpRegistration {
+    match std::env::current_dir() {
+        Ok(cwd) => mcp_registration(&cwd),
+        Err(e) => McpRegistration::NoCli { why: format!("could not read the working directory ({e})") },
+    }
+}
+
+/// The `embarch-api` path a registration names, for `locate_api` — `None` for
+/// every other state, all of which mean the same thing to it: no reading on
+/// offer, fall through to the guesses.
+fn registered_api_command(reg: &McpRegistration) -> Option<PathBuf> {
+    match reg {
+        McpRegistration::Registered { command, .. } => Some(PathBuf::from(command)),
+        _ => None,
+    }
+}
+
+fn check_mcp(config_path: Option<&Path>, api: Option<&Located>, reg: &McpRegistration) -> Check {
     let register_fix = format!(
         "claude mcp add {MCP_SERVER_NAME} -- {} --config {}",
         api.map(|a| a.path.display().to_string()).unwrap_or_else(|| "<path to embarch-api>".to_string()),
         config_path.map(|p| p.display().to_string()).unwrap_or_else(|| "<repo>/embarch/embarch.toml".to_string()),
     );
 
-    // Local scope is keyed by absolute working directory, so a registration is
-    // about *where doctor is run from* — the same directory the agent CLI
-    // would resolve it in. An unreadable cwd is reported as its own reason
-    // rather than silently searching the wrong key.
-    let reg = match std::env::current_dir() {
-        Ok(cwd) => mcp_registration(&cwd),
-        Err(e) => McpRegistration::NoCli { why: format!("could not read the working directory ({e})") },
-    };
-    let handshake = match &reg {
+    let handshake = match reg {
         McpRegistration::Registered { command, args, env, .. } => {
             Some(mcp_initialize(command, args, env, MCP_HANDSHAKE_TIMEOUT))
         }
         _ => None,
     };
-    judge_mcp(&reg, handshake.as_ref(), &register_fix)
+    judge_mcp(reg, handshake.as_ref(), &register_fix)
 }
 
 // ---- /dev-bench/hello, fetched once for checks 11 and 13 --------------------
@@ -2703,7 +2755,10 @@ pub async fn doctor(json: bool) -> i32 {
     let under_wsl2 = env::under_wsl2();
     let saved = state::load();
     let core = locate::locate_core(saved.core_exe.as_deref(), under_wsl2);
-    let api = locate::locate_api();
+    // One read of the agent CLI's config, for check 10's spawn and check 1's
+    // locator alike (decision 42).
+    let mcp_reg = mcp_registration_for_cwd();
+    let api = locate::locate_api(registered_api_command(&mcp_reg).as_deref());
 
     let config_path = config::find_config_path();
     let (check6, config) = check_config(config_path.as_deref());
@@ -2741,7 +2796,7 @@ pub async fn doctor(json: bool) -> i32 {
     let check7 = check_build_commands(projects);
     let check8 = check_chip(projects, config_path.as_deref(), api.as_ref());
     let check9 = check_artifact_paths(projects);
-    let check10 = check_mcp(config_path.as_deref(), api.as_ref());
+    let check10 = check_mcp(config_path.as_deref(), api.as_ref(), &mcp_reg);
     // One handshake, two checks: `/dev-bench/hello` opens the serial link, so
     // checks 11 and 13 share one answer rather than opening it twice.
     let hello = fetch_dev_bench_hello(&core_probe, authed.as_ref(), config.as_ref()).await;
@@ -3593,6 +3648,49 @@ mod tests {
         let no_api = check_binaries(Some(&core), None, None, None, TopologyClass::WslHost);
         assert_eq!(no_api.status, Status::Fail);
         assert_eq!(no_api.code, Some("not-found"));
+    }
+
+    /// Decision 42: a `PATH` hit is the ordinary case and says nothing extra,
+    /// while the two sources it added both change what checks 8, 10 and 11 are
+    /// statements *about* — so check 1 names them.
+    #[test]
+    fn check_1_names_a_non_obvious_api_provenance_and_stays_quiet_about_path() {
+        let core = a_located("/usr/local/bin/embarch-core", false);
+
+        let on_path = a_located("/usr/local/bin/embarch-api", false);
+        let quiet = check_binaries(Some(&core), Some(&on_path), None, None, TopologyClass::Local);
+        assert!(!quiet.detail.contains("Located via"), "{}", quiet.detail);
+
+        let mut installed = a_located("/home/u/.local/share/embarch/bin/embarch-api", false);
+        installed.found_by = locate::FoundBy::CanonicalInstall;
+        let noted = check_binaries(Some(&core), Some(&installed), None, None, TopologyClass::Local);
+        assert!(noted.detail.contains("non-interactive shell"), "{}", noted.detail);
+
+        let mut registered = a_located("/repo/target/debug/embarch-api", false);
+        registered.found_by = locate::FoundBy::AgentCliRegistration;
+        let reg = check_binaries(Some(&core), Some(&registered), None, None, TopologyClass::Local);
+        assert!(reg.detail.contains("an agent actually runs"), "{}", reg.detail);
+    }
+
+    /// The registration is read once and used twice, so `locate_api`'s
+    /// candidate and check 10's spawn target cannot be different files.
+    #[test]
+    fn only_a_registration_naming_a_command_offers_locate_a_path() {
+        let reg = McpRegistration::Registered {
+            name: "embarch-api".to_string(),
+            scope: "local",
+            command: "/repo/target/debug/embarch-api".to_string(),
+            args: vec![],
+            env: vec![],
+        };
+        assert_eq!(registered_api_command(&reg), Some(PathBuf::from("/repo/target/debug/embarch-api")));
+        for other in [
+            McpRegistration::NotRegistered { looked_in: "/x".to_string() },
+            McpRegistration::NoCli { why: "no config".to_string() },
+            McpRegistration::UnreadableEntry { name: "n".to_string(), why: "w".to_string() },
+        ] {
+            assert_eq!(registered_api_command(&other), None);
+        }
     }
 
     /// Only ever asked when nothing was located, so the WSL2 arm wins over a

@@ -713,7 +713,7 @@ pub fn init(uninstall: bool) -> i32 {
         }
 
         print!("Registering the MCP server for this repo... ");
-        match locate::locate_api() {
+        match locate::locate_api(None) {
             Some(api) => {
                 if register_mcp(&api.path, &config_path) {
                     println!("done");
@@ -833,7 +833,7 @@ pub fn init(uninstall: bool) -> i32 {
     }
 
     print!("Registering the MCP server for this repo... ");
-    match locate::locate_api() {
+    match locate::locate_api(None) {
         Some(api) => {
             if register_mcp(&api.path, &config_path) {
                 println!("done");

@@ -31,6 +31,19 @@ pub enum FoundBy {
     /// because it is a reading rather than a guess, and behind `PATH` because
     /// a binary this side of the boundary is one `doctor` can run cheaply.
     WindowsServiceRegistration,
+    /// The `embarch-api` the agent CLI is registered to run (decision 42) —
+    /// the only authoritative answer to "which `embarch-api` does this
+    /// machine actually run", since being that agent's MCP server is what
+    /// `embarch-api` is *for*. Ranked ahead of `PATH` because it is a reading
+    /// rather than a guess, and behind the explicit override because an
+    /// operator naming a binary still outranks a config file.
+    AgentCliRegistration,
+    /// The canonical location `setup`'s install step copies to (decision 28),
+    /// found by computing it rather than by it being on `PATH`. Last, because
+    /// a `PATH` hit is what the machine would actually run by name — but not
+    /// absent, because that directory reaches `PATH` through a shell rc file
+    /// and so is invisible to any non-interactive shell (decision 42).
+    CanonicalInstall,
     /// The canonical copy `setup` just installed, this same run (`install.rs`,
     /// decision 28) — used only as a same-process fallback, since a `PATH`
     /// change this run just made isn't visible to this run's own environment
@@ -52,6 +65,8 @@ impl FoundBy {
             FoundBy::Path => "PATH",
             FoundBy::WindowsConventionalDir => "Windows install directory",
             FoundBy::WindowsServiceRegistration => "the Windows service's own registration",
+            FoundBy::AgentCliRegistration => "the agent CLI's own MCP registration",
+            FoundBy::CanonicalInstall => "the location `setup` installs to",
             FoundBy::JustInstalled => "just installed here",
             FoundBy::PendingInstall => "would be installed by this run",
         }
@@ -148,20 +163,54 @@ fn is_file(p: &Path) -> bool {
     p.is_file()
 }
 
-/// Locate `embarch-api`: the same order as `locate_core` minus the
-/// Windows-side cases, since the API always runs where the *source* is —
-/// which, on the WSL2 split, is this side of the boundary. `PATH` is enough
-/// once `setup` (decision 28) has run; before that, `EMBARCH_API_BIN` is the
-/// escape hatch.
-pub fn locate_api() -> Option<Located> {
-    if let Some(raw) = std::env::var_os("EMBARCH_API_BIN") {
-        return Some(Located {
-            path: PathBuf::from(raw),
-            found_by: FoundBy::EnvVar,
-            windows_exe_from_wsl2: false,
-        });
-    }
-    on_path("embarch-api")
+/// Where `setup`'s install step puts `embarch-api` (decision 28), computed
+/// rather than searched for. `None` only where the install directory itself
+/// cannot be derived — no `LOCALAPPDATA`, `XDG_DATA_HOME` or `HOME`.
+pub fn canonical_api_path() -> Option<PathBuf> {
+    crate::install::canonical_bin_dir().ok().map(|d| d.join(native_name("embarch-api")))
+}
+
+/// Locate `embarch-api`: no Windows-side cases, since the API always runs
+/// where the *source* is — which, on the WSL2 split, is this side of the
+/// boundary — and four sources rather than two, per decision 42.
+///
+/// `registered` is the command the agent CLI is registered to run, resolved
+/// by the caller (`doctor` reads it for check 10 anyway) and passed in rather
+/// than read here, so this module keeps knowing nothing about
+/// `~/.claude.json`. `None` from a caller with no reading to offer.
+pub fn locate_api(registered: Option<&Path>) -> Option<Located> {
+    choose_api(
+        std::env::var_os("EMBARCH_API_BIN").map(PathBuf::from),
+        registered.filter(|p| p.is_file()).map(Path::to_path_buf),
+        on_path("embarch-api").map(|l| l.path),
+        canonical_api_path().filter(|p| p.is_file()),
+    )
+}
+
+/// The precedence itself, over candidates the caller has already resolved and
+/// existence-checked. Pure, so the ordering is testable on a machine with no
+/// `embarch-api` on it and without an environment variable that every other
+/// test thread shares.
+///
+/// The env override is deliberately *not* existence-checked, matching
+/// `locate_core`: an operator who named a binary should see that path fail,
+/// not be silently handed a different one.
+fn choose_api(
+    env_override: Option<PathBuf>,
+    registered: Option<PathBuf>,
+    on_path: Option<PathBuf>,
+    canonical: Option<PathBuf>,
+) -> Option<Located> {
+    let (path, found_by) = if let Some(p) = env_override {
+        (p, FoundBy::EnvVar)
+    } else if let Some(p) = registered {
+        (p, FoundBy::AgentCliRegistration)
+    } else if let Some(p) = on_path {
+        (p, FoundBy::Path)
+    } else {
+        (canonical?, FoundBy::CanonicalInstall)
+    };
+    Some(Located { path, found_by, windows_exe_from_wsl2: false })
 }
 
 fn on_path(stem: &str) -> Option<Located> {
@@ -584,6 +633,62 @@ mod tests {
             FoundBy::WindowsConventionalDir.as_str()
         );
         assert!(FoundBy::WindowsServiceRegistration.as_str().contains("service"));
+    }
+
+    /// Decision 42's whole ordering, in one table. The two middle rows are
+    /// the ones that were missing: before it, `locate_api` consulted `PATH`
+    /// and nothing else, so the copy `setup` had itself installed was
+    /// invisible to every non-interactive shell.
+    #[test]
+    fn the_api_precedence_prefers_a_reading_over_a_guess() {
+        let e = PathBuf::from("/e/embarch-api");
+        let r = PathBuf::from("/r/embarch-api");
+        let p = PathBuf::from("/p/embarch-api");
+        let c = PathBuf::from("/c/embarch-api");
+
+        let all = choose_api(Some(e.clone()), Some(r.clone()), Some(p.clone()), Some(c.clone())).unwrap();
+        assert_eq!((all.path, all.found_by), (e, FoundBy::EnvVar));
+
+        let reg = choose_api(None, Some(r.clone()), Some(p.clone()), Some(c.clone())).unwrap();
+        assert_eq!((reg.path, reg.found_by), (r, FoundBy::AgentCliRegistration));
+
+        let on_p = choose_api(None, None, Some(p.clone()), Some(c.clone())).unwrap();
+        assert_eq!((on_p.path, on_p.found_by), (p, FoundBy::Path));
+
+        let inst = choose_api(None, None, None, Some(c.clone())).unwrap();
+        assert_eq!((inst.path, inst.found_by), (c, FoundBy::CanonicalInstall));
+
+        assert_eq!(choose_api(None, None, None, None), None);
+    }
+
+    /// The registered command is only ever *this* side of the boundary — it
+    /// is spawned in-process by the agent CLI — so nothing `locate_api`
+    /// returns is ever a Windows exe seen from WSL2, unlike `locate_core`.
+    #[test]
+    fn a_located_api_is_never_a_windows_exe_from_wsl2() {
+        let l = choose_api(None, Some(PathBuf::from("/mnt/c/embarch/embarch-api.exe")), None, None).unwrap();
+        assert!(!l.windows_exe_from_wsl2);
+    }
+
+    /// The canonical path is derived from `install`'s own directory function
+    /// rather than from a second spelling of it — the two drifting apart
+    /// would mean `doctor` looking somewhere `setup` never writes.
+    #[test]
+    fn the_canonical_api_path_sits_in_installs_own_bin_dir() {
+        let dir = crate::install::canonical_bin_dir_from(false, None, None, Some("/home/me")).unwrap();
+        assert_eq!(dir, PathBuf::from("/home/me/.local/share/embarch/bin"));
+        assert_eq!(dir.join(native_name("embarch-api")).file_name().unwrap(), native_name("embarch-api").as_str());
+    }
+
+    /// Provenance is user-facing here for the same reason it is for Core: a
+    /// binary found where `setup` installed it and a binary the agent CLI is
+    /// registered to run are different claims, and check 1 prints which.
+    #[test]
+    fn the_two_new_api_provenances_are_distinct_and_say_what_they_are() {
+        assert_ne!(FoundBy::AgentCliRegistration.as_str(), FoundBy::CanonicalInstall.as_str());
+        assert_ne!(FoundBy::CanonicalInstall.as_str(), FoundBy::Path.as_str());
+        assert!(FoundBy::AgentCliRegistration.as_str().contains("registration"));
+        assert!(FoundBy::CanonicalInstall.as_str().contains("setup"));
     }
 
     #[test]
