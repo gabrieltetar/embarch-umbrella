@@ -2323,9 +2323,12 @@ struct BindEvidence<'a> {
     /// Check 3's winner: the class and the address `/status` was actually
     /// reached at.
     reached: Option<(TopologyClass, &'a str)>,
-    /// `--bind` out of the Windows service's own registration, read **only
-    /// when nothing answered** (see the driver). `None` everywhere else, and
-    /// on every machine whose Core is not a Windows service.
+    /// `--bind` out of the Windows service's own registration — **the only
+    /// evidence either Fail arm has that discriminates a narrow bind.** Read
+    /// when nothing answered, and also when the winner answered at loopback
+    /// on a machine that needs a wide bind (see the driver). `None` where
+    /// neither holds, and on every machine whose Core is not a Windows
+    /// service.
     registered: Option<&'a str>,
 }
 
@@ -2365,6 +2368,16 @@ fn is_loopback_bind(addr: &str) -> bool {
 /// wider than needed, everything works, and failing a `doctor` run over it
 /// would be a red on a machine with nothing wrong. It warns and says which
 /// direction it is. The losing argument is recorded in decision 22.
+///
+/// **Reaching loopback is not evidence of a narrow bind** (decision 22(a)'s
+/// 2026-09-06 amendment). `candidates()` puts `Local @ 127.0.0.1` first and
+/// `resolve` stops at the first responder, so a Core bound `0.0.0.0` wins
+/// there exactly as one bound `127.0.0.1` does. The wide-recorded/loopback-
+/// reached arm therefore does not conclude from the hit alone: it asks the
+/// service registration, Fails `bind-too-narrow` only when *that* is narrow,
+/// Passes `bind-matches-registered` when it is wide, and Warns
+/// `bind-unproven` when it cannot be read — a Warn that says it did not look
+/// at the route that matters rather than a Fail asserting what it never saw.
 ///
 /// **What it refuses to restate.** With no winner and no registration to
 /// read, this is a Warn that points at check 3 rather than a second Fail for
@@ -2410,29 +2423,84 @@ fn judge_bind_address(e: &BindEvidence<'_>) -> Check {
             );
         }
         if needed == "0.0.0.0" && is_loopback_bind_url(url) {
-            return with_fix(
-                with_code(
+            return match e.registered {
+                Some(addr) if is_loopback_bind(addr) => with_fix(
+                    with_code(
+                        check(
+                            N,
+                            CHECK_17_NAME,
+                            Status::Fail,
+                            format!(
+                                "reached at {url} ({}), and the Core service is registered `--bind \
+                                 {addr}`, while this machine was set up as {recorded_str}, which \
+                                 needs {needed}. The registration is the evidence, not the \
+                                 loopback hit: loopback is the first candidate tried and every \
+                                 bind answers there. Bound this narrow, the route a WSL2 guest \
+                                 reaches its Windows host over — the default gateway — cannot \
+                                 reach Core. This is not an unreachable Core; it is a Core \
+                                 reachable from the wrong side",
+                                reached_class.as_str()
+                            ),
+                        ),
+                        "bind-too-narrow",
+                    ),
+                    // Deliberately **not** the `bound-narrow` fix's second
+                    // half. Something answered, which is exactly the
+                    // condition `setup` calls `already_running`: it installs
+                    // nothing and then rewrites the recorded class to the
+                    // winner's, after which this check passes `bind-matches`
+                    // with the bind untouched and the only independent
+                    // evidence destroyed.
+                    format!(
+                        "reinstall the service with the wide bind, in an elevated shell on the \
+                         machine running Core: `embarch-core install --bind {needed}`. Do not \
+                         re-run `embarch setup` for this: Core answered, so `setup` installs \
+                         nothing and overwrites the recorded class, which greens this check \
+                         without widening the bind."
+                    ),
+                ),
+                Some(addr) => with_code(
                     check(
                         N,
                         CHECK_17_NAME,
-                        Status::Fail,
+                        Status::Pass,
                         format!(
-                            "reached at {url} ({}) only, but this machine was set up as \
-                             {recorded_str}, which needs Core bound {needed}. Core is answering on \
-                             an interface this process can use and the one a WSL2 guest reaches its \
-                             Windows host over — the default gateway — is not it. This is not an \
-                             unreachable Core; it is a Core reachable from the wrong side",
+                            "reached at {url} ({}), which on its own says nothing — loopback is \
+                             the first candidate tried and every bind answers there — but the Core \
+                             service is registered `--bind {addr}`, which covers what a \
+                             {recorded_str} machine needs ({needed})",
                             reached_class.as_str()
                         ),
                     ),
-                    "bind-too-narrow",
+                    "bind-matches-registered",
                 ),
-                format!(
-                    "reinstall the service with the wide bind, in an elevated shell on the machine \
-                     running Core: `embarch-core install --bind {needed}` — or re-run `embarch \
-                     setup`, which passes it for you."
+                None => with_fix(
+                    with_code(
+                        check(
+                            N,
+                            CHECK_17_NAME,
+                            Status::Warn,
+                            format!(
+                                "reached at {url} ({}), but this machine was set up as \
+                                 {recorded_str}, which needs Core bound {needed}, and no service \
+                                 registration could be read to say whether it is. A loopback hit \
+                                 does not discriminate: it is the first candidate tried and every \
+                                 bind answers there, so whether the WSL2 gateway route works is \
+                                 unknown here",
+                                reached_class.as_str()
+                            ),
+                        ),
+                        "bind-unproven",
+                    ),
+                    format!(
+                        "ask from the side that matters: run `embarch doctor` in the WSL2 guest, \
+                         or `curl http://$(ip route show default | awk '{{print $3}}'):4884/status` \
+                         there. If that cannot reach Core, reinstall the service with \
+                         `embarch-core install --bind {needed}` in an elevated shell on the \
+                         machine running Core."
+                    ),
                 ),
-            );
+            };
         }
         return with_code(
             check(
@@ -2518,6 +2586,32 @@ fn is_loopback_bind_url(base_url: &str) -> bool {
     is_loopback_bind(host)
 }
 
+/// Is an `sc.exe qc` worth spending before check 17 judges?
+///
+/// Two states can be changed by the answer, and only two. **Nothing
+/// answered:** the registration is the only evidence there is, and it is the
+/// difference between `bound-narrow` and `bind-not-the-cause`. **Something
+/// answered at loopback on a machine that needs `0.0.0.0`:** the hit itself
+/// cannot discriminate — loopback is the first candidate tried and every bind
+/// answers there — so the registration is the difference between
+/// `bind-too-narrow`, `bind-matches-registered` and `bind-unproven`.
+///
+/// Everywhere else the subprocess cannot move the verdict: a winner reached
+/// over the gateway has *proved* the bind covers the route that matters, and
+/// a `local` machine's need is loopback, which the hit already demonstrates.
+fn bind_registration_can_change_the_verdict(
+    recorded: Option<TopologyClass>,
+    winner_base_url: Option<&str>,
+) -> bool {
+    match winner_base_url {
+        None => true,
+        Some(url) => {
+            is_loopback_bind_url(url)
+                && recorded.is_some_and(|r| topology::recommended_bind_address(r) == "0.0.0.0")
+        }
+    }
+}
+
 // ---- driver ------------------------------------------------------------------
 
 pub async fn doctor(json: bool) -> i32 {
@@ -2580,14 +2674,20 @@ pub async fn doctor(json: bool) -> i32 {
         projects,
     );
 
-    // Decision 22(a). The service registration is read **only when nothing
-    // answered**: with a winner the address it answered at is the better
-    // evidence and already proves the bind covers that route, so the
-    // subprocess is spent exactly where it can change the verdict.
-    let registered_bind =
-        if core_probe.winner_base_url.is_none() { locate::windows_core_service_bind_address() } else { None };
+    // Decision 22(a), amended 2026-09-06. The subprocess is spent exactly
+    // where it can change the verdict — which, unlike this comment's first
+    // version, includes a winner that answered at loopback.
+    let recorded_class = saved.topology.as_deref().and_then(setup::topology_class_from_str);
+    let registered_bind = if bind_registration_can_change_the_verdict(
+        recorded_class,
+        core_probe.winner_base_url.as_deref(),
+    ) {
+        locate::windows_core_service_bind_address()
+    } else {
+        None
+    };
     let check17 = judge_bind_address(&BindEvidence {
-        recorded: saved.topology.as_deref().and_then(setup::topology_class_from_str),
+        recorded: recorded_class,
         reached: core_probe
             .winner_class
             .zip(core_probe.winner_base_url.as_deref()),
@@ -3940,23 +4040,110 @@ mod tests {
 
     /// **The check's reason for existing, and the state that must be a Fail
     /// and not a Warn.** A `wsl-host` machine needs Core bound `0.0.0.0`;
-    /// this one answered on loopback and nowhere else, which is exactly
+    /// this one is registered `--bind 127.0.0.1`, which is exactly
     /// "reachable from this interface but not the one WSL2 can actually
     /// use". A Warn here would sit in a list of warns nobody reads while
     /// every flash from the guest fails.
     #[test]
-    fn check_17_fails_when_the_address_reached_is_narrower_than_the_topology_needs() {
+    fn check_17_fails_when_the_registered_bind_is_narrower_than_the_topology_needs() {
         let c = judge_bind_address(&bind_evidence(
             Some(TopologyClass::WslHost),
             Some((TopologyClass::Local, "http://127.0.0.1:4884")),
-            None,
+            Some("127.0.0.1"),
         ));
         assert_eq!(c.n, 17);
         assert_eq!(c.status, Status::Fail);
         assert_eq!(c.code, Some("bind-too-narrow"));
         assert!(c.detail.contains("wsl-host"), "{}", c.detail);
         assert!(c.detail.contains("0.0.0.0"), "{}", c.detail);
-        assert!(c.fix.unwrap().contains("--bind 0.0.0.0"));
+        assert!(c.fix.as_deref().unwrap().contains("--bind 0.0.0.0"));
+    }
+
+    /// **The defect this arm shipped with.** Its fix offered `embarch setup`
+    /// as an alternative — but a candidate answering is precisely what
+    /// `setup` calls `already_running`, so it installs nothing and then
+    /// rewrites the recorded class to the winner's, after which this check
+    /// Passes `bind-matches` with the bind untouched. A fix line that can
+    /// green its own check, and destroy the only independent evidence doing
+    /// it, is worse than no fix line.
+    #[test]
+    fn check_17s_too_narrow_fix_does_not_offer_the_command_that_would_green_it() {
+        let c = judge_bind_address(&bind_evidence(
+            Some(TopologyClass::WslHost),
+            Some((TopologyClass::Local, "http://127.0.0.1:4884")),
+            Some("localhost"),
+        ));
+        let fix = c.fix.as_deref().unwrap();
+        assert!(fix.contains("Do not re-run `embarch setup`"), "{fix}");
+        // And the detail must not claim the other candidates were tried.
+        assert!(!c.detail.contains("only,"), "{}", c.detail);
+    }
+
+    /// The same loopback hit with a **wide** registration is the passing
+    /// state, and the detail has to say why the hit itself proved nothing:
+    /// loopback is the first candidate and every bind answers there.
+    #[test]
+    fn check_17_passes_on_a_loopback_hit_when_the_registration_is_wide() {
+        let c = judge_bind_address(&bind_evidence(
+            Some(TopologyClass::WslHost),
+            Some((TopologyClass::Local, "http://127.0.0.1:4884")),
+            Some("0.0.0.0"),
+        ));
+        assert_eq!(c.status, Status::Pass);
+        assert_eq!(c.code, Some("bind-matches-registered"));
+        assert!(c.detail.contains("says nothing"), "{}", c.detail);
+    }
+
+    /// **The arm that used to Fail on evidence that cannot discriminate.**
+    /// A loopback hit and no registration to read is not a narrow bind; it
+    /// is not knowing. It warns, says it never tried the route that matters,
+    /// and its fix asks from the side that matters rather than asserting.
+    #[test]
+    fn check_17_warns_rather_than_failing_when_only_a_loopback_hit_is_available() {
+        let c = judge_bind_address(&bind_evidence(
+            Some(TopologyClass::WslHost),
+            Some((TopologyClass::Local, "http://127.0.0.1:4884")),
+            None,
+        ));
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.code, Some("bind-unproven"));
+        assert!(c.detail.contains("does not discriminate"), "{}", c.detail);
+        assert!(!c.detail.contains("only,"), "{}", c.detail);
+        let fix = c.fix.as_deref().unwrap();
+        assert!(fix.contains("in the WSL2 guest"), "{fix}");
+        assert!(!fix.contains("embarch setup"), "{fix}");
+    }
+
+    /// The registration is read where — and only where — it can move the
+    /// verdict. A gateway winner has already proved the bind covers the
+    /// route that matters, and a `local` machine needs exactly the loopback
+    /// the hit demonstrates; neither is worth an `sc.exe`.
+    #[test]
+    fn check_17_reads_the_service_registration_exactly_where_it_can_change_the_answer() {
+        // Nothing answered: the only evidence there is.
+        assert!(bind_registration_can_change_the_verdict(Some(TopologyClass::WslHost), None));
+        assert!(bind_registration_can_change_the_verdict(None, None));
+        // Loopback winner on a machine needing a wide bind: the hit alone
+        // cannot tell `bind-too-narrow` from a Core bound `0.0.0.0`.
+        assert!(bind_registration_can_change_the_verdict(
+            Some(TopologyClass::WslHost),
+            Some("http://127.0.0.1:4884")
+        ));
+        // Reached over the gateway — the wide bind is already proved.
+        assert!(!bind_registration_can_change_the_verdict(
+            Some(TopologyClass::WslHost),
+            Some("http://172.24.16.1:4884")
+        ));
+        // A `local` machine needs loopback and got it.
+        assert!(!bind_registration_can_change_the_verdict(
+            Some(TopologyClass::Local),
+            Some("http://127.0.0.1:4884")
+        ));
+        // Nothing recorded: the check warns `no-recorded-class` regardless.
+        assert!(!bind_registration_can_change_the_verdict(
+            None,
+            Some("http://127.0.0.1:4884")
+        ));
     }
 
     /// The second Fail path, and the one the decision's "rather than
