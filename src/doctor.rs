@@ -401,7 +401,12 @@ fn check_service(probe: &CoreProbe, host: Option<&str>, core: Option<&Located>) 
             setup::windows_display_path(&c.path)
         ),
         (TopologyClass::Local, Some(c)) => {
-            format!("sudo \"{}\" install   (or, if already installed: sudo \"{}\" start)", c.path.display(), c.path.display())
+            // One space before the parenthesis, not three: the module-wide
+            // guard below (`no_check_renders_a_run_of_two_or_more_spaces`)
+            // reads any multi-space run as a wrapped literal, and a hand-set
+            // gap that has to be spelled out as an exception is worth less
+            // than the guard.
+            format!("sudo \"{}\" install (or, if already installed: sudo \"{}\" start)", c.path.display(), c.path.display())
         }
         (_, None) => "embarch-core not found — run `embarch setup` first.".to_string(),
     };
@@ -2895,7 +2900,8 @@ fn check_flash_backend(core: Option<&Located>, class: TopologyClass) -> Check {
         // flashing. It says what is missing and what would supply it.
         let detail = match class {
             TopologyClass::Remote => {
-                "skipped — Core runs on another machine, and only its own binary can say which                  flashing program it would resolve there"
+                "skipped — Core runs on another machine, and only its own binary can say \
+                 which flashing program it would resolve there"
             }
             TopologyClass::WslHost => {
                 "skipped — no embarch-core binary this host can run: nothing is registered \
@@ -3718,7 +3724,13 @@ mod tests {
             assert!(!c.detail.contains("check 1"), "{}", c.detail);
         }
         assert!(check_flash_backend(None, TopologyClass::WslHost).detail.contains("sc.exe qc"));
-        assert!(check_flash_backend(None, TopologyClass::Remote).detail.contains("another machine"));
+        // Deliberately a fragment that **spans the literal's line break**.
+        // `contains("another machine")` was what this line asserted while the
+        // arm shipped eighteen stray spaces at the wrap (task `umbrella/024`):
+        // a fragment wholly on one side of a break cannot see the defect.
+        assert!(check_flash_backend(None, TopologyClass::Remote)
+            .detail
+            .contains("its own binary can say which flashing program"));
     }
 
     #[test]
@@ -4688,5 +4700,346 @@ mod tests {
         assert!(is_loopback_bind_url("http://[::1]:4884"));
         assert!(!is_loopback_bind_url("http://172.24.16.1:4884"));
         assert!(!is_loopback_bind_url("http://0.0.0.0:4884"));
+    }
+
+    // ---- every check's rendered text, held to one shape ---------------------
+
+    /// Every verdict this module's **pure** judges can be made to produce
+    /// without a network, a Core or a bench.
+    ///
+    /// **What this corpus is for.** A long message here is written as a
+    /// `\`-continued literal, which drops the newline *and* the next line's
+    /// indentation. Wrap the same literal without the `\` and Rust keeps
+    /// both: the indentation lands in the rendered sentence as a run of
+    /// spaces, and every `contains` assertion on a fragment either side of
+    /// the break still passes. That is exactly how check 14's two skip arms
+    /// each shipped eighteen stray spaces, and how the second survived the
+    /// first's fix (`81e20f4`, then task `umbrella/024`) — the test that
+    /// existed asserted `detail.contains("another machine")`, a fragment
+    /// before the break. So the guard is on the rendered text of *every*
+    /// verdict, not on the arm that was caught.
+    ///
+    /// **The two checks it cannot reach.** Checks 4 and 12 have no pure
+    /// judge: both are `async` and decide nothing without a live Core, so
+    /// their text is absent from this corpus and this test claims nothing
+    /// about it.
+    ///
+    /// **Check 16 goes through [`judge_growth`], not [`check_growth`].** The
+    /// wrapper resolves a real data directory, which every test in this
+    /// module is forbidden to do (decision 39; see check 16's test header),
+    /// so the three notes the wrapper composes are passed in here instead.
+    fn pure_verdicts() -> Vec<Check> {
+        let mut out: Vec<Check> = Vec::new();
+
+        let core = a_located("/usr/local/bin/embarch-core", false);
+        let win_core = a_located("/mnt/c/Program Files/embarch/embarch-core.exe", true);
+        let api = a_located("/usr/local/bin/embarch-api", false);
+        let classes = [TopologyClass::Local, TopologyClass::WslHost, TopologyClass::Remote];
+
+        // ---- check 1 --------------------------------------------------------
+        for class in classes {
+            for c in [None, Some(&core), Some(&win_core)] {
+                for a in [None, Some(&api)] {
+                    out.push(check_binaries(c, a, None, None, class));
+                    out.push(check_binaries(
+                        c,
+                        a,
+                        Some("embarch-core 0.1.0"),
+                        Some("embarch-api 0.1.0"),
+                        class,
+                    ));
+                }
+            }
+        }
+        // Every provenance note decision 42 added, and the ones it stays quiet
+        // about — each is its own sentence appended to the same detail.
+        for found_by in [
+            locate::FoundBy::EnvVar,
+            locate::FoundBy::SavedState,
+            locate::FoundBy::Path,
+            locate::FoundBy::WindowsConventionalDir,
+            locate::FoundBy::WindowsServiceRegistration,
+            locate::FoundBy::AgentCliRegistration,
+            locate::FoundBy::CanonicalInstall,
+            locate::FoundBy::JustInstalled,
+            locate::FoundBy::PendingInstall,
+        ] {
+            let mut a = a_located("/repo/target/debug/embarch-api", false);
+            a.found_by = found_by;
+            out.push(check_binaries(Some(&core), Some(&a), None, None, TopologyClass::Local));
+        }
+
+        // ---- checks 2 and 3 -------------------------------------------------
+        let attempts: Vec<topology::Attempt> =
+            topology::candidates(true, Some("172.24.16.1"), Some("bench.local"), 4884)
+                .into_iter()
+                .enumerate()
+                .map(|(i, candidate)| topology::Attempt {
+                    candidate,
+                    outcome: if i == 0 {
+                        ProbeOutcome::NotCore { status: 404 }
+                    } else {
+                        ProbeOutcome::Unreachable
+                    },
+                })
+                .collect();
+        let nothing_answered = CoreProbe {
+            winner_base_url: None,
+            winner_class: None,
+            attempts,
+        };
+        out.push(check_reachable(&nothing_answered));
+        for host in [None, Some("bench.local")] {
+            for c in [None, Some(&core), Some(&win_core)] {
+                out.push(check_service(&nothing_answered, host, c));
+            }
+        }
+        for class in classes {
+            let reached = CoreProbe {
+                winner_base_url: Some("http://127.0.0.1:4884".to_string()),
+                winner_class: Some(class),
+                attempts: Vec::new(),
+            };
+            out.push(check_reachable(&reached));
+            out.push(check_service(&reached, None, Some(&core)));
+        }
+
+        // ---- check 5 --------------------------------------------------------
+        let usb = tempdir();
+        usb_device(usb.path(), "1-2", "1366", Some("J-Link"));
+        usb_device(usb.path(), "1-3", "0d28", None);
+        let none_authed = no_probes();
+        let one_probe = AuthedStatus {
+            probes: vec![serde_json::json!({"id": "probe-1", "kind": "jlink"})],
+            study_designer_schema_version: Some(17),
+            core_version: Some("0.1.0".to_string()),
+        };
+        for scan in [
+            UsbScan::NotLinux,
+            UsbScan::CoreElsewhere,
+            UsbScan::Scanned(Vec::new()),
+            UsbScan::Scanned(scan_usb_debug_probes(usb.path())),
+        ] {
+            for authed in [None, Some(&none_authed), Some(&one_probe)] {
+                out.push(check_probes(authed, &scan));
+            }
+        }
+
+        // ---- check 6 --------------------------------------------------------
+        let cfg = tempdir();
+        let malformed = cfg.path().join("embarch.toml");
+        std::fs::write(&malformed, "this is not toml =\n").unwrap();
+        out.push(check_config(None).0);
+        out.push(check_config(Some(&malformed)).0);
+        out.push(check_config(Some(&cfg.path().join("absent.toml"))).0);
+
+        // ---- checks 7, 8 and 9 ----------------------------------------------
+        let projects = [
+            sample_project("firmware-a", "nRF54L15"),
+            sample_project("firmware-b", "not-a-chip"),
+        ];
+        out.push(check_build_commands(&[]));
+        out.push(check_build_commands(&projects));
+        out.push(check_chip(&[], None, None));
+        out.push(check_chip(&projects, None, None));
+        out.push(check_artifact_paths(&[]));
+        out.push(check_artifact_paths(&projects));
+
+        // ---- check 10 -------------------------------------------------------
+        let regs = [
+            registered(),
+            McpRegistration::NotRegistered { looked_in: "/repo".to_string() },
+            McpRegistration::NoCli { why: "no agent CLI config on this machine".to_string() },
+            McpRegistration::UnreadableEntry {
+                name: "embarch".to_string(),
+                why: "the entry names no command".to_string(),
+            },
+        ];
+        let handshakes = [
+            HandshakeOutcome::Answered("embarch-api".to_string()),
+            HandshakeOutcome::Failed("couldn't start `/bin/embarch-api`: No such file".to_string()),
+            HandshakeOutcome::TimedOut,
+        ];
+        for reg in &regs {
+            out.push(judge_mcp(reg, None, "claude mcp add embarch -- /bin/embarch-api"));
+            for h in &handshakes {
+                out.push(judge_mcp(reg, Some(h), "claude mcp add embarch -- /bin/embarch-api"));
+            }
+        }
+
+        // ---- check 11 -------------------------------------------------------
+        for core_host in [Ok(17), Ok(16), Err("Core isn't reachable (see check 3)")] {
+            for bench_wire in [
+                Ok((15, Some(true))),
+                Ok((15, Some(false))),
+                Ok((14, None)),
+                Err("no dev-bench plugged in"),
+            ] {
+                out.push(judge_schema_versions(&versions(core_host, 17, bench_wire)));
+            }
+        }
+        out.push(judge_schema_versions(&SchemaVersions {
+            core_host: Ok(17),
+            api_host: Err("couldn't run `/usr/local/bin/embarch-api`".to_string()),
+            umbrella_host: 17,
+            bench_wire: Ok((15, Some(true))),
+        }));
+        out.push(judge_schema_versions(&SchemaVersions {
+            core_host: Ok(17),
+            api_host: Ok(16),
+            umbrella_host: 17,
+            bench_wire: Err("no dev-bench plugged in"),
+        }));
+
+        // ---- check 13 -------------------------------------------------------
+        let saved = state::State::default();
+        out.push(check_firmware_version(&HelloOutcome::NoBench, &saved));
+        out.push(check_firmware_version(
+            &HelloOutcome::Unavailable("Core isn't reachable (see check 3)".to_string()),
+            &saved,
+        ));
+        out.push(check_firmware_version(
+            &HelloOutcome::Answered(HelloAck {
+                schema_version: Some(15),
+                compatible: Some(true),
+                firmware_version: Some("v7".to_string()),
+                raw: "{}".to_string(),
+            }),
+            &saved,
+        ));
+
+        // ---- check 14 -------------------------------------------------------
+        let unrunnable = a_located("/no/such/embarch-core-xyz", false);
+        for class in classes {
+            out.push(check_flash_backend(None, class));
+            out.push(check_flash_backend(Some(&unrunnable), class));
+        }
+
+        // ---- check 15 -------------------------------------------------------
+        for served in [None, Some("0.1.0")] {
+            for located in [
+                None,
+                Some("embarch-core 0.1.0"),
+                Some("embarch-core 0.2.0"),
+                Some("not a version line"),
+            ] {
+                out.push(judge_core_build(served, located));
+            }
+        }
+
+        // ---- check 16 -------------------------------------------------------
+        let results = tempdir();
+        let empty_dir = results.path().join("study_results");
+        std::fs::create_dir_all(&empty_dir).unwrap();
+        for class in classes {
+            out.push(judge_growth(None, "", absent_note(class), &projects));
+            out.push(judge_growth(Some(&empty_dir), "", absent_note(class), &[]));
+            out.push(judge_growth(
+                Some(&results.path().join("never-created")),
+                "",
+                absent_note(class),
+                &[],
+            ));
+        }
+        // The three notes `check_growth` composes, which it cannot be asked
+        // for here without resolving a real data directory.
+        out.push(judge_growth(
+            None,
+            "study_results/ is on the remote Core's machine and can't be measured from here",
+            "",
+            &[],
+        ));
+        for class in classes {
+            out.push(judge_growth(
+                None,
+                &format!("no data directory resolves for a {} Core here", class.as_str()),
+                "",
+                &[],
+            ));
+            out.push(judge_growth(
+                Some(&empty_dir),
+                &format!("assuming a {} Core — check 3 found no winner to ask", class.as_str()),
+                absent_note(class),
+                &projects,
+            ));
+        }
+
+        // ---- check 17 -------------------------------------------------------
+        for recorded in [None, Some(TopologyClass::Local), Some(TopologyClass::WslHost), Some(TopologyClass::Remote)] {
+            for reached in [
+                None,
+                Some((TopologyClass::Local, "http://127.0.0.1:4884")),
+                Some((TopologyClass::WslHost, "http://172.24.16.1:4884")),
+                Some((TopologyClass::Remote, "http://build-box.local:4884")),
+            ] {
+                for registered_bind in [None, Some("127.0.0.1"), Some("0.0.0.0"), Some("bench.local")] {
+                    for setup_would_infer in classes {
+                        out.push(judge_bind_address(&BindEvidence {
+                            recorded,
+                            reached,
+                            registered: registered_bind,
+                            setup_would_infer,
+                        }));
+                    }
+                }
+            }
+        }
+
+        out
+    }
+
+    /// **No rendered verdict contains a run of two or more spaces**, in
+    /// `detail` or in `fix`, for any check with a pure judge.
+    ///
+    /// A failure here is almost always a long literal wrapped without its
+    /// trailing `\` — see [`pure_verdicts`] for why that is invisible to an
+    /// ordinary `contains` assertion, and why this is a whole-module guard
+    /// rather than one more assertion on the arm that was caught.
+    #[test]
+    fn no_check_renders_a_run_of_two_or_more_spaces() {
+        let verdicts = pure_verdicts();
+
+        // The corpus itself, asserted: an emptied or shrunken one would pass
+        // the guard below while guarding nothing. 4 and 12 are absent by
+        // construction — neither has a pure judge.
+        let mut covered: Vec<u8> = verdicts.iter().map(|c| c.n).collect();
+        covered.sort_unstable();
+        covered.dedup();
+        assert_eq!(covered, vec![1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17]);
+
+        let mut offenders: Vec<String> = Vec::new();
+        let mut verbatim: Vec<u8> = Vec::new();
+        for c in &verdicts {
+            for (field, text) in [("detail", Some(&c.detail)), ("fix", c.fix.as_ref())] {
+                let Some(text) = text else { continue };
+                // Nothing in this module *authors* a multi-line message, so a
+                // newline marks text rendered verbatim from somewhere else —
+                // check 6's `{e:#}` of a `toml` parse error, whose caret
+                // diagram is made of the very runs this test forbids. Its
+                // layout is not ours to police, and the defect being guarded
+                // against never produces a newline: the missing `\` swallows
+                // one and leaves indentation behind.
+                if text.contains('\n') {
+                    verbatim.push(c.n);
+                    continue;
+                }
+                if text.contains("  ") {
+                    offenders.push(format!("check {} {field}: {text:?}", c.n));
+                }
+            }
+        }
+        // The exemption, pinned so it cannot quietly widen to cover a real
+        // offender: check 6 is the only check that renders foreign text.
+        verbatim.sort_unstable();
+        verbatim.dedup();
+        assert_eq!(verbatim, vec![6]);
+        offenders.sort();
+        offenders.dedup();
+        assert!(
+            offenders.is_empty(),
+            "a wrapped literal leaked its indentation into rendered text \
+             (a long string needs a trailing `\\`):\n{}",
+            offenders.join("\n")
+        );
     }
 }
