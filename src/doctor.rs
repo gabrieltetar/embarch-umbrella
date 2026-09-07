@@ -448,11 +448,11 @@ fn check_reachable(probe: &CoreProbe) -> Check {
 /// other. What they share is what they do *not* do — no serial link opened,
 /// no `hw_lock` taken, nothing waited on from a board.
 ///
-/// **Measured under this budget for `/status` only** [three live `embarch
-/// doctor` runs, 2026-09-06, primary `wsl-host` bench, both boards attached]:
-/// check 4 read a `200` every time. `/dev-bench/port`'s own enumeration has
-/// never been timed; it sits here because Core does the same *kind* of work
-/// for it, which is an argument and not a measurement (decision 44).
+/// **Both calls are now measured under it** [three authenticated GETs each,
+/// 2026-09-07, primary `wsl-host` bench, both boards attached and validated]:
+/// `/status` 126.5/99.6/100.0 ms, `/dev-bench/port` 5.8/12.5/5.0 ms — the
+/// cheapest call in the chain, and the one whose place here used to be an
+/// argument from what Core does for it rather than a timing (decision 44).
 ///
 /// Deliberately short. `doctor` runs the whole chain and is already the heavy
 /// command (decision 11), and a Core that cannot finish a device scan in half
@@ -471,11 +471,13 @@ const DEVICE_SCAN_GET_TIMEOUT: Duration = Duration::from_millis(500);
 /// 13 reported *unavailable* on a bench that was handshaking three times out
 /// of three (decision 44, `tasks/umbrella/030`).
 ///
-/// **Assumed, not measured.** No run on this bench or any other has produced
-/// a handshake *duration*, so what this value has to exceed is unknown; it is
-/// sized like [`MCP_HANDSHAKE_TIMEOUT`], this module's other assumed budget
-/// for another process's handshake, and sits under `embarch-api`'s 15 s
-/// `serial_timeout_secs` for a call that reads the same link. **A budget is
+/// **Measured** [three authenticated GETs, 2026-09-07, primary `wsl-host`
+/// bench, both boards attached and validated]: **719.7 / 730.1 / 746.9 ms**,
+/// so the handshake costs about 0.73 s and the 500 ms it used to inherit was
+/// short by roughly 230 ms — 1.4× under, which is the kind of wrong that reads
+/// as an intermittent bench. 10 s stands, now with ~13× headroom rather than
+/// by analogy with [`MCP_HANDSHAKE_TIMEOUT`], and still under `embarch-api`'s
+/// 15 s `serial_timeout_secs` for a call over the same link. **A budget is
 /// spent only by a call that does not answer** — a handshake that completes
 /// returns when it completes, so a generous one costs a healthy run nothing.
 const LINK_HANDSHAKE_GET_TIMEOUT: Duration = Duration::from_secs(10);
