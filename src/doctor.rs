@@ -2105,14 +2105,53 @@ fn git_describe(repo_path: &Path) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
-/// `embarch-dev-bench/design.md` §3 decision 25 /
-/// `embarch-umbrella/design.md` §3 decision 19: compares the currently
-/// flashed dev-bench's `HelloAck.firmware_version` (over `GET
-/// /dev-bench/hello`, `embarch-core/design.md`'s handshake-only endpoint —
-/// no `Study` involved) against `git describe` run against whichever local
-/// `embarch-dev-bench` checkout is configured. A mismatch means "you changed
-/// dev-bench firmware and haven't reflashed it," caught here instead of as a
-/// confusing mid-study failure.
+/// Whether `remote_version` — a `HelloAck.firmware_version` as reported by
+/// the flashed bench — names a commit `repo_path` still has, as opposed to
+/// one a history rewrite (e.g. a client-name scrub) removed. `git describe`'s
+/// output is `[<tag>-<n>-g]<hash>[-dirty]`; strip both optional parts before
+/// asking `git cat-file` about the commit-ish that's left (decision 47:
+/// umbrella/037 found a reported id that was not a commit, a tag or in any
+/// reflog of the configured checkout, and untangling that by hand is exactly
+/// what this exists to save).
+fn git_object_known(repo_path: &Path, remote_version: &str) -> bool {
+    let without_dirty = remote_version.strip_suffix("-dirty").unwrap_or(remote_version);
+    let commit_ish = without_dirty
+        .rsplit_once("-g")
+        .map(|(_, hash)| hash)
+        .unwrap_or(without_dirty);
+    Command::new("git")
+        .args(["cat-file", "-e", &format!("{commit_ish}^{{commit}}")])
+        .current_dir(repo_path)
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// `embarch-dev-bench/design.md` §3 decision 25 / `embarch-umbrella`
+/// decision 19: compares the currently flashed dev-bench's
+/// `HelloAck.firmware_version` (over `GET /dev-bench/hello`,
+/// `embarch-core/design.md`'s handshake-only endpoint — no `Study` involved)
+/// against `git describe` run against whichever local `embarch-dev-bench`
+/// checkout is configured. A mismatch means "you changed dev-bench firmware
+/// and haven't reflashed it," caught here instead of as a confusing
+/// mid-study failure.
+///
+/// **No checkout configured is a `Fail`, not a `Warn` (decision 47).** This
+/// arm only runs once `ack` exists — a bench answered `/dev-bench/hello` —
+/// so "no bench at all" is already a `Pass` above, and the candidate
+/// judgement this decision argues against ("a machine with no bench should
+/// not be nagged") does not reach here: a bench *is* present, and the
+/// check's whole purpose goes uncaught for as long as nobody runs `setup
+/// --dev-bench-repo`.
+///
+/// **A `firmware_version` git can't find is reported as that, not as an
+/// ordinary stale mismatch (decision 47).** `git describe`'s hash survives
+/// unchanged in the flashed firmware even after the checkout's history is
+/// later rewritten out from under it — a client-name scrub, say — so "not a
+/// commit here" and "an older commit here" want different fix lines: the
+/// first can't say how stale the flashed build is, only that it predates
+/// the rewrite.
 fn check_firmware_version(hello: &HelloOutcome, saved: &state::State) -> Check {
     const N: u8 = 13;
     const NAME: &str = "dev-bench firmware matches the local checkout";
@@ -2125,11 +2164,18 @@ fn check_firmware_version(hello: &HelloOutcome, saved: &state::State) -> Check {
         HelloOutcome::Unavailable(why) => return check(N, NAME, Status::Warn, format!("skipped — {why}")),
     };
     let Some(repo_path) = dev_bench_repo_path(saved) else {
-        return check(
-            N,
-            NAME,
-            Status::Warn,
-            "skipped — no embarch-dev-bench checkout configured",
+        return with_code(
+            with_fix(
+                check(
+                    N,
+                    NAME,
+                    Status::Fail,
+                    "a dev-bench answered, but no embarch-dev-bench checkout is configured to compare it \
+                     against — this check cannot catch stale firmware until one is",
+                ),
+                "run `embarch setup --dev-bench-repo <path-to-your-embarch-dev-bench-checkout>`",
+            ),
+            "not-configured",
         );
     };
 
@@ -2144,24 +2190,48 @@ fn check_firmware_version(hello: &HelloOutcome, saved: &state::State) -> Check {
     };
 
     match &ack.firmware_version {
-        Some(remote) if *remote == local_version => {
-            check(N, NAME, Status::Pass, format!("firmware_version '{remote}' matches {}", repo_path.display()))
-        }
-        Some(remote) => with_fix(
-            check(
-                N,
-                NAME,
-                Status::Fail,
+        Some(remote) if *remote == local_version => with_code(
+            check(N, NAME, Status::Pass, format!("firmware_version '{remote}' matches {}", repo_path.display())),
+            "match",
+        ),
+        Some(remote) if git_object_known(&repo_path, remote) => with_code(
+            with_fix(
+                check(
+                    N,
+                    NAME,
+                    Status::Fail,
+                    format!(
+                        "dev-bench reports firmware_version '{remote}', but {} is at '{local_version}'",
+                        repo_path.display()
+                    ),
+                ),
                 format!(
-                    "dev-bench reports firmware_version '{remote}', but {} is at '{local_version}'",
+                    "rebuild and reflash dev-bench from {}: `west build -b <board> app && west flash` \
+                     (or, for a board using embarch-core's native flashing support, `embarch-api flash`)",
                     repo_path.display()
                 ),
             ),
-            format!(
-                "rebuild and reflash dev-bench from {}: `west build -b <board> app && west flash` \
-                 (or, for a board using embarch-core's native flashing support, `embarch-api flash`)",
-                repo_path.display()
+            "stale",
+        ),
+        Some(remote) => with_code(
+            with_fix(
+                check(
+                    N,
+                    NAME,
+                    Status::Fail,
+                    format!(
+                        "dev-bench reports firmware_version '{remote}', which is not a commit, tag or reflog \
+                         entry in {} — its history no longer contains whatever was flashed (a rewrite, e.g. a \
+                         scrub, is the likely cause), so this can't say how stale the build is",
+                        repo_path.display()
+                    ),
+                ),
+                format!(
+                    "rebuild and reflash dev-bench from {}; '{remote}' can't be traced back any further than that",
+                    repo_path.display()
+                ),
             ),
+            "unresolvable",
         ),
         None => check(N, NAME, Status::Warn, format!("unexpected /dev-bench/hello response: {}", ack.raw)),
     }
@@ -3430,6 +3500,110 @@ mod tests {
     fn git_describe_errors_outside_a_git_checkout() {
         let dir = tempdir();
         assert!(git_describe(dir.path()).is_err());
+    }
+
+    #[test]
+    fn git_object_known_is_true_for_the_repos_own_head() {
+        let dir = tempdir();
+        init_repo(dir.path());
+        let head = git_describe(dir.path()).unwrap();
+        assert!(git_object_known(dir.path(), &head));
+    }
+
+    #[test]
+    fn git_object_known_is_false_for_a_hash_no_history_rewrite_left_behind() {
+        let dir = tempdir();
+        init_repo(dir.path());
+        // Same shape `--abbrev=8` produces, but not a commit this repo has —
+        // umbrella/037's exact finding: a firmware_version whose history was
+        // rewritten out from under the checkout it was built from.
+        assert!(!git_object_known(dir.path(), "49958d34"));
+    }
+
+    #[test]
+    fn git_object_known_strips_the_dirty_suffix_and_the_tag_prefix() {
+        let dir = tempdir();
+        init_repo(dir.path());
+        let head = git_describe(dir.path()).unwrap();
+        assert!(git_object_known(dir.path(), &format!("{head}-dirty")));
+        // A lightweight tag doesn't change `git describe`'s output (no
+        // `--tags` flag, matching `git_describe`'s own invocation), so make
+        // it annotated to actually exercise the `<tag>-<n>-g<hash>` form.
+        git(dir.path(), &["tag", "-a", "v1.0", "-m", "v1.0"]);
+        std::fs::write(dir.path().join("f.txt"), "2").unwrap();
+        git(dir.path(), &["add", "f.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "second"]);
+        let described = git_describe(dir.path()).unwrap();
+        assert!(described.starts_with("v1.0-1-g"), "{described}");
+        assert!(git_object_known(dir.path(), &described));
+    }
+
+    #[test]
+    fn check_13_fails_with_a_fix_when_no_checkout_is_configured() {
+        let ack = HelloAck {
+            schema_version: Some(15),
+            compatible: Some(true),
+            firmware_version: Some("abc12345".to_string()),
+            raw: "{}".to_string(),
+        };
+        let c = check_firmware_version(&HelloOutcome::Answered(ack), &state::State::default());
+        assert_eq!(c.status, Status::Fail);
+        assert_eq!(c.code, Some("not-configured"));
+        assert!(c.fix.unwrap().contains("setup --dev-bench-repo"));
+    }
+
+    #[test]
+    fn check_13_distinguishes_stale_from_unresolvable() {
+        let dir = tempdir();
+        init_repo(dir.path());
+        let head = git_describe(dir.path()).unwrap();
+        let saved = state::State { dev_bench_repo_path: Some(dir.path().to_path_buf()), ..Default::default() };
+
+        // Matches: pass.
+        let matching = check_firmware_version(
+            &HelloOutcome::Answered(HelloAck {
+                schema_version: Some(15),
+                compatible: Some(true),
+                firmware_version: Some(head.clone()),
+                raw: "{}".to_string(),
+            }),
+            &saved,
+        );
+        assert_eq!(matching.status, Status::Pass);
+        assert_eq!(matching.code, Some("match"));
+
+        // An older commit still in this history: an ordinary stale mismatch.
+        let first_commit = head.clone();
+        std::fs::write(dir.path().join("f.txt"), "2").unwrap();
+        git(dir.path(), &["add", "f.txt"]);
+        git(dir.path(), &["commit", "-q", "-m", "second"]);
+        let stale = check_firmware_version(
+            &HelloOutcome::Answered(HelloAck {
+                schema_version: Some(15),
+                compatible: Some(true),
+                firmware_version: Some(first_commit),
+                raw: "{}".to_string(),
+            }),
+            &saved,
+        );
+        assert_eq!(stale.status, Status::Fail);
+        assert_eq!(stale.code, Some("stale"));
+        assert!(stale.fix.unwrap().contains("rebuild and reflash"));
+
+        // A hash this history never contained at all: an unresolvable id,
+        // reported as such rather than as an ordinary mismatch.
+        let unresolvable = check_firmware_version(
+            &HelloOutcome::Answered(HelloAck {
+                schema_version: Some(15),
+                compatible: Some(true),
+                firmware_version: Some("49958d34".to_string()),
+                raw: "{}".to_string(),
+            }),
+            &saved,
+        );
+        assert_eq!(unresolvable.status, Status::Fail);
+        assert_eq!(unresolvable.code, Some("unresolvable"));
+        assert!(unresolvable.detail.contains("not a commit"));
     }
 
     #[test]
