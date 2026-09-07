@@ -13,6 +13,7 @@
 //! rule check 11 was violating for months by returning a hardcoded warn whose
 //! stated reason had stopped being true (decision 33).
 
+use std::error::Error as _;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -440,12 +441,44 @@ fn check_reachable(probe: &CoreProbe) -> Check {
 
 // ---- check 4: token resolves and matches -----------------------------------
 
-/// This check's own per-request budget — coincidentally the same value
-/// `embarch-topology`'s candidate-probing uses internally, but a separate
-/// constant: this is an *authenticated* request to an already-resolved
-/// `base_url`, not a topology candidate probe, so it has no reason to share
-/// that crate-internal value even if the number happens to match today.
-const AUTHED_GET_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+/// How long Core gets to answer a call it can serve **without opening a link
+/// to a board** — `GET /status` (check 4) and `GET /dev-bench/port`
+/// (check 12). Neither is a bare in-memory read: Core enumerates devices for
+/// both, `hardware::list_probes` for one and `resolve_dev_bench_port` for the
+/// other. What they share is what they do *not* do — no serial link opened,
+/// no `hw_lock` taken, nothing waited on from a board.
+///
+/// **Measured under this budget for `/status` only** [three live `embarch
+/// doctor` runs, 2026-09-06, primary `wsl-host` bench, both boards attached]:
+/// check 4 read a `200` every time. `/dev-bench/port`'s own enumeration has
+/// never been timed; it sits here because Core does the same *kind* of work
+/// for it, which is an argument and not a measurement (decision 44).
+///
+/// Deliberately short. `doctor` runs the whole chain and is already the heavy
+/// command (decision 11), and a Core that cannot finish a device scan in half
+/// a second is itself a finding. Coincidentally the same value
+/// `embarch-topology`'s candidate-probing uses internally, and still a
+/// separate constant: that number answers a different question and is free to
+/// move without dragging this one.
+const DEVICE_SCAN_GET_TIMEOUT: Duration = Duration::from_millis(500);
+
+/// How long Core gets to answer `GET /dev-bench/hello` (checks 11 and 13),
+/// which it cannot answer at all until it has **opened the bench's serial
+/// link, completed the `Hello`/`HelloAck` handshake, taken the boot log the
+/// bench flushes only after that ack (`embarch-core` decision 37), and closed
+/// the link again**. A budget sized for a device scan covers none of that,
+/// and this call inheriting [`DEVICE_SCAN_GET_TIMEOUT`] is why checks 11 and
+/// 13 reported *unavailable* on a bench that was handshaking three times out
+/// of three (decision 44, `tasks/umbrella/030`).
+///
+/// **Assumed, not measured.** No run on this bench or any other has produced
+/// a handshake *duration*, so what this value has to exceed is unknown; it is
+/// sized like [`MCP_HANDSHAKE_TIMEOUT`], this module's other assumed budget
+/// for another process's handshake, and sits under `embarch-api`'s 15 s
+/// `serial_timeout_secs` for a call that reads the same link. **A budget is
+/// spent only by a call that does not answer** — a handshake that completes
+/// returns when it completes, so a generous one costs a healthy run nothing.
+const LINK_HANDSHAKE_GET_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Everything `GET /status` answered with, parsed once
 /// ([embarch-core/interfaces.md](../embarch-core/interfaces.md)'s `/status`
@@ -465,16 +498,106 @@ struct AuthedStatus {
     core_version: Option<String>,
 }
 
-async fn authed_get(base_url: &str, path: &str, token: &str) -> Result<(u16, String), String> {
+/// Foreign text on one line: every run of whitespace — a newline included —
+/// collapsed to a single space, other control characters dropped.
+///
+/// Applied where this module *introduces* another program's words into a
+/// `detail`, which is where [decision 43](../embarch-doc/embarch-umbrella/decisions/reporting.md)
+/// says the normalisation belongs. This is that fix at one interpolation
+/// point, deliberately not the general one: check 1 interpolates
+/// `embarch-core --version`'s stdout and is still unnormalised
+/// (`tasks/umbrella/031`).
+fn one_line(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut pending_space = false;
+    for c in text.chars() {
+        if c.is_whitespace() {
+            pending_space = !out.is_empty();
+        } else if !c.is_control() {
+            if pending_space {
+                out.push(' ');
+                pending_space = false;
+            }
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// An error and every error below it, one line, outermost first.
+///
+/// `reqwest::Error`'s `Display` **drops its source**, so the message alone
+/// cannot say what went wrong underneath it. That is not a detail: three live
+/// runs printed `error sending request for url (…)` and the cause stayed a
+/// question afterwards, because that is what both a timed-out request and a
+/// refused connection render as (`tasks/umbrella/030`, and the test
+/// `reqwests_display_alone_does_not_say_which_failure_it_was` holds it).
+fn error_chain(e: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts = vec![e.to_string()];
+    let mut source = e.source();
+    while let Some(inner) = source {
+        parts.push(inner.to_string());
+        source = inner.source();
+    }
+    one_line(&parts.join(": "))
+}
+
+/// Which failure it was, in the words a reader can act on.
+///
+/// **A timed-out request names the budget it exceeded**, because that number
+/// is this module's own and is the thing to change; a refused connection
+/// names the connection, because nothing here can fix it. Timing out wins
+/// where both are set — a connect attempt that ran out the clock is a budget
+/// question first, and `is_connect` alone would hide the number.
+///
+/// Pure, and taking the two predicates rather than the error, so the naming
+/// is testable without a live socket for each arm.
+fn request_failure_verb(timed_out: bool, could_not_connect: bool, budget: Duration) -> String {
+    if timed_out {
+        format!("timed out after {} ms", budget.as_millis())
+    } else if could_not_connect {
+        "could not connect".to_string()
+    } else {
+        "failed".to_string()
+    }
+}
+
+/// The one sentence a reader of check 4, 11, 12 or 13 gets when a call to
+/// Core did not come back.
+///
+/// **The chain starts below `reqwest`'s own error, not at it.** That layer
+/// renders `error sending request for url (<url>)` and nothing more: the URL
+/// is already in this sentence and the verb now says what that layer would
+/// not, so repeating it would push the part that carries the diagnosis —
+/// `operation timed out`, `tcp connect error: …` — off the end of the line.
+/// Where there is no source, the error itself is still printed rather than
+/// dropped.
+fn describe_request_failure(url: &str, budget: Duration, e: &reqwest::Error) -> String {
+    let cause = e.source().map(error_chain).unwrap_or_else(|| one_line(&e.to_string()));
+    format!(
+        "request to {url} {}: {cause}",
+        request_failure_verb(e.is_timeout(), e.is_connect(), budget)
+    )
+}
+
+/// One authenticated `GET`, under the budget **the caller** chose.
+///
+/// The budget is a parameter and not a constant read in here, because it is a
+/// property of what Core must do before it can answer *that path* — not of
+/// the request. Until 2026-09-06 this function set one budget for every
+/// caller, and the single call that opens a serial link silently inherited
+/// the one sized for a device scan (decision 44). A parameter makes the next
+/// call site state which kind of call it is.
+async fn authed_get(base_url: &str, path: &str, token: &str, budget: Duration) -> Result<(u16, String), String> {
     let client = reqwest::Client::new();
     let url = format!("{}{path}", base_url.trim_end_matches('/'));
     let response = client
         .get(&url)
         .bearer_auth(token)
-        .timeout(AUTHED_GET_TIMEOUT)
+        .timeout(budget)
         .send()
         .await
-        .map_err(|e| format!("request to {url} failed: {e}"))?;
+        .map_err(|e| describe_request_failure(&url, budget, &e))?;
     let status = response.status().as_u16();
     let body = response.text().await.unwrap_or_default();
     Ok((status, body))
@@ -505,7 +628,7 @@ async fn check_token(probe: &CoreProbe, config: Option<&Config>) -> (Check, Opti
         }
     };
 
-    match authed_get(base_url, "/status", &token).await {
+    match authed_get(base_url, "/status", &token, DEVICE_SCAN_GET_TIMEOUT).await {
         Ok((200, body)) => {
             let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
             let probes = parsed
@@ -1557,6 +1680,10 @@ fn check_mcp(config_path: Option<&Path>, api: Option<&Located>, reg: &McpRegistr
 /// enough to handshake and closes it again, and Core guards it with a `409`
 /// against an in-flight study. Two checks asking separately would be two link
 /// opens for one answer.
+///
+/// **And it is fetched under [`LINK_HANDSHAKE_GET_TIMEOUT`], not the budget
+/// the reads use** — the same fact about this call, applied to how long it is
+/// waited for (decision 44).
 struct HelloAck {
     /// `embarch-study-designer`'s `DEV_BENCH_WIRE_SCHEMA_VERSION` as compiled
     /// into the firmware currently flashed on the bench.
@@ -1603,7 +1730,7 @@ async fn fetch_dev_bench_hello(
         Err(_) => return HelloOutcome::Unavailable("could not resolve token".to_string()),
     };
 
-    match authed_get(base_url, "/dev-bench/hello", &token).await {
+    match authed_get(base_url, "/dev-bench/hello", &token, LINK_HANDSHAKE_GET_TIMEOUT).await {
         Ok((200, body)) => {
             let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
             HelloOutcome::Answered(HelloAck {
@@ -1923,7 +2050,7 @@ async fn check_dev_bench(probe: &CoreProbe, authed: Option<&AuthedStatus>, confi
         Err(_) => return check(12, "dev-bench port detected", Status::Warn, "skipped — could not resolve token"),
     };
 
-    match authed_get(base_url, "/dev-bench/port", &token).await {
+    match authed_get(base_url, "/dev-bench/port", &token, DEVICE_SCAN_GET_TIMEOUT).await {
         Ok((200, body)) => check(12, "dev-bench port detected", Status::Pass, format!("detected: {body}")),
         Ok((404, _)) => check(12, "dev-bench port detected", Status::Pass, "not plugged in (expected if you have no bench)"),
         Ok((status, body)) => check(12, "dev-bench port detected", Status::Warn, format!("HTTP {status}: {body}")),
@@ -5041,5 +5168,176 @@ mod tests {
              (a long string needs a trailing `\\`):\n{}",
             offenders.join("\n")
         );
+    }
+
+    // ---- the two budgets, and saying which failure it was ------------------
+
+    /// A one-shot HTTP server that reads the request, waits `delay`, and only
+    /// then answers a minimal `200` — the shape of a Core that is doing real
+    /// work before it can reply. `std::net` and a thread, deliberately: this
+    /// crate has no HTTP-mock dev-dependency and needs none for a socket that
+    /// is merely slow.
+    fn slow_http_server(delay: Duration) -> (u16, std::thread::JoinHandle<()>) {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut buf = [0u8; 1024];
+                let _ = stream.read(&mut buf);
+                std::thread::sleep(delay);
+                let _ = stream.write_all(
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}",
+                );
+                let _ = stream.flush();
+            }
+        });
+        (port, handle)
+    }
+
+    /// A loopback port with nothing listening: bound to learn a free number,
+    /// then dropped, so a connect to it is refused rather than answered.
+    fn closed_port() -> u16 {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        listener.local_addr().unwrap().port()
+    }
+
+    /// The whole mechanism behind `tasks/umbrella/030`, host-side: an endpoint
+    /// that *does* answer is reported as unavailable when the budget is
+    /// shorter than the work, and the same call under a budget sized for the
+    /// work succeeds. Nothing here needs a bench — the failure was never about
+    /// one.
+    #[tokio::test]
+    async fn an_endpoint_slower_than_its_budget_fails_and_the_same_one_answers_under_a_wider_budget() {
+        let (port, server) = slow_http_server(Duration::from_millis(600));
+        let base = format!("http://127.0.0.1:{port}");
+        let err = authed_get(&base, "/dev-bench/hello", "t", Duration::from_millis(150))
+            .await
+            .unwrap_err();
+        assert!(err.starts_with(&format!("request to {base}/dev-bench/hello timed out after 150 ms: ")), "{err}");
+        // The URL once, not twice: `reqwest`'s own layer is skipped so the
+        // cause is what follows the colon.
+        assert_eq!(err.matches(&base).count(), 1, "{err}");
+        server.join().unwrap();
+
+        let (port, server) = slow_http_server(Duration::from_millis(600));
+        let base = format!("http://127.0.0.1:{port}");
+        let (status, _) = authed_get(&base, "/dev-bench/hello", "t", Duration::from_secs(5))
+            .await
+            .unwrap();
+        assert_eq!(status, 200);
+        server.join().unwrap();
+    }
+
+    /// The other arm: nothing is listening, so no budget would have helped,
+    /// and the message must not send the reader after the number.
+    #[tokio::test]
+    async fn a_refused_connection_says_so_instead_of_naming_the_budget() {
+        let base = format!("http://127.0.0.1:{}", closed_port());
+        let err = authed_get(&base, "/status", "t", Duration::from_millis(500))
+            .await
+            .unwrap_err();
+        assert!(err.contains("could not connect"), "{err}");
+        assert!(!err.contains("timed out"), "{err}");
+    }
+
+    /// **Why the fix had to touch the message and not only the constant.**
+    /// `reqwest::Error`'s `Display` drops its source, so a timeout and a
+    /// refusal render as the same sentence — which is exactly the string
+    /// three live `doctor` runs printed, leaving "timed out" and "never
+    /// connected" indistinguishable from the output alone. Pinned so a
+    /// reqwest that starts distinguishing them is noticed here rather than
+    /// leaving a message this module no longer needs to build.
+    #[tokio::test]
+    async fn reqwests_display_alone_does_not_say_which_failure_it_was() {
+        let client = reqwest::Client::new();
+        let (port, server) = slow_http_server(Duration::from_millis(600));
+        let timed_out = client
+            .get(format!("http://127.0.0.1:{port}/dev-bench/hello"))
+            .timeout(Duration::from_millis(150))
+            .send()
+            .await
+            .unwrap_err();
+        server.join().unwrap();
+        let refused = client
+            .get(format!("http://127.0.0.1:{}/status", closed_port()))
+            .timeout(Duration::from_millis(500))
+            .send()
+            .await
+            .unwrap_err();
+
+        assert!(timed_out.is_timeout(), "{timed_out}");
+        assert!(!refused.is_timeout(), "{refused}");
+        // Identical apart from the URL each one names — which is the whole
+        // finding, and is character-for-character the sentence the live runs
+        // printed.
+        let sentence = |e: &reqwest::Error| e.to_string().split(" (").next().unwrap().to_string();
+        assert_eq!(sentence(&timed_out), "error sending request for url");
+        assert_eq!(sentence(&timed_out), sentence(&refused));
+        for e in [&timed_out, &refused] {
+            let rendered = e.to_string();
+            for word in ["timed out", "timeout", "refused", "connect"] {
+                assert!(!rendered.contains(word), "{rendered} names {word} without its source");
+            }
+        }
+        // And the source chain does separate them, which is what
+        // `describe_request_failure` reads.
+        // `tcp connect error`, not the OS's own wording for a refusal, which
+        // is not the same sentence on every platform this binary ships to.
+        assert!(error_chain(&refused).contains("tcp connect error"), "{}", error_chain(&refused));
+    }
+
+    /// The naming rule, without a socket per arm: the budget is named only
+    /// where it is the actionable number, and a connect that also ran out the
+    /// clock is reported as the timeout it is.
+    #[test]
+    fn the_failure_verb_names_the_budget_only_when_the_clock_ran_out() {
+        let budget = Duration::from_millis(500);
+        assert_eq!(request_failure_verb(true, false, budget), "timed out after 500 ms");
+        assert_eq!(request_failure_verb(false, true, budget), "could not connect");
+        assert_eq!(request_failure_verb(true, true, budget), "timed out after 500 ms");
+        assert_eq!(request_failure_verb(false, false, budget), "failed");
+    }
+
+    /// Foreign text goes into `detail`, and `detail` is one line with no run
+    /// of two spaces (decision 43) — so the flattening happens where the
+    /// foreign text is introduced, not in the test that reads it back.
+    #[test]
+    fn an_error_chain_is_flattened_to_one_line() {
+        #[derive(Debug)]
+        struct Inner;
+        impl std::fmt::Display for Inner {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "os error 10060\n   after  two hops\r")
+            }
+        }
+        impl std::error::Error for Inner {}
+
+        #[derive(Debug)]
+        struct Outer(Inner);
+        impl std::fmt::Display for Outer {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "error sending request")
+            }
+        }
+        impl std::error::Error for Outer {
+            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let rendered = error_chain(&Outer(Inner));
+        assert_eq!(rendered, "error sending request: os error 10060 after two hops");
+        assert!(!rendered.contains("  "));
+        assert!(!rendered.contains('\n'));
+    }
+
+    /// The two budgets are two, and the wider one is the one the handshake
+    /// call gets. A constant is cheap to widen and cheap to collapse back
+    /// into one by accident; this is the statement that they are sized for
+    /// different work (decision 44).
+    #[test]
+    fn the_handshake_budget_is_its_own_and_is_wider_than_a_device_scan() {
+        assert!(LINK_HANDSHAKE_GET_TIMEOUT > DEVICE_SCAN_GET_TIMEOUT);
+        assert_eq!(DEVICE_SCAN_GET_TIMEOUT, Duration::from_millis(500));
     }
 }
