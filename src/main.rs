@@ -227,9 +227,19 @@ enum ProbeReport {
     NoToken(String),
     /// Core rejected the resolved token (`401`).
     Unauthorized,
-    /// The authenticated request didn't come back with a body to read at
-    /// all — a timeout, a connection drop, or a non-`200`/`401` status.
-    /// `String` is `crate::doctor`'s own description of the failure.
+    /// The authenticated request didn't come back with a count to read — a
+    /// timeout, a connection drop, a non-`200`/`401` status, **or a `200`
+    /// whose body carried no `probes` array**. `String` is
+    /// `crate::doctor`'s own description of the failure, or ours.
+    ///
+    /// That last case used to be `Count(0)`, via an `unwrap_or(0)` on the
+    /// parse. Decision 46's stated success condition is that a real zero and
+    /// "couldn't find out" never share a value, and a malformed `200` is
+    /// "couldn't find out" — so folding it into a count contradicted the
+    /// decision this same change filed. It reuses this state rather than
+    /// taking a sixth of its own, which is the narrower repair; a named
+    /// `bad-response` state is filed as an `inbox/` finding and is the
+    /// better shape.
     RequestFailed(String),
 }
 
@@ -262,13 +272,15 @@ async fn probe_report(base_url: Option<&str>) -> ProbeReport {
     };
 
     match crate::doctor::authed_get(base_url, "/status", &token, crate::doctor::DEVICE_SCAN_GET_TIMEOUT).await {
-        Ok((200, body)) => {
-            let count = serde_json::from_str::<serde_json::Value>(&body)
-                .ok()
-                .and_then(|v| v.get("probes").and_then(|p| p.as_array().map(Vec::len)))
-                .unwrap_or(0);
-            ProbeReport::Count(count)
-        }
+        Ok((200, body)) => match serde_json::from_str::<serde_json::Value>(&body)
+            .ok()
+            .and_then(|v| v.get("probes").and_then(|p| p.as_array().map(Vec::len)))
+        {
+            Some(count) => ProbeReport::Count(count),
+            None => ProbeReport::RequestFailed(
+                "Core answered HTTP 200 but its body carried no `probes` array".to_string(),
+            ),
+        },
         Ok((401, _)) => ProbeReport::Unauthorized,
         Ok((status, _)) => ProbeReport::RequestFailed(format!("Core answered HTTP {status}")),
         Err(reason) => ProbeReport::RequestFailed(reason),
