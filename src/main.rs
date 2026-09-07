@@ -1,11 +1,9 @@
 //! `embarch` — setup and diagnostics for the EmbArch suite.
 //!
-//! Design doc: ../embarch-doc/embarch-umbrella/design.md
-//! Execution plan: ../embarch-doc/embarch-umbrella/milestone-6.md
-//!
-//! Implemented so far: topology detection (§3.2), `setup` (§3.3), `init`,
-//! `up`/`down`, `doctor` (§3.4), and enough of `status` to be useful. §3.7
-//! (release CI) and §3.8 (dogfooding the guide) are what remains.
+//! Current truth is `embarch-doc/embarch-umbrella/spec.md`; why is
+//! `decisions.md`; what's left is `open.md`. Implemented so far: topology
+//! detection, `setup`, `init`, `up`/`down`, `doctor`, and `status`. Release CI
+//! and dogfooding the guide are what remains.
 
 mod config;
 mod deploy;
@@ -212,17 +210,83 @@ async fn main() {
     std::process::exit(code);
 }
 
+/// What `status` learned about Core's probe count, or why it couldn't.
+///
+/// A plain `Option<usize>` would make "zero probes plugged in" and "wasn't
+/// allowed to look" both render as `0` / `null` — the exact collapse
+/// `embarch-umbrella` decision 46 exists to rule out. Every non-`Count` state
+/// is its own reported fact, never silently folded into a count.
+enum ProbeReport {
+    /// Core answered `GET /status` with `200` and this many entries in
+    /// `probes` ([embarch-core/interfaces.md](../embarch-doc/embarch-core/interfaces.md)'s `/status` row).
+    Count(usize),
+    /// No candidate answered as Core at all — nothing to authenticate to.
+    Unreachable,
+    /// A token could not be resolved. `String` is the display of the
+    /// `anyhow::Error` `crate::token::resolve_token` returned.
+    NoToken(String),
+    /// Core rejected the resolved token (`401`).
+    Unauthorized,
+    /// The authenticated request didn't come back with a body to read at
+    /// all — a timeout, a connection drop, or a non-`200`/`401` status.
+    /// `String` is `crate::doctor`'s own description of the failure.
+    RequestFailed(String),
+}
+
+impl ProbeReport {
+    fn state_str(&self) -> &'static str {
+        match self {
+            ProbeReport::Count(_) => "ok",
+            ProbeReport::Unreachable => "unreachable",
+            ProbeReport::NoToken(_) => "no-token",
+            ProbeReport::Unauthorized => "unauthorized",
+            ProbeReport::RequestFailed(_) => "request-failed",
+        }
+    }
+}
+
+/// Ask the winning candidate for its probe count, the same way `doctor`
+/// check 5 does: resolve a token, one authenticated `GET /status`, read the
+/// `probes` array's length (decision 46). `status` has no `--config`, so
+/// unlike `doctor` this always resolves with no config override — the token
+/// env var or file discovery `crate::token::resolve_token` falls back to on
+/// its own.
+async fn probe_report(base_url: Option<&str>) -> ProbeReport {
+    let Some(base_url) = base_url else {
+        return ProbeReport::Unreachable;
+    };
+
+    let token = match crate::token::resolve_token(None, None) {
+        Ok(t) => t,
+        Err(e) => return ProbeReport::NoToken(format!("{e:#}")),
+    };
+
+    match crate::doctor::authed_get(base_url, "/status", &token, crate::doctor::DEVICE_SCAN_GET_TIMEOUT).await {
+        Ok((200, body)) => {
+            let count = serde_json::from_str::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| v.get("probes").and_then(|p| p.as_array().map(Vec::len)))
+                .unwrap_or(0);
+            ProbeReport::Count(count)
+        }
+        Ok((401, _)) => ProbeReport::Unauthorized,
+        Ok((status, _)) => ProbeReport::RequestFailed(format!("Core answered HTTP {status}")),
+        Err(reason) => ProbeReport::RequestFailed(reason),
+    }
+}
+
 /// Find Core and report where it is. Returns the process exit code.
 async fn status(json: bool, host: Option<&str>, port: u16) -> i32 {
-    // embarch-topology/design.md decisions 2, 3: live, in-process, every
-    // call — this crate no longer owns any of the WSL2/gateway/probe I/O
-    // itself (formerly this file's own use of `env.rs`/`probe.rs`/`topology.rs`).
+    // embarch-topology decisions 2, 3: live, in-process, every call — this
+    // crate no longer owns any of the WSL2/gateway/probe I/O itself (formerly
+    // this file's own use of `env.rs`/`probe.rs`/`topology.rs`).
     let resolved = embarch_topology::software::resolve_software_topology(port, host, None).await;
+    let probes = probe_report(resolved.base_url()).await;
 
     if json {
-        println!("{}", status_json(&resolved.attempts));
+        println!("{}", status_json(&resolved.attempts, &probes));
     } else {
-        print_status(&resolved.attempts);
+        print_status(&resolved.attempts, &probes);
     }
 
     if resolved.winner.is_some() {
@@ -241,7 +305,7 @@ fn outcome_str(outcome: ProbeOutcome) -> String {
     }
 }
 
-fn print_status(attempts: &[Attempt]) {
+fn print_status(attempts: &[Attempt], probes: &ProbeReport) {
     match winner(attempts) {
         Some(found) => {
             println!(
@@ -249,10 +313,19 @@ fn print_status(attempts: &[Attempt]) {
                 found.candidate.base_url,
                 found.candidate.class.as_str()
             );
-            // Not a warning about Core — a statement about how far this
-            // command currently looks. Probe listing and a real token check
-            // arrive with milestone-6.md §3.3/§3.4.
-            println!("  auth: not checked (this probe is unauthenticated)");
+            match probes {
+                ProbeReport::Count(n) => println!("  probes: {n}"),
+                ProbeReport::NoToken(reason) => {
+                    println!("  probes: unknown — no token ({reason})");
+                }
+                ProbeReport::Unauthorized => {
+                    println!("  probes: unknown — Core rejected the token (401)");
+                }
+                ProbeReport::RequestFailed(reason) => {
+                    println!("  probes: unknown — {reason}");
+                }
+                ProbeReport::Unreachable => unreachable!("a winner implies a base_url"),
+            }
         }
         None => {
             println!("Core: not found");
@@ -275,7 +348,26 @@ fn print_status(attempts: &[Attempt]) {
     }
 }
 
-fn status_json(attempts: &[Attempt]) -> String {
+/// `probes` is always present and is `{"state": ..., "count": ...}` rather
+/// than a bare nullable number, so "no probes" and "couldn't find out" don't
+/// collapse into the same `0`/`null` a consumer would have to guess between
+/// (decision 46). `count` is only non-null for `state: "ok"`.
+fn probes_json(probes: &ProbeReport) -> serde_json::Value {
+    let reason = match probes {
+        ProbeReport::Count(_) | ProbeReport::Unreachable | ProbeReport::Unauthorized => None,
+        ProbeReport::NoToken(reason) | ProbeReport::RequestFailed(reason) => Some(reason.clone()),
+    };
+    serde_json::json!({
+        "state": probes.state_str(),
+        "count": match probes {
+            ProbeReport::Count(n) => Some(*n),
+            _ => None,
+        },
+        "reason": reason,
+    })
+}
+
+fn status_json(attempts: &[Attempt], probes: &ProbeReport) -> String {
     let found = winner(attempts);
     serde_json::json!({
         "reachable": found.is_some(),
@@ -285,6 +377,7 @@ fn status_json(attempts: &[Attempt]) -> String {
             ProbeOutcome::Core { authorized } => Some(authorized),
             _ => None,
         }),
+        "probes": probes_json(probes),
         "attempts": attempts.iter().map(|a| serde_json::json!({
             "base_url": a.candidate.base_url,
             "topology": a.candidate.class.as_str(),
@@ -292,4 +385,84 @@ fn status_json(attempts: &[Attempt]) -> String {
         })).collect::<Vec<_>>(),
     })
     .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use embarch_topology::software::{Candidate, TopologyClass};
+
+    fn core_attempt(authorized: bool) -> Attempt {
+        Attempt {
+            candidate: Candidate { class: TopologyClass::Local, base_url: "http://127.0.0.1:4884".to_string() },
+            outcome: ProbeOutcome::Core { authorized },
+        }
+    }
+
+    fn unreachable_attempt() -> Attempt {
+        Attempt {
+            candidate: Candidate { class: TopologyClass::Local, base_url: "http://127.0.0.1:4884".to_string() },
+            outcome: ProbeOutcome::Unreachable,
+        }
+    }
+
+    /// A found Core with a resolved token and probes attached reports the
+    /// count, distinctly from either "unknown" state below — the shape
+    /// `embarch-umbrella` decision 46 and the spec.md row it closes require.
+    #[test]
+    fn json_reports_the_probe_count_when_core_and_a_token_are_both_found() {
+        let attempts = vec![core_attempt(true)];
+        let json = status_json(&attempts, &ProbeReport::Count(3));
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["reachable"], true);
+        assert_eq!(v["probes"]["state"], "ok");
+        assert_eq!(v["probes"]["count"], 3);
+        assert!(v["probes"]["reason"].is_null());
+    }
+
+    /// Reachable but no token resolves is its own state — never a probe
+    /// count of `0`, which is indistinguishable from "found Core, no probes
+    /// plugged in" (the task's own "must be its own reported state" rule).
+    #[test]
+    fn json_reports_no_token_as_its_own_state_not_a_zero_count() {
+        let attempts = vec![core_attempt(false)];
+        let reason = "no EMBARCH_TOKEN, no token file".to_string();
+        let json = status_json(&attempts, &ProbeReport::NoToken(reason.clone()));
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["reachable"], true);
+        assert_eq!(v["probes"]["state"], "no-token");
+        assert!(v["probes"]["count"].is_null());
+        assert_eq!(v["probes"]["reason"], reason);
+    }
+
+    /// Core rejecting the resolved token is distinct from not having one at
+    /// all, and from a plain unreachable Core.
+    #[test]
+    fn json_reports_unauthorized_as_its_own_state() {
+        let attempts = vec![core_attempt(false)];
+        let json = status_json(&attempts, &ProbeReport::Unauthorized);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["probes"]["state"], "unauthorized");
+        assert!(v["probes"]["count"].is_null());
+    }
+
+    /// No candidate answered as Core at all: `reachable: false`, and probes
+    /// report `unreachable` rather than any of the found-Core states.
+    #[test]
+    fn json_reports_unreachable_when_no_candidate_is_core() {
+        let attempts = vec![unreachable_attempt()];
+        let json = status_json(&attempts, &ProbeReport::Unreachable);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["reachable"], false);
+        assert_eq!(v["probes"]["state"], "unreachable");
+        assert!(v["probes"]["count"].is_null());
+    }
+
+    /// `probe_report` on an unresolved base URL never touches the network —
+    /// it must short-circuit to `Unreachable` before making a request.
+    #[tokio::test]
+    async fn probe_report_is_unreachable_with_no_base_url() {
+        let report = probe_report(None).await;
+        assert_eq!(report.state_str(), "unreachable");
+    }
 }

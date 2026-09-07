@@ -460,7 +460,7 @@ fn check_reachable(probe: &CoreProbe) -> Check {
 /// `embarch-topology`'s candidate-probing uses internally, and still a
 /// separate constant: that number answers a different question and is free to
 /// move without dragging this one.
-const DEVICE_SCAN_GET_TIMEOUT: Duration = Duration::from_millis(500);
+pub(crate) const DEVICE_SCAN_GET_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// How long Core gets to answer `GET /dev-bench/hello` (checks 11 and 13),
 /// which it cannot answer at all until it has **opened the bench's serial
@@ -590,7 +590,12 @@ fn describe_request_failure(url: &str, budget: Duration, e: &reqwest::Error) -> 
 /// caller, and the single call that opens a serial link silently inherited
 /// the one sized for a device scan (decision 44). A parameter makes the next
 /// call site state which kind of call it is.
-async fn authed_get(base_url: &str, path: &str, token: &str, budget: Duration) -> Result<(u16, String), String> {
+///
+/// `pub(crate)`: `main.rs`'s `status` command shares this and
+/// [`DEVICE_SCAN_GET_TIMEOUT`] rather than opening a second `reqwest` client
+/// and a second copy of the failure-describing logic for the same
+/// authenticated `GET /status` call (decision 46).
+pub(crate) async fn authed_get(base_url: &str, path: &str, token: &str, budget: Duration) -> Result<(u16, String), String> {
     let client = reqwest::Client::new();
     let url = format!("{}{path}", base_url.trim_end_matches('/'));
     let response = client
