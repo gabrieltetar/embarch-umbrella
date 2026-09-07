@@ -228,19 +228,22 @@ enum ProbeReport {
     /// Core rejected the resolved token (`401`).
     Unauthorized,
     /// The authenticated request didn't come back with a count to read — a
-    /// timeout, a connection drop, a non-`200`/`401` status, **or a `200`
-    /// whose body carried no `probes` array**. `String` is
+    /// timeout, a connection drop, or a non-`200`/`401` status. `String` is
     /// `crate::doctor`'s own description of the failure, or ours.
-    ///
-    /// That last case used to be `Count(0)`, via an `unwrap_or(0)` on the
-    /// parse. Decision 46's stated success condition is that a real zero and
-    /// "couldn't find out" never share a value, and a malformed `200` is
-    /// "couldn't find out" — so folding it into a count contradicted the
-    /// decision this same change filed. It reuses this state rather than
-    /// taking a sixth of its own, which is the narrower repair; a named
-    /// `bad-response` state is filed as an `inbox/` finding and is the
-    /// better shape.
     RequestFailed(String),
+    /// Core answered `200` but its body carried no `probes` array. The
+    /// request itself succeeded — Core is up and answering — so this is
+    /// distinct from `RequestFailed`: a `--json` consumer that retries on
+    /// `request-failed` would retry this forever, against a Core that
+    /// isn't failing. `String` is our own description of what was wrong
+    /// with the body.
+    ///
+    /// This used to be folded into `RequestFailed` under the same label
+    /// (`embarch-umbrella` `5c92ea0`), which fixed the value collapse
+    /// decision 46 rules out but left a wrong label — the state that
+    /// determines whether a machine consumer retries — behind
+    /// (`embarch-umbrella` task 039).
+    BadResponse(String),
 }
 
 impl ProbeReport {
@@ -251,6 +254,7 @@ impl ProbeReport {
             ProbeReport::NoToken(_) => "no-token",
             ProbeReport::Unauthorized => "unauthorized",
             ProbeReport::RequestFailed(_) => "request-failed",
+            ProbeReport::BadResponse(_) => "bad-response",
         }
     }
 }
@@ -272,18 +276,28 @@ async fn probe_report(base_url: Option<&str>) -> ProbeReport {
     };
 
     match crate::doctor::authed_get(base_url, "/status", &token, crate::doctor::DEVICE_SCAN_GET_TIMEOUT).await {
-        Ok((200, body)) => match serde_json::from_str::<serde_json::Value>(&body)
+        Ok((status, body)) => interpret_probe_response(status, &body),
+        Err(reason) => ProbeReport::RequestFailed(reason),
+    }
+}
+
+/// Turn a `/status` response's status code and body into a `ProbeReport`.
+/// Split out of `probe_report` so the `200`-with-no-`probes`-array case
+/// (`BadResponse`, `embarch-umbrella` task 039) can be tested without a
+/// real socket or a resolved token.
+fn interpret_probe_response(status: u16, body: &str) -> ProbeReport {
+    match status {
+        200 => match serde_json::from_str::<serde_json::Value>(body)
             .ok()
             .and_then(|v| v.get("probes").and_then(|p| p.as_array().map(Vec::len)))
         {
             Some(count) => ProbeReport::Count(count),
-            None => ProbeReport::RequestFailed(
+            None => ProbeReport::BadResponse(
                 "Core answered HTTP 200 but its body carried no `probes` array".to_string(),
             ),
         },
-        Ok((401, _)) => ProbeReport::Unauthorized,
-        Ok((status, _)) => ProbeReport::RequestFailed(format!("Core answered HTTP {status}")),
-        Err(reason) => ProbeReport::RequestFailed(reason),
+        401 => ProbeReport::Unauthorized,
+        status => ProbeReport::RequestFailed(format!("Core answered HTTP {status}")),
     }
 }
 
@@ -336,6 +350,9 @@ fn print_status(attempts: &[Attempt], probes: &ProbeReport) {
                 ProbeReport::RequestFailed(reason) => {
                     println!("  probes: unknown — {reason}");
                 }
+                ProbeReport::BadResponse(reason) => {
+                    println!("  probes: unknown — {reason}");
+                }
                 ProbeReport::Unreachable => unreachable!("a winner implies a base_url"),
             }
         }
@@ -367,7 +384,9 @@ fn print_status(attempts: &[Attempt], probes: &ProbeReport) {
 fn probes_json(probes: &ProbeReport) -> serde_json::Value {
     let reason = match probes {
         ProbeReport::Count(_) | ProbeReport::Unreachable | ProbeReport::Unauthorized => None,
-        ProbeReport::NoToken(reason) | ProbeReport::RequestFailed(reason) => Some(reason.clone()),
+        ProbeReport::NoToken(reason)
+        | ProbeReport::RequestFailed(reason)
+        | ProbeReport::BadResponse(reason) => Some(reason.clone()),
     };
     serde_json::json!({
         "state": probes.state_str(),
@@ -476,5 +495,32 @@ mod tests {
     async fn probe_report_is_unreachable_with_no_base_url() {
         let report = probe_report(None).await;
         assert_eq!(report.state_str(), "unreachable");
+    }
+
+    /// The request succeeded — Core is up, authenticated, and answered
+    /// `200` — but the body carries no `probes` array. This must not read
+    /// as `request-failed`: that label is what a `--json` consumer switches
+    /// on to decide whether to retry, and retrying this gets the same
+    /// answer forever (`embarch-umbrella` task 039).
+    #[test]
+    fn a_200_with_no_probes_array_is_bad_response_not_request_failed() {
+        let report = interpret_probe_response(200, "{}");
+        assert_eq!(report.state_str(), "bad-response");
+        assert_ne!(report.state_str(), "request-failed");
+
+        let attempts = vec![core_attempt(true)];
+        let json = status_json(&attempts, &report);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["probes"]["state"], "bad-response");
+        assert!(v["probes"]["count"].is_null());
+        assert!(v["probes"]["reason"].as_str().unwrap().contains("no `probes` array"));
+    }
+
+    /// A non-`200`/`401` status is still the transport-failure state:
+    /// `interpret_probe_response`'s two outcomes stay distinct.
+    #[test]
+    fn a_non_200_status_is_still_request_failed() {
+        let report = interpret_probe_response(500, "");
+        assert_eq!(report.state_str(), "request-failed");
     }
 }
