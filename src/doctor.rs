@@ -389,7 +389,27 @@ fn check_binaries(
 
 // ---- check 2: service installed and running --------------------------------
 
-fn check_service(probe: &CoreProbe, host: Option<&str>, core: Option<&Located>) -> Check {
+/// `config_host` and `saved_host` arrive separately — never pre-merged —
+/// **so the Fail detail can name which one it read.** `setup::infer_class`
+/// itself only wants "a host or none", but `config.core.host` is the
+/// operator's current word and `saved.host` is `apply_plan`'s sticky
+/// leftover from an earlier `setup` run for *any* class (`open.md`); a
+/// `Fail` that only ever said "not reachable" sent an operator on a `wsl-host`
+/// bench chasing "on another machine" with nothing to tell them the class
+/// came from a stale flag, not the bench they're standing at.
+///
+/// **Deliberately does not fix that staleness.** `saved.host` still feeds
+/// `infer_class` exactly as before and nothing here clears it — the verdict
+/// and every fix line are unchanged. Naming the evidence is the harmless
+/// half; changing what `saved.host` does would be a behaviour change on real
+/// machines made on a guess, and `open.md` records that as withheld on
+/// purpose.
+fn check_service(
+    probe: &CoreProbe,
+    config_host: Option<&str>,
+    saved_host: Option<&str>,
+    core: Option<&Located>,
+) -> Check {
     if probe.winner_base_url.is_some() {
         return check(
             2,
@@ -400,7 +420,30 @@ fn check_service(probe: &CoreProbe, host: Option<&str>, core: Option<&Located>) 
         );
     }
 
+    let host = config_host.or(saved_host);
     let class = setup::infer_class(host, core);
+
+    // What let this check conclude `class` — read off the same two inputs
+    // `infer_class` was fed, not re-derived from `class` itself, so the
+    // sentence names the actual evidence rather than restating the verdict.
+    let host_evidence = match (config_host, saved_host) {
+        (Some(h), _) => Some(format!("`config.core.host` of `{h}`")),
+        (None, Some(h)) => Some(format!(
+            "a saved `--host` of `{h}`, recorded by an earlier `setup`"
+        )),
+        (None, None) => None,
+    };
+    let detail = match class {
+        TopologyClass::Remote => format!(
+            "inferred `remote` from {}",
+            host_evidence.unwrap_or_else(|| "a host override".to_string())
+        ),
+        TopologyClass::WslHost => "inferred `wsl-host`: no `--host` override, and embarch-core \
+                                    resolved to a Windows binary reached through WSL2"
+            .to_string(),
+        TopologyClass::Local => "inferred `local`: no `--host` override".to_string(),
+    };
+
     let fix = match (class, core) {
         (TopologyClass::Remote, _) => {
             "Core runs on another machine. On that machine: `embarch-core install` (elevated).".to_string()
@@ -420,7 +463,7 @@ fn check_service(probe: &CoreProbe, host: Option<&str>, core: Option<&Located>) 
         (_, None) => "embarch-core not found — run `embarch setup` first.".to_string(),
     };
     with_fix(
-        check(2, "Core service installed, and running", Status::Fail, "not reachable"),
+        check(2, "Core service installed, and running", Status::Fail, detail),
         fix,
     )
 }
@@ -3015,7 +3058,13 @@ pub async fn doctor(json: bool) -> i32 {
     let config_path = config::find_config_path();
     let (check6, config) = check_config(config_path.as_deref());
 
-    let host = config.as_ref().and_then(|c| c.core.host.clone()).or(saved.host.clone());
+    // Kept apart rather than merged: check 2 wants to say which one it read
+    // when it fails, and `infer_class` below is content with `host`, their
+    // usual merge (`config.core.host`, falling back to `apply_plan`'s sticky
+    // `saved.host`).
+    let config_host = config.as_ref().and_then(|c| c.core.host.clone());
+    let saved_host = saved.host.clone();
+    let host = config_host.clone().or(saved_host.clone());
     let port = config.as_ref().map(|c| c.core.port).unwrap_or(topology::DEFAULT_CORE_PORT);
 
     let core_probe = probe_topology(config.as_ref(), host.as_deref(), port).await;
@@ -3037,7 +3086,7 @@ pub async fn doctor(json: bool) -> i32 {
         api_version_output.as_deref(),
         core_class,
     );
-    let check2 = check_service(&core_probe, host.as_deref(), core.as_ref());
+    let check2 = check_service(&core_probe, config_host.as_deref(), saved_host.as_deref(), core.as_ref());
     let check3 = check_reachable(&core_probe);
     let (check4, authed) = check_token(&core_probe, config.as_ref()).await;
     // Decision 18: the USB-tree read only means something where Core
@@ -3375,6 +3424,114 @@ mod tests {
         );
         assert!(denied.is_err());
         assert_eq!(tries.get(), 1);
+    }
+
+    // ---- check 2: service installed and running -----------------------------
+
+    fn a_reached_probe(class: TopologyClass) -> CoreProbe {
+        CoreProbe {
+            winner_base_url: Some("http://127.0.0.1:4884".to_string()),
+            winner_class: Some(class),
+            attempts: Vec::new(),
+        }
+    }
+
+    fn nothing_answered_probe() -> CoreProbe {
+        CoreProbe {
+            winner_base_url: None,
+            winner_class: None,
+            attempts: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn check_2_passes_whenever_something_answered_whatever_class_it_is() {
+        let core = a_located("/usr/local/bin/embarch-core", false);
+        for class in [TopologyClass::Local, TopologyClass::WslHost, TopologyClass::Remote] {
+            let c = check_service(&a_reached_probe(class), None, None, Some(&core));
+            assert_eq!(c.status, Status::Pass);
+        }
+    }
+
+    #[test]
+    fn check_2_names_config_host_as_the_remote_evidence() {
+        let c = check_service(&nothing_answered_probe(), Some("bench.local"), None, None);
+        assert_eq!(c.status, Status::Fail);
+        assert!(
+            c.detail.contains("inferred `remote` from `config.core.host` of `bench.local`"),
+            "{}",
+            c.detail
+        );
+        assert!(c.fix.as_deref().unwrap().contains("On that machine"));
+    }
+
+    /// The bug this task exists for: a `saved.host` left over from an
+    /// earlier `setup`, with no `config.core.host` to explain it, used to
+    /// render the same bare "not reachable" a genuinely down Core would. The
+    /// detail now says which input it read and where it came from — without
+    /// changing the verdict or the fix line, which `saved.host` still drives
+    /// exactly as before.
+    #[test]
+    fn check_2_names_a_sticky_saved_host_as_the_remote_evidence() {
+        let c = check_service(&nothing_answered_probe(), None, Some("bench.local"), None);
+        assert_eq!(c.status, Status::Fail);
+        assert!(
+            c.detail.contains(
+                "inferred `remote` from a saved `--host` of `bench.local`, recorded by an \
+                 earlier `setup`"
+            ),
+            "{}",
+            c.detail
+        );
+        // Unchanged: the fix line still names "another machine", the same
+        // sentence check 2 has always printed for `remote`.
+        assert!(c.fix.as_deref().unwrap().contains("On that machine"));
+    }
+
+    /// `config.core.host` wins the naming when both are present — it is what
+    /// `infer_class` itself reads first (`host = config_host.or(saved_host)`).
+    #[test]
+    fn check_2_prefers_config_host_over_a_saved_host_when_both_are_set() {
+        let c = check_service(
+            &nothing_answered_probe(),
+            Some("current.local"),
+            Some("stale.local"),
+            None,
+        );
+        assert!(c.detail.contains("`config.core.host` of `current.local`"));
+        assert!(!c.detail.contains("stale.local"));
+    }
+
+    #[test]
+    fn check_2_fails_wsl_host_with_no_host_override_and_a_windows_binary() {
+        let win_core = a_located("/mnt/c/Program Files/embarch/embarch-core.exe", true);
+        let c = check_service(&nothing_answered_probe(), None, None, Some(&win_core));
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.detail.contains("inferred `wsl-host`"), "{}", c.detail);
+        assert!(c.fix.as_deref().unwrap().contains("elevated Windows"));
+    }
+
+    #[test]
+    fn check_2_fails_local_with_no_host_override_and_a_local_binary() {
+        let core = a_located("/usr/local/bin/embarch-core", false);
+        let c = check_service(&nothing_answered_probe(), None, None, Some(&core));
+        assert_eq!(c.status, Status::Fail);
+        assert!(c.detail.contains("inferred `local`"), "{}", c.detail);
+        assert!(c.fix.as_deref().unwrap().contains("sudo"));
+    }
+
+    #[test]
+    fn check_2_fails_no_binary_found_regardless_of_the_class_it_inferred() {
+        let c = check_service(&nothing_answered_probe(), None, None, None);
+        assert_eq!(c.status, Status::Fail);
+        // No host and no binary infers `local` (setup::infer_class's default),
+        // and the detail still says so — it is the fix line, not the
+        // detail, that special-cases "no binary located".
+        assert!(c.detail.contains("inferred `local`"), "{}", c.detail);
+        assert_eq!(
+            c.fix.as_deref(),
+            Some("embarch-core not found — run `embarch setup` first.")
+        );
     }
 
     // ---- check 5: attached-but-not-permitted (decision 18) -----------------
@@ -5148,9 +5305,11 @@ mod tests {
             attempts,
         };
         out.push(check_reachable(&nothing_answered));
-        for host in [None, Some("bench.local")] {
-            for c in [None, Some(&core), Some(&win_core)] {
-                out.push(check_service(&nothing_answered, host, c));
+        for config_host in [None, Some("bench.local")] {
+            for saved_host in [None, Some("stale.local")] {
+                for c in [None, Some(&core), Some(&win_core)] {
+                    out.push(check_service(&nothing_answered, config_host, saved_host, c));
+                }
             }
         }
         for class in classes {
@@ -5160,7 +5319,7 @@ mod tests {
                 attempts: Vec::new(),
             };
             out.push(check_reachable(&reached));
-            out.push(check_service(&reached, None, Some(&core)));
+            out.push(check_service(&reached, None, None, Some(&core)));
         }
 
         // ---- check 5 --------------------------------------------------------
