@@ -511,12 +511,13 @@ struct AuthedStatus {
 /// Foreign text on one line: every run of whitespace — a newline included —
 /// collapsed to a single space, other control characters dropped.
 ///
-/// Applied where this module *introduces* another program's words into a
-/// `detail`, which is where [decision 43](../embarch-doc/embarch-umbrella/decisions/reporting.md)
-/// says the normalisation belongs. This is that fix at one interpolation
-/// point, deliberately not the general one: check 1 interpolates
-/// `embarch-core --version`'s stdout and is still unnormalised
-/// (`tasks/umbrella/031`).
+/// Applied at **every** point where this module introduces another program's
+/// words into a `detail`, which is where
+/// [decision 43](../embarch-doc/embarch-umbrella/decisions/message-rendering.md)
+/// says the normalisation belongs. `tasks/umbrella/031` closed the general
+/// case: check 1 — which interpolates `embarch-core --version`'s stdout — was
+/// the last unnormalised site, and its stdout half is `tasks/core/015`.
+///
 /// Collapses whitespace runs to one space, drops control characters, and
 /// consumes a whole ANSI CSI escape sequence (`ESC [ … final-byte`) rather
 /// than just the leading `ESC` — a bare control-character drop leaves the
