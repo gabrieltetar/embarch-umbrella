@@ -3102,6 +3102,14 @@ fn check_flash_backend(core: Option<&Located>, class: TopologyClass) -> Check {
         // topology it most needed to answer for — check 1 was itself wrong
         // there, and a reader who followed the pointer learned nothing about
         // flashing. It says what is missing and what would supply it.
+        //
+        // All three arms below are reachable only when *this run's own*
+        // class has no locatable core — i.e. before `setup` has finished for
+        // that class, which is the state `doctor` exists to diagnose rather
+        // than one anybody runs it a second time from. None is a verdict
+        // about flashing; each phrases the same "could not ask Core" for its
+        // class, and the wording differs because what a reader should check
+        // next differs by class (decision 31, task 032).
         let detail = match class {
             TopologyClass::Remote => {
                 "skipped — Core runs on another machine, and only its own binary can say \
