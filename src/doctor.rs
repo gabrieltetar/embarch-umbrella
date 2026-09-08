@@ -252,6 +252,14 @@ fn check_binaries(
     a_ver: Option<&str>,
     class: TopologyClass,
 ) -> Check {
+    // `c_ver`/`a_ver` are `--version`'s stdout, another program's output —
+    // normalised here, at the point this check starts building `detail` from
+    // it, so every arm below (the plain display and `manifest_mismatches`'
+    // echoed values alike) gets clean text (decision 43).
+    let c_ver = c_ver.map(one_line);
+    let a_ver = a_ver.map(one_line);
+    let c_ver = c_ver.as_deref();
+    let a_ver = a_ver.as_deref();
     match (core, api) {
         (Some(c), Some(a)) => {
             let c_display = c_ver.unwrap_or("version unknown");
@@ -509,10 +517,30 @@ struct AuthedStatus {
 /// point, deliberately not the general one: check 1 interpolates
 /// `embarch-core --version`'s stdout and is still unnormalised
 /// (`tasks/umbrella/031`).
+/// Collapses whitespace runs to one space, drops control characters, and
+/// consumes a whole ANSI CSI escape sequence (`ESC [ … final-byte`) rather
+/// than just the leading `ESC` — a bare control-character drop leaves the
+/// sequence's body (`2m`, `0m`, `33m`, …) behind as literal text, which is
+/// not what decision 43 means by "escapes stripped" (`embarch-umbrella`
+/// decision 43, `tasks/umbrella/031`).
 fn one_line(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut pending_space = false;
-    for c in text.chars() {
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' && chars.peek() == Some(&'[') {
+            chars.next(); // consume the '['
+            // Consume parameter/intermediate bytes through the final byte
+            // (0x40..=0x7E) that ends a CSI sequence. A malformed sequence
+            // with no final byte consumes to the end of the string, which is
+            // no worse than leaving an unterminated escape behind verbatim.
+            for nc in chars.by_ref() {
+                if ('@'..='~').contains(&nc) {
+                    break;
+                }
+            }
+            continue;
+        }
         if c.is_whitespace() {
             pending_space = !out.is_empty();
         } else if !c.is_control() {
@@ -668,7 +696,12 @@ async fn check_token(probe: &CoreProbe, config: Option<&Config>) -> (Check, Opti
         ),
         Ok((status, body)) => (
             with_fix(
-                check(4, "token resolves and matches", Status::Fail, format!("unexpected HTTP {status}: {body}")),
+                check(
+                    4,
+                    "token resolves and matches",
+                    Status::Fail,
+                    format!("unexpected HTTP {status}: {}", one_line(&body)),
+                ),
                 "this isn't a token problem — something answered but isn't behaving like Core",
             ),
             None,
@@ -1756,8 +1789,8 @@ async fn fetch_dev_bench_hello(
             })
         }
         Ok((404, _)) => HelloOutcome::NoBench,
-        Ok((409, body)) => HelloOutcome::Unavailable(format!("dev-bench is busy: {body}")),
-        Ok((status, body)) => HelloOutcome::Unavailable(format!("HTTP {status}: {body}")),
+        Ok((409, body)) => HelloOutcome::Unavailable(format!("dev-bench is busy: {}", one_line(&body))),
+        Ok((status, body)) => HelloOutcome::Unavailable(format!("HTTP {status}: {}", one_line(&body))),
         Err(e) => HelloOutcome::Unavailable(e),
     }
 }
@@ -2058,9 +2091,13 @@ async fn check_dev_bench(probe: &CoreProbe, authed: Option<&AuthedStatus>, confi
     };
 
     match authed_get(base_url, "/dev-bench/port", &token, DEVICE_SCAN_GET_TIMEOUT).await {
-        Ok((200, body)) => check(12, "dev-bench port detected", Status::Pass, format!("detected: {body}")),
+        Ok((200, body)) => {
+            check(12, "dev-bench port detected", Status::Pass, format!("detected: {}", one_line(&body)))
+        }
         Ok((404, _)) => check(12, "dev-bench port detected", Status::Pass, "not plugged in (expected if you have no bench)"),
-        Ok((status, body)) => check(12, "dev-bench port detected", Status::Warn, format!("HTTP {status}: {body}")),
+        Ok((status, body)) => {
+            check(12, "dev-bench port detected", Status::Warn, format!("HTTP {status}: {}", one_line(&body)))
+        }
         Err(e) => check(12, "dev-bench port detected", Status::Warn, e),
     }
 }
@@ -2233,7 +2270,12 @@ fn check_firmware_version(hello: &HelloOutcome, saved: &state::State) -> Check {
             ),
             "unresolvable",
         ),
-        None => check(N, NAME, Status::Warn, format!("unexpected /dev-bench/hello response: {}", ack.raw)),
+        None => check(
+            N,
+            NAME,
+            Status::Warn,
+            format!("unexpected /dev-bench/hello response: {}", one_line(&ack.raw)),
+        ),
     }
 }
 
@@ -5345,7 +5387,14 @@ mod tests {
             }
         }
         // The exemption, pinned so it cannot quietly widen to cover a real
-        // offender: check 6 is the only check that renders foreign text.
+        // offender. This is a statement about the *fixtures*, not the
+        // program: the trigger above is a literal `'\n'`, so what this
+        // actually exempts is "checks whose fixture corpus contains a
+        // newline" — check 6's caret diagram is the only one that does.
+        // Foreign text with a multi-space run and no newline is an offender
+        // today and this assertion cannot see it; that gap is closed at the
+        // interpolation point instead (decision 43, `tasks/umbrella/031`),
+        // not by widening this exemption.
         verbatim.sort_unstable();
         verbatim.dedup();
         assert_eq!(verbatim, vec![6]);
@@ -5357,6 +5406,41 @@ mod tests {
              (a long string needs a trailing `\\`):\n{}",
             offenders.join("\n")
         );
+
+        // `--json` carries no ANSI escapes from any check (decision 43) —
+        // verified across the whole corpus, not argued from one arm.
+        let mut escaped: Vec<String> = Vec::new();
+        for c in &verdicts {
+            for (field, text) in [("detail", Some(&c.detail)), ("fix", c.fix.as_ref())] {
+                let Some(text) = text else { continue };
+                if text.contains('\u{1b}') {
+                    escaped.push(format!("check {} {field}: {text:?}", c.n));
+                }
+            }
+        }
+        assert!(escaped.is_empty(), "an ANSI escape reached rendered text:\n{}", escaped.join("\n"));
+    }
+
+    /// **The runtime case decision 43 records**: check 1's judge, handed a
+    /// version string shaped like the deployed `embarch-core.exe`'s actual
+    /// stdout — a `tracing` warning with a newline, a multi-space run from
+    /// its own indentation, and ANSI colour codes — still renders one clean
+    /// line. `check_binaries` (not [`binary_version`]) is what this test
+    /// calls, because that is what the guard above tests and what a fixture
+    /// corpus can exercise without a subprocess.
+    #[test]
+    fn check_1_normalises_a_foreign_version_string() {
+        let core = a_located("/usr/local/bin/embarch-core", false);
+        let api = a_located("/usr/local/bin/embarch-api", false);
+        let dirty = "\u{1b}[2m2026-09-07T00:24:33.426655Z\u{1b}[0m \u{1b}[33m WARN\u{1b}[0m \
+                     \u{1b}[2membarch_core\u{1b}[0m\u{1b}[2m:\u{1b}[0m failed to set up daily-rolling \
+                     log file, falling back to stderr\n\nCaused by:\n    0: failed to create log \
+                     file: Access is denied. (os error 5)\nembarch-core 0.1.4";
+        let c = check_binaries(Some(&core), Some(&api), Some(dirty), Some("embarch-api 0.1.0"), TopologyClass::Local);
+        assert!(!c.detail.contains('\n'), "{}", c.detail);
+        assert!(!c.detail.contains("  "), "{}", c.detail);
+        assert!(!c.detail.contains('\u{1b}'), "{}", c.detail);
+        assert!(c.detail.contains("embarch-core 0.1.4"), "{}", c.detail);
     }
 
     // ---- the two budgets, and saying which failure it was ------------------
