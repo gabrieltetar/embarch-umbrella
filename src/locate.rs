@@ -116,8 +116,9 @@ pub fn windows_conventional_core_paths() -> Vec<PathBuf> {
 /// (`%LOCALAPPDATA%\embarch\bin\embarch-core.exe`), resolved from a WSL2
 /// guest. `%LOCALAPPDATA%` is per-user, and WSL2 has no direct view of the
 /// Windows username to derive this path by hand — so, same technique
-/// `token.rs` already uses for the machine-wide `%ProgramData%` case, shell
-/// out to Windows for the real value and translate it to its `/mnt/c` form.
+/// `embarch_core_client::token_discovery` already uses for the machine-wide
+/// `%ProgramData%` case, shell out to Windows for the real value and
+/// translate it to its `/mnt/c` form.
 /// `None` on any failure (no `cmd.exe`/`wslpath`, unexpected output) — the
 /// caller falls through to `windows_conventional_core_paths` either way.
 #[cfg(unix)]
@@ -455,7 +456,8 @@ fn parse_sc_qc_binary_path(stdout: &str) -> Option<String> {
 
 /// Parses `sc.exe query`'s output. Split out from the shell-out so the
 /// parsing is testable without Windows interop — the same split
-/// `token.rs`/`zephyr.rs` already make for their own shell-outs.
+/// `zephyr.rs` already makes for its own shell-outs, and
+/// `embarch_core_client::token_discovery` makes upstream.
 ///
 /// Anchored on `SERVICE_NAME:` being present, because `sc.exe` prints its
 /// "does not exist" message on *stdout* while still sometimes exiting

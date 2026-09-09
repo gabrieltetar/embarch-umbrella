@@ -694,7 +694,7 @@ async fn check_token(probe: &CoreProbe, config: Option<&Config>) -> (Check, Opti
         .map(|c| (c.core.token.clone(), c.core.token_env.clone()))
         .unwrap_or((None, None));
 
-    let token = match crate::token::resolve_token(token_cfg, token_env) {
+    let token = match embarch_core_client::token_discovery::resolve_token(token_cfg, token_env) {
         Ok(t) => t,
         Err(e) => {
             return (
@@ -1809,7 +1809,7 @@ async fn fetch_dev_bench_hello(
     let (token_cfg, token_env) = config
         .map(|c| (c.core.token.clone(), c.core.token_env.clone()))
         .unwrap_or((None, None));
-    let token = match crate::token::resolve_token(token_cfg, token_env) {
+    let token = match embarch_core_client::token_discovery::resolve_token(token_cfg, token_env) {
         Ok(t) => t,
         Err(_) => return HelloOutcome::Unavailable("could not resolve token".to_string()),
     };
@@ -2129,7 +2129,7 @@ async fn check_dev_bench(probe: &CoreProbe, authed: Option<&AuthedStatus>, confi
     let (token_cfg, token_env) = config
         .map(|c| (c.core.token.clone(), c.core.token_env.clone()))
         .unwrap_or((None, None));
-    let token = match crate::token::resolve_token(token_cfg, token_env) {
+    let token = match embarch_core_client::token_discovery::resolve_token(token_cfg, token_env) {
         Ok(t) => t,
         Err(_) => return check(12, "dev-bench port detected", Status::Warn, "skipped — could not resolve token"),
     };
@@ -4820,7 +4820,7 @@ mod tests {
     #[test]
     fn a_remote_core_has_no_local_data_directory_to_measure() {
         // The reason check 16 asks `setup::data_dir_for` rather than
-        // `token.rs`: a Remote Core's results are on another machine, and a
+        // `embarch_core_client::token_discovery`: a Remote Core's results are on another machine, and a
         // local directory that happens to exist would be the wrong answer
         // reported confidently.
         assert_eq!(setup::data_dir_for(TopologyClass::Remote, false), None);

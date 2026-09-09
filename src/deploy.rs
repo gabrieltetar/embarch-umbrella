@@ -120,8 +120,9 @@ pub struct Resolution {
 ///
 /// Pure with respect to the probes: they arrive as arguments so this is
 /// testable without a Windows filesystem, `sc.exe`, or a real checkout. That
-/// is the same split `locate.rs` and `token.rs` already make for their own
-/// shell-outs.
+/// is the same split `locate.rs` already makes for its own shell-outs, and
+/// `embarch_core_client::token_discovery` makes upstream for the token
+/// fallback chain this crate now depends on rather than mirrors.
 #[allow(clippy::too_many_arguments)]
 pub fn resolve_plan(
     source_root: Option<&Path>,

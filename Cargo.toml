@@ -30,6 +30,16 @@ embarch-topology = { path = "../embarch-topology" }
 # crate never touches, so this stays a types-only dependency and pulls in no
 # hardware. Nothing else in this crate links a study type.
 embarch-study-designer = { path = "../embarch-study-designer" }
+# ../embarch-doc/embarch-umbrella/decisions/mirrors.md 20 (amended
+# 2026-09-08): the token fallback chain (formerly this crate's own
+# token.rs) now calls this shared crate live, in-process, rather than
+# carrying a hand-kept copy. Only `embarch_core_client::token_discovery`
+# is used here; nothing else in this crate calls into it. Cargo unifies
+# its `reqwest`/`tokio` features with this crate's own below — `bytes` and
+# tokio's `sync`/`fs`/`process` grow in as a result, but `probe-rs` and
+# `serialport` stay absent (verified via `cargo tree`), so this file's
+# "deliberately absent" comment above stays true.
+embarch-core-client = { path = "../embarch-api/crates/embarch-core-client" }
 # rustls rather than native-tls, matching embarch-api: no system OpenSSL
 # dependency, so this stays trivially buildable wherever Core happens to run.
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }

@@ -33,7 +33,8 @@ pub fn token_path_for(class: TopologyClass, windows: bool) -> Option<PathBuf> {
 /// ([embarch-core/spec.md](../embarch-doc/embarch-core/spec.md) §6).
 ///
 /// Pure, and **class-aware rather than host-aware**, which is the whole
-/// reason `doctor`'s check 16 uses this and not `token.rs`'s discovery: a
+/// reason `doctor`'s check 16 uses this and not
+/// `embarch_core_client::token_discovery`'s discovery: a
 /// `Remote` Core's data directory is not on this filesystem at all, and a
 /// measurement of a directory that happens to exist locally would be a
 /// confident report about the wrong machine.

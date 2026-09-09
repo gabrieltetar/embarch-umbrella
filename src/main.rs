@@ -15,7 +15,6 @@ mod locate;
 mod manifest;
 mod setup;
 mod state;
-mod token;
 mod zephyr;
 
 use std::path::PathBuf;
@@ -223,7 +222,8 @@ enum ProbeReport {
     /// No candidate answered as Core at all — nothing to authenticate to.
     Unreachable,
     /// A token could not be resolved. `String` is the display of the
-    /// `anyhow::Error` `crate::token::resolve_token` returned.
+    /// `anyhow::Error` `embarch_core_client::token_discovery::resolve_token`
+    /// returned.
     NoToken(String),
     /// Core rejected the resolved token (`401`).
     Unauthorized,
@@ -263,14 +263,14 @@ impl ProbeReport {
 /// check 5 does: resolve a token, one authenticated `GET /status`, read the
 /// `probes` array's length (decision 46). `status` has no `--config`, so
 /// unlike `doctor` this always resolves with no config override — the token
-/// env var or file discovery `crate::token::resolve_token` falls back to on
-/// its own.
+/// env var or file discovery `embarch_core_client::token_discovery::resolve_token`
+/// falls back to on its own.
 async fn probe_report(base_url: Option<&str>) -> ProbeReport {
     let Some(base_url) = base_url else {
         return ProbeReport::Unreachable;
     };
 
-    let token = match crate::token::resolve_token(None, None) {
+    let token = match embarch_core_client::token_discovery::resolve_token(None, None) {
         Ok(t) => t,
         Err(e) => return ProbeReport::NoToken(format!("{e:#}")),
     };

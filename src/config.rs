@@ -1,13 +1,20 @@
 //! Reading `embarch/embarch.toml` for `doctor` (design.md §5 checks 6-9).
 //!
-//! The same shape `embarch-api/src/config.rs` deserializes — `doctor` has to
-//! see exactly what `embarch-api` would see, not a reinterpretation of it —
-//! minus the fields none of checks 6-9 read (`flash_format`, `env`; TOML
-//! tolerates the extra keys since neither struct denies unknown fields), and
-//! without `embarch-api`'s own validation, since `doctor`'s whole job is to
-//! report what's wrong rather than fail fast on the first bad field. Another
-//! liftable copy (design.md §3 decision 15's pattern), scoped to the checks
-//! that need it.
+//! `ProjectConfig` below mirrors the same shape `embarch-api/src/config.rs`
+//! deserializes — `doctor` has to see exactly what `embarch-api` would see,
+//! not a reinterpretation of it — minus the fields none of checks 6-9 read
+//! (`flash_format`, `env`; TOML tolerates the extra keys since neither struct
+//! denies unknown fields), and without `embarch-api`'s own validation, since
+//! `doctor`'s whole job is to report what's wrong rather than fail fast on
+//! the first bad field. Another liftable copy (design.md §3 decision 15's
+//! pattern), scoped to the checks that need it.
+//!
+//! `CoreConfig` below is *not* mirrored from `embarch-api/src/config.rs` —
+//! that struct moved out to the shared `embarch-api/crates/embarch-core-client`
+//! crate on 2026-08-24 (`../embarch-doc/embarch-umbrella/decisions/mirrors.md`
+//! 20's amendment). This file still hand-keeps its own `CoreConfig` shape
+//! rather than depending on the shared one for it; see decision 20's
+//! amendment for why that half stays a mirror for now.
 
 use std::path::{Path, PathBuf};
 
@@ -32,10 +39,11 @@ pub struct CoreConfig {
 }
 
 impl CoreConfig {
-    /// Doctor's checks call `crate::token::resolve_token` directly with
-    /// `token`/`token_env` pulled out first, since check 4 needs to report
-    /// resolution failures as its own check rather than bubbling an
-    /// `anyhow::Error` — so this type carries no resolution method of its own.
+    /// Doctor's checks call `embarch_core_client::token_discovery::resolve_token`
+    /// directly with `token`/`token_env` pulled out first, since check 4
+    /// needs to report resolution failures as its own check rather than
+    /// bubbling an `anyhow::Error` — so this type carries no resolution
+    /// method of its own.
     pub fn is_auto(&self) -> bool {
         self.base_url.trim().eq_ignore_ascii_case("auto")
     }
