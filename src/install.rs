@@ -139,7 +139,14 @@ fn sourcing_line(env_path: &Path) -> String {
     format!(". \"{}\"", env_path.display())
 }
 
-const MARKER: &str = "# added by `embarch setup` (embarch-umbrella/design.md decision 28)";
+const MARKER: &str = "# added by `embarch setup` (embarch-umbrella decision 28, decisions/install.md)";
+
+/// The marker text this file wrote before the four-file split moved `design.md`
+/// out from under it — `design.md` itself no longer exists, but a machine set
+/// up before this change still carries this exact line in its rc file, and
+/// `ensure_not_sourced` (the uninstall half) must keep recognising it or an
+/// old install is left with a dangling comment nothing will ever remove.
+const LEGACY_MARKER: &str = "# added by `embarch setup` (embarch-umbrella/design.md decision 28)";
 
 /// Which rc files to consider. Only ones that already exist are ever
 /// touched — matching decision 28's "one idempotent line, never a new file"
@@ -204,7 +211,7 @@ pub fn ensure_not_sourced(rc_path: &Path, env_path: &Path) -> Result<bool> {
             skip_marker_pending = false;
             continue;
         }
-        if l.trim() == MARKER {
+        if l.trim() == MARKER || l.trim() == LEGACY_MARKER {
             skip_marker_pending = true;
             continue;
         }
@@ -687,6 +694,33 @@ mod tests {
 
         let final_content = std::fs::read_to_string(&rc).unwrap();
         assert!(!final_content.contains(&sourcing_line(&env_path)));
+        assert!(!final_content.contains(MARKER));
+        assert!(final_content.contains("alias ll='ls -la'"), "unrelated content must survive");
+
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ensure_not_sourced_removes_the_legacy_pre_four_file_split_marker() {
+        // A machine set up by `embarch setup` before the four-file split still
+        // has this exact marker text (naming a `design.md` that no longer
+        // exists) sitting in its rc file. `ensure_not_sourced` must still
+        // remove it and the sourcing line beside it, or an old install is
+        // left with a dangling comment nothing will ever clean up.
+        let dir = tmp_dir("rc-legacy-marker");
+        let rc = dir.join(".bashrc");
+        let env_path = dir.join("env");
+        let legacy_content = format!(
+            "# existing content\nalias ll='ls -la'\n\n{LEGACY_MARKER}\n{}\n",
+            sourcing_line(&env_path)
+        );
+        std::fs::write(&rc, &legacy_content).unwrap();
+
+        assert!(ensure_not_sourced(&rc, &env_path).unwrap());
+
+        let final_content = std::fs::read_to_string(&rc).unwrap();
+        assert!(!final_content.contains(&sourcing_line(&env_path)));
+        assert!(!final_content.contains(LEGACY_MARKER));
         assert!(!final_content.contains(MARKER));
         assert!(final_content.contains("alias ll='ls -la'"), "unrelated content must survive");
 

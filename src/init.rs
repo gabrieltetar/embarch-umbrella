@@ -483,7 +483,7 @@ pub fn render_zephyr_west_config(
          source_path = {source:?}\n\
          # Zephyr/west detected here (boards/*/*.yml + app/*/CMakeLists.txt): board,\n\
          # chip, and artifact path are resolved live, per call, instead of stored —\n\
-         # see `embarch-api list-targets {name}` and embarch-api/design.md §3 decision 12.\n\
+         # see `embarch-api list-targets {name}` and embarch-api decision 12 (decisions/zephyr.md).\n\
          discovery = \"zephyr-west\"\n\
          west_binary = {west_binary:?}\n\
          # Per-target subdirectories are computed under this, never shared between\n\
@@ -531,7 +531,7 @@ pub fn render_config(
     let unc_line = match unc_artifact {
         Some(p) => format!(
             "# Windows-visible form of the same file, for a Core running on the Windows\n\
-             # side of this WSL2 split (embarch-api/design.md §9).\nartifact_path_for_core = {:?}\n",
+             # side of this WSL2 split (decision 16, decisions/mirrors.md).\nartifact_path_for_core = {:?}\n",
             p
         ),
         None => String::new(),

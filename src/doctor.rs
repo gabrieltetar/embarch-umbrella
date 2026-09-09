@@ -280,7 +280,7 @@ fn check_binaries(
                         Status::Pass,
                         format!(
                             "{found}. No suite manifest next to this binary — either not installed from a \
-                             suite archive (milestone-6.md §3.7), or a per-repo/debug build; \
+                             suite archive (decision 42), or a per-repo/debug build; \
                              version-vs-manifest comparison skipped.{api_note}"
                         ),
                     ),
@@ -1299,7 +1299,7 @@ fn check_artifact_paths(projects: &[ProjectConfig]) -> Check {
                     worst = Status::Fail;
                     fix = Some(
                         "regenerate artifact_path_for_core (rerun `embarch init`, or fix it by hand) so \
-                         both name the same build output — see ../embarch-doc/embarch-api/design.md §12"
+                         both name the same build output — see spec.md, check 9"
                             .to_string(),
                     );
                 }
@@ -3319,6 +3319,34 @@ fn render_json(checks: &[Check], any_fail: bool) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every user-visible `Check.detail`/`Check.fix` string is built from a
+    /// literal in this file, and the four-file split (`embarch.md` §6)
+    /// deleted `design.md` and every `milestone-*.md` — a string naming one
+    /// routes an operator to a `git show`-only file (task 025). A source
+    /// comment (`//` or `///`) is not user-visible and is exempt; this scans
+    /// only the code lines that are left once comment-only lines are
+    /// dropped.
+    #[test]
+    fn no_check_text_names_a_document_the_four_file_split_deleted() {
+        let source = include_str!("doctor.rs");
+        // Everything below this module is test code, including the literal
+        // document names this very test greps for — scan production code
+        // only, or the test would fail on its own assertion strings.
+        let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
+        for (i, line) in production.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with("//") {
+                continue;
+            }
+            let lower = line.to_ascii_lowercase();
+            assert!(
+                !lower.contains("design.md") && !lower.contains("milestone"),
+                "doctor.rs:{}: non-comment line names a deleted doc: {line:?}",
+                i + 1
+            );
+        }
+    }
 
     struct TempDir(PathBuf);
     impl TempDir {
