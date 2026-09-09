@@ -13,9 +13,10 @@ path = "src/main.rs"
 # Deliberately absent, and expected to stay absent: probe-rs and serialport.
 # Umbrella holds no hardware knowledge, with one exception: doctor check 5
 # reads world-readable /sys/bus/usb/devices sysfs attributes in-process (no
-# probe-rs, no permission needed — decision 18, ../embarch-doc/embarch-umbrella
-# /decisions/doctor.md). Every other hardware-facing capability is a
-# shell-out to embarch-core or an HTTP call to its endpoints (design.md §1).
+# probe-rs, no permission needed) — embarch-umbrella decision 18, in
+# ../embarch-doc/embarch-umbrella/decisions/doctor.md. Every other
+# hardware-facing capability is a shell-out to embarch-core or an HTTP call to
+# its endpoints (../embarch-doc/embarch-umbrella/spec.md, "Not:").
 [dependencies]
 anyhow = "1.0.103"
 clap = { version = "4.6.2", features = ["derive"] }
