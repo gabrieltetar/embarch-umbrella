@@ -1,7 +1,8 @@
 //! Reads the suite manifest a combined release archive carries
 //! (`.github/workflows/assemble-suite.yml`), so `doctor`'s check 1 can
 //! compare what's actually installed against what the archive said it
-//! shipped (decision 14: "`doctor` warns when the installed
+//! shipped (decision 14, and decision 24 for why a mismatch is a warning
+//! rather than a refusal: "`doctor` warns when the installed
 //! component versions don't match the suite manifest").
 //!
 //! Absent entirely for anyone who didn't install from a suite archive (a
