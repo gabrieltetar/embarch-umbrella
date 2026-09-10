@@ -2,6 +2,7 @@
 name = "embarch-umbrella"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 # The repo is embarch-umbrella; the binary is `embarch` — it's the most-typed
 # command in the suite for someone who has never used it before
