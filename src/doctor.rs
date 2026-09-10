@@ -940,7 +940,77 @@ fn check_probes(authed: Option<&AuthedStatus>, scan: &UsbScan) -> Check {
 
 // ---- check 6: config loads, source_path exists -----------------------------
 
-fn check_config(config_path: Option<&Path>) -> (Check, Option<Config>) {
+/// What the located `embarch-api` said about the config file itself, asked
+/// the same way check 8 asks about targets (`list-projects` triggers the
+/// same `Config::load_from_path` -> `validate()` every real subcommand
+/// does, per `embarch-api/src/main.rs`'s `async_main`).
+#[derive(Debug, PartialEq, Eq)]
+enum LoaderVerdict {
+    /// The real loader accepted this file outright.
+    Ok,
+    /// It answered, and its answer is refusal — `embarch-api`'s own error
+    /// text, naming the exact field or invariant this config trips.
+    Rejected(String),
+    /// No verdict could be obtained. Never a verdict about the config file
+    /// itself.
+    Unanswerable(String),
+}
+
+/// Parse one `embarch-api --config <path> --json list-projects` run. Split
+/// out for the same reason `api_targets_from_output` is: testable with no
+/// `embarch-api` on the machine.
+fn api_config_verdict_from_output(exit_code: Option<i32>, stdout: &str) -> LoaderVerdict {
+    if exit_code == Some(2) {
+        return LoaderVerdict::Unanswerable(
+            "the located embarch-api rejected `list-projects` (clap exited 2)".to_string(),
+        );
+    }
+    let parsed = match serde_json::from_str::<serde_json::Value>(stdout.trim()) {
+        Ok(v) => v,
+        Err(e) => {
+            return LoaderVerdict::Unanswerable(format!(
+                "`embarch-api --json list-projects` printed no JSON object ({e})"
+            ))
+        }
+    };
+    match parsed.get("success").and_then(serde_json::Value::as_bool) {
+        Some(true) => LoaderVerdict::Ok,
+        Some(false) => {
+            let why = parsed
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("no reason given");
+            LoaderVerdict::Rejected(why.to_string())
+        }
+        None => LoaderVerdict::Unanswerable(
+            "`embarch-api --json list-projects` answered without a `success` field".to_string(),
+        ),
+    }
+}
+
+/// Ask the **located** `embarch-api` whether it would even start on this
+/// config — the same shell-out check 8 already does one function away
+/// (`api_target_answer`), for the same reason: there is a real loader one
+/// process away, and this crate's own permissive mirror (below) cannot
+/// answer for it (decision 16, `spec.md` check 6's row).
+fn api_config_verdict(api: Option<&Located>, config_path: &Path) -> LoaderVerdict {
+    let Some(api) = api else {
+        return LoaderVerdict::Unanswerable("embarch-api not located (see check 1)".to_string());
+    };
+    let out = Command::new(&api.path)
+        .arg("--config")
+        .arg(config_path)
+        .args(["--json", "list-projects"])
+        .output();
+    match out {
+        Ok(o) => api_config_verdict_from_output(o.status.code(), &String::from_utf8_lossy(&o.stdout)),
+        Err(e) => {
+            LoaderVerdict::Unanswerable(format!("couldn't run `{} list-projects`: {e}", api.path.display()))
+        }
+    }
+}
+
+fn check_config(config_path: Option<&Path>, api: Option<&Located>) -> (Check, Option<Config>) {
     let Some(path) = config_path else {
         return (
             with_fix(
@@ -951,42 +1021,117 @@ fn check_config(config_path: Option<&Path>) -> (Check, Option<Config>) {
         );
     };
 
-    let config = match Config::load_from_path(path) {
-        Ok(c) => c,
-        Err(e) => {
-            return (
-                check(6, "embarch-api config loads", Status::Fail, format!("{e:#}")),
+    // The permissive local mirror (this file's header explains why it's
+    // permissive: `doctor`'s job is to report what's wrong, not fail fast on
+    // the first bad field). Parsed regardless of the real loader's verdict
+    // below, so checks 7-9 still get project data on a config the real
+    // loader would refuse for a reason none of them read (`flash_format`,
+    // retired fields, `.validate()`'s cross-field rules), and so a Fail
+    // below can say *which* field looks wrong, not just that one exists —
+    // decision 16's actual requirement.
+    let local = Config::load_from_path(path);
+
+    match api_config_verdict(api, path) {
+        LoaderVerdict::Ok => match local {
+            Ok(config) => (
+                check(
+                    6,
+                    "embarch-api config loads",
+                    Status::Pass,
+                    format!(
+                        "{} — embarch-api itself accepts this file ({} project(s))",
+                        path.display(),
+                        config.projects.len()
+                    ),
+                ),
+                Some(config),
+            ),
+            // embarch-api's own loader is a superset of what this crate's
+            // mirror can parse (e.g. a project field this mirror doesn't
+            // declare at all), so a mirror parse failure here is a fact
+            // about the mirror, not about the config — reported as a Warn,
+            // never a Fail, since the loader whose title this check names
+            // already said yes.
+            Err(e) => (
+                check(
+                    6,
+                    "embarch-api config loads",
+                    Status::Warn,
+                    format!(
+                        "embarch-api accepts {} but this doctor's own reader could not parse it \
+                         ({e:#}) — checks 7-9 have no project data this run",
+                        path.display()
+                    ),
+                ),
                 None,
+            ),
+        },
+        LoaderVerdict::Rejected(why) => {
+            let detail = match &local {
+                Ok(_) => why,
+                Err(e) => format!("{why} (this doctor's own reader also failed to parse it: {e:#})"),
+            };
+            (
+                with_fix(
+                    check(
+                        6,
+                        "embarch-api config loads",
+                        Status::Fail,
+                        format!("embarch-api refuses {}: {detail}", path.display()),
+                    ),
+                    "fix embarch/embarch.toml for the reason embarch-api gave above",
+                ),
+                local.ok(),
             )
         }
-    };
-
-    let missing: Vec<&str> = config
-        .projects
-        .iter()
-        .filter(|p| !p.source_path.exists())
-        .map(|p| p.name.as_str())
-        .collect();
-
-    if missing.is_empty() {
-        let c = check(
-            6,
-            "embarch-api config loads",
-            Status::Pass,
-            format!("{} ({} project(s), every source_path exists)", path.display(), config.projects.len()),
-        );
-        (c, Some(config))
-    } else {
-        let c = with_fix(
-            check(
-                6,
-                "embarch-api config loads",
-                Status::Fail,
-                format!("source_path missing for: {}", missing.join(", ")),
+        LoaderVerdict::Unanswerable(why) => match local {
+            Ok(config) => {
+                let missing: Vec<&str> = config
+                    .projects
+                    .iter()
+                    .filter(|p| !p.source_path.exists())
+                    .map(|p| p.name.as_str())
+                    .collect();
+                let base = format!(
+                    "couldn't ask embarch-api directly ({why}) — falling back to a permissive \
+                     local read of {}",
+                    path.display()
+                );
+                if missing.is_empty() {
+                    (
+                        check(
+                            6,
+                            "embarch-api config loads",
+                            Status::Warn,
+                            format!("{base}: parses, {} project(s), every source_path exists", config.projects.len()),
+                        ),
+                        Some(config),
+                    )
+                } else {
+                    (
+                        with_fix(
+                            check(
+                                6,
+                                "embarch-api config loads",
+                                Status::Warn,
+                                format!("{base}: source_path missing for: {}", missing.join(", ")),
+                            ),
+                            "fix `source_path` in embarch/embarch.toml for the project(s) listed",
+                        ),
+                        Some(config),
+                    )
+                }
+            }
+            Err(e) => (
+                check(
+                    6,
+                    "embarch-api config loads",
+                    Status::Fail,
+                    format!("couldn't ask embarch-api directly ({why}), and this doctor's own permissive reader also failed: {e:#}"),
+                ),
+                None,
             ),
-            "fix `source_path` in embarch/embarch.toml for the project(s) listed",
-        );
-        (c, Some(config))
+        },
     }
 }
 
@@ -3056,7 +3201,7 @@ pub async fn doctor(json: bool) -> i32 {
     let api = locate::locate_api(registered_api_command(&mcp_reg).as_deref());
 
     let config_path = config::find_config_path();
-    let (check6, config) = check_config(config_path.as_deref());
+    let (check6, config) = check_config(config_path.as_deref(), api.as_ref());
 
     // Kept apart rather than merged: check 2 wants to say which one it read
     // when it fails, and `infer_class` below is content with `host`, their
@@ -3898,6 +4043,88 @@ mod tests {
         assert_eq!(c.status, Status::Pass);
     }
 
+    // ---- check 6: decoding embarch-api's own `list-projects` verdict --------
+
+    #[test]
+    fn embarch_api_accepting_the_config_is_ok() {
+        let out = r#"{"success": true, "projects": ["fw"]}"#;
+        assert_eq!(api_config_verdict_from_output(Some(0), out), LoaderVerdict::Ok);
+    }
+
+    #[test]
+    fn embarch_api_refusing_the_config_carries_its_own_reason() {
+        let out = r#"{"success": false, "error": "project 'fw' has no chip"}"#;
+        assert_eq!(
+            api_config_verdict_from_output(Some(1), out),
+            LoaderVerdict::Rejected("project 'fw' has no chip".to_string())
+        );
+    }
+
+    #[test]
+    fn a_clap_rejection_of_list_projects_is_unanswerable_not_a_verdict() {
+        assert!(matches!(
+            api_config_verdict_from_output(Some(2), ""),
+            LoaderVerdict::Unanswerable(_)
+        ));
+    }
+
+    #[test]
+    fn non_json_stdout_from_list_projects_is_unanswerable() {
+        assert!(matches!(
+            api_config_verdict_from_output(Some(0), "not json\n"),
+            LoaderVerdict::Unanswerable(_)
+        ));
+    }
+
+    #[test]
+    fn a_json_object_without_success_from_list_projects_is_unanswerable() {
+        assert!(matches!(
+            api_config_verdict_from_output(Some(0), r#"{"projects": []}"#),
+            LoaderVerdict::Unanswerable(_)
+        ));
+    }
+
+    /// `check_config` with no located `embarch-api`: falls back to the
+    /// permissive local mirror, never claiming an authoritative Pass/Fail —
+    /// the config still parses under this mirror, so the fallback is a
+    /// Warn, not a Pass.
+    #[test]
+    fn no_located_api_falls_back_to_a_warn_not_a_pass() {
+        let cfg = tempdir();
+        let path = cfg.path().join("embarch.toml");
+        std::fs::write(
+            &path,
+            "[core]\nbase_url = \"auto\"\n\n[[projects]]\nname = \"fw\"\n\
+             source_path = \"/repo\"\nbuild_command = [\"west\", \"build\"]\n\
+             artifact_path = \"build/zephyr/zephyr.hex\"\nchip = \"CHANGE-ME\"\n\
+             flash_format = \"hex\"\n",
+        )
+        .unwrap();
+        let (check, config) = check_config(Some(&path), None);
+        assert_eq!(check.status, Status::Warn);
+        assert!(config.is_some());
+    }
+
+    /// A retired key (`embarch-api` decision 53) is refused by this mirror
+    /// too, so the fallback path (no `embarch-api` located) still catches it
+    /// rather than reporting a clean parse.
+    #[test]
+    fn a_retired_targets_key_fails_the_local_mirror_too() {
+        let cfg = tempdir();
+        let path = cfg.path().join("embarch.toml");
+        std::fs::write(
+            &path,
+            "[core]\nbase_url = \"auto\"\n\n[[projects]]\nname = \"fw\"\n\
+             source_path = \"/repo\"\nbuild_command = [\"west\", \"build\"]\n\
+             artifact_path = \"build/zephyr/zephyr.hex\"\nchip = \"CHANGE-ME\"\n\
+             flash_format = \"hex\"\n\n[[projects.targets]]\nboard = \"x\"\n",
+        )
+        .unwrap();
+        let (check, config) = check_config(Some(&path), None);
+        assert_eq!(check.status, Status::Fail);
+        assert!(config.is_none());
+    }
+
     // ---- check 8: decoding embarch-api's own listing (decision 17's
     // amendment) -------------------------------------------------------------
 
@@ -4676,9 +4903,12 @@ mod tests {
             build_command: Some(vec!["west".to_string(), "build".to_string()]),
             artifact_path: Some(PathBuf::from("build/zephyr/zephyr.hex")),
             chip: Some(chip.to_string()),
+            flash_format: "hex".to_string(),
             artifact_path_for_core: None,
             west_binary: None,
             build_dir_root: None,
+            retired_targets: Vec::new(),
+            retired_soc_chip_overrides: None,
         }
     }
 
@@ -4697,9 +4927,12 @@ mod tests {
             build_command: None,
             artifact_path: None,
             chip: None,
+            flash_format: "hex".to_string(),
             artifact_path_for_core: None,
             west_binary: Some(PathBuf::from("west")),
             build_dir_root: build_dir_root.map(PathBuf::from),
+            retired_targets: Vec::new(),
+            retired_soc_chip_overrides: None,
         }
     }
 
@@ -5375,9 +5608,9 @@ mod tests {
         let cfg = tempdir();
         let malformed = cfg.path().join("embarch.toml");
         std::fs::write(&malformed, "this is not toml =\n").unwrap();
-        out.push(check_config(None).0);
-        out.push(check_config(Some(&malformed)).0);
-        out.push(check_config(Some(&cfg.path().join("absent.toml"))).0);
+        out.push(check_config(None, None).0);
+        out.push(check_config(Some(&malformed), None).0);
+        out.push(check_config(Some(&cfg.path().join("absent.toml")), None).0);
 
         // ---- checks 7, 8 and 9 ----------------------------------------------
         let projects = [
