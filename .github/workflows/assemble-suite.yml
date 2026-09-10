@@ -1,6 +1,6 @@
 # Assembles the suite release archive: `embarch-<version>-<target>.{tar.gz,zip}`
 # carrying all three binaries from one already-tagged release of each
-# component (embarch-umbrella/design.md §3 decision 14). This is what the
+# component (embarch-umbrella decision 14). This is what the
 # user guide links to — the per-repo releases (release.yml, here and in
 # embarch-core/embarch-api) exist for developers working on one component,
 # not for a new engineer's first download.

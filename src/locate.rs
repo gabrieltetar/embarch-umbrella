@@ -1,16 +1,16 @@
 //! Finding the other two binaries.
 //!
 //! Umbrella never does hardware or build work itself — it shells out
-//! (design.md §1) — so "where is `embarch-core`" is a question it has to
+//! (embarch-umbrella spec.md §1) — so "where is `embarch-core`" is a question it has to
 //! answer before it can do almost anything.
 //!
-//! **`setup` now installs for real (design.md §3 decision 28).** It copies
+//! **`setup` now installs for real (decision 28).** It copies
 //! the suite's binaries to a canonical per-user location and mutates `PATH`
 //! for real (`install.rs`) — reversing the 2026-08-05 refinement that used
 //! to live here (never edit `PATH`, find `embarch-core` as a sibling of
 //! `embarch` instead). That sibling-lookup mechanism (`next_to_me`) is gone
 //! from the resolution chain below entirely: it was found misreporting which
-//! binary was actually in play for a `wsl-host` topology (design.md §10,
+//! binary was actually in play for a `wsl-host` topology (decision 28,
 //! 2026-08-17), and `install.rs`'s copy step is now the only place "look at
 //! my own directory" logic remains — a one-time install source, not an
 //! ongoing lookup.
@@ -79,8 +79,7 @@ pub struct Located {
     pub found_by: FoundBy,
     /// A Windows `.exe` being invoked from a WSL2 guest. Relevant because
     /// controlling a Windows service from here needs an elevated *Windows*
-    /// shell, which umbrella will never try to obtain itself (design.md §3
-    /// decision 7).
+    /// shell, which umbrella will never try to obtain itself (decision 7).
     pub windows_exe_from_wsl2: bool,
 }
 
@@ -228,7 +227,7 @@ fn on_path(stem: &str) -> Option<Located> {
         })
 }
 
-/// Locate `embarch-core`, in the precedence order design.md §3 decisions 7
+/// Locate `embarch-core`, in the precedence order decisions 7
 /// and 28 specify: an explicit override, then what `setup` recorded, then
 /// `PATH` (populated for real by `setup`'s install step once decision 28 has
 /// run), then — under WSL2 only — the real canonical Windows location, then
@@ -297,13 +296,13 @@ pub fn locate_core(saved: Option<&Path>, under_wsl2: bool) -> Option<Located> {
 
 /// `embarch-core`'s own Windows service label (its `service.rs`'s
 /// `SERVICE_LABEL`). Duplicated rather than imported: umbrella depends on
-/// none of the three binaries it orchestrates, by design (design.md §1) —
+/// none of the three binaries it orchestrates, by design (embarch-umbrella spec.md §1) —
 /// it shells out. Verified against the real installed service on this
 /// bench, not read off the source: `sc.exe query com.embarch.core` returns
 /// `SERVICE_NAME: com.embarch.core`.
 pub const WINDOWS_CORE_SERVICE_LABEL: &str = "com.embarch.core";
 
-/// What a read-only probe found on the Windows side (design.md §3 decision
+/// What a read-only probe found on the Windows side (decision
 /// 30). Absence — no service at all — is `None` from the probe, not a
 /// variant here.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -316,7 +315,7 @@ pub enum WindowsServiceState {
 }
 
 /// Is `embarch-core` installed as a Windows service, as seen from a WSL2
-/// guest (design.md §3 decision 30)?
+/// guest (decision 30)?
 ///
 /// **Read-only, and that is the safety argument.** `sc.exe query` changes
 /// nothing, so a wrong answer here costs a check rather than a botched
@@ -341,8 +340,8 @@ pub fn windows_core_service_state() -> Option<WindowsServiceState> {
 
 #[cfg(not(unix))]
 pub fn windows_core_service_state() -> Option<WindowsServiceState> {
-    // This probe exists to resolve a WSL2-guest ambiguity (design.md §3
-    // decision 30). A native Windows `embarch` can control the service
+    // This probe exists to resolve a WSL2-guest ambiguity (decision
+    // 30). A native Windows `embarch` can control the service
     // directly and has no ambiguity to resolve.
     None
 }

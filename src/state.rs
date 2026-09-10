@@ -1,7 +1,7 @@
 //! What `setup` remembers between runs.
 //!
 //! Deliberately tiny, and deliberately *not* an address. The topology class
-//! is stable; the address behind it isn't (design.md §3 decision 6), so
+//! is stable; the address behind it isn't (decision 6), so
 //! persisting a URL would recreate the staleness this suite just finished
 //! removing. What's worth writing down is only what re-detection can't cheaply
 //! rediscover: which class we concluded, the remote host if the operator named
@@ -33,14 +33,14 @@ pub struct State {
     pub core_exe: Option<PathBuf>,
     /// Local `embarch-dev-bench` checkout, for `doctor` check 13's
     /// `git describe`-vs-`HelloAck.firmware_version` staleness check
-    /// (design.md §3 decision 19, `embarch-dev-bench/design.md` §3 decision
-    /// 25). Set by `setup --dev-bench-repo <path>`; unlike `core_exe`, not
+    /// (decision 19, `embarch-dev-bench` decision 25). Set by `setup
+    /// --dev-bench-repo <path>`; unlike `core_exe`, not
     /// something re-detection can rediscover on its own — a git checkout can
     /// live anywhere.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dev_bench_repo_path: Option<PathBuf>,
-    /// The three paths `deploy-core` cannot rediscover (design.md §3
-    /// decision 37), remembered **only after a deploy that actually
+    /// The three paths `deploy-core` cannot rediscover (decision 32),
+    /// remembered **only after a deploy that actually
     /// landed** — so a wrong `--windows-root` isn't persisted for the next
     /// run to inherit.
     ///

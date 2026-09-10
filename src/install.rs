@@ -2,10 +2,10 @@
 //! canonical per-user location and making sure `PATH` actually includes it.
 //!
 //! Replaces `locate.rs`'s old sibling-lookup-plus-printed-hint approach
-//! (design.md §3 decision 3's 2026-08-05 refinement) — reversed by decision
+//! (decision 3's 2026-08-05 refinement) — reversed by decision
 //! 28, at the user's explicit request, after a real `wsl-host` onboarding
 //! run the same day showed the sibling lookup misreporting which
-//! `embarch-core` binary was actually in play (design.md §10).
+//! `embarch-core` binary was actually in play (decision 28).
 //!
 //! Every write here is per-user — no elevation needed, distinct from the
 //! Core-service install decision 7 already requires elevation for — and

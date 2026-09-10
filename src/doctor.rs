@@ -128,7 +128,7 @@ fn declared_base_url(config: Option<&Config>) -> Option<&str> {
 }
 
 async fn probe_topology(config: Option<&Config>, host: Option<&str>, port: u16) -> CoreProbe {
-    // embarch-topology/design.md decisions 2, 3: live, in-process, every
+    // `embarch-topology` decisions 2, 3: live, in-process, every
     // call — `doctor` still wants a probe result even for a declared
     // `base_url` (unlike embarch-api's `core_client.rs`, which trusts a
     // declared address outright), so this always passes through the crate's
@@ -1035,7 +1035,7 @@ fn check_build_commands(projects: &[ProjectConfig]) -> Check {
     let mut unresolved = Vec::new();
     for p in projects {
         if p.is_zephyr_west() {
-            // design.md §3 decision 17: a zephyr-west project has no
+            // decision 17: a zephyr-west project has no
             // build_command at all — west_binary is the equivalent
             // executable-on-PATH preflight.
             let Some(west) = p.west_binary.as_ref().and_then(|w| w.to_str()) else {
@@ -1166,8 +1166,8 @@ fn api_target_answer(
 }
 
 /// For a `discovery = "static"` project: `chip` isn't still `init`'s
-/// placeholder. For a `discovery = "zephyr-west"` project (`design.md` §3
-/// decision 17): there's nowhere for a placeholder to live at all — `chip`
+/// placeholder. For a `discovery = "zephyr-west"` project (decision
+/// 17): there's nowhere for a placeholder to live at all — `chip`
 /// is resolved per call — so this checks the thing that actually matters
 /// instead, that at least one real target exists, by asking `embarch-api`'s
 /// own listing rather than approximating it here.
@@ -1241,7 +1241,7 @@ fn check_artifact_paths(projects: &[ProjectConfig]) -> Check {
 
     for p in projects {
         if p.is_zephyr_west() {
-            // design.md §3 decision 17: artifact_path and artifact_path_for_core
+            // decision 17: artifact_path and artifact_path_for_core
             // are both computed together, per call, from the same resolved
             // build dir — there's nothing stored to compare here. All this
             // check can verify ahead of time is that the WSL2 UNC-path
@@ -2209,10 +2209,10 @@ fn git_object_known(repo_path: &Path, remote_version: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// `embarch-dev-bench/design.md` §3 decision 25 / `embarch-umbrella`
+/// `embarch-dev-bench` decision 25 / `embarch-umbrella`
 /// decision 19: compares the currently flashed dev-bench's
 /// `HelloAck.firmware_version` (over `GET /dev-bench/hello`,
-/// `embarch-core/design.md`'s handshake-only endpoint — no `Study` involved)
+/// `embarch-core`'s handshake-only endpoint — no `Study` involved)
 /// against `git describe` run against whichever local `embarch-dev-bench`
 /// checkout is configured. A mismatch means "you changed dev-bench firmware
 /// and haven't reflashed it," caught here instead of as a confusing
@@ -2933,7 +2933,7 @@ fn judge_bind_address(e: &BindEvidence<'_>) -> Check {
             // as the same test and are not: `recommended_bind_address` says
             // `0.0.0.0` for `remote` as well, and a `setup` that infers
             // `remote` installs *nothing* — umbrella does no remote
-            // orchestration at all (design.md §3 decision 8). Asking the
+            // orchestration at all (decision 8). Asking the
             // bind constant therefore offered the command in the one state
             // where it cannot possibly help, which is the same defect
             // `bind-too-narrow` was stripped of one arm over. So the class
@@ -3169,7 +3169,7 @@ pub async fn doctor(json: bool) -> i32 {
 // ---- check 14: the flashing backend each chip family resolves to ------------
 
 /// Asks the located `embarch-core` which program it would flash with
-/// ([embarch-core/design.md](../embarch-core/design.md) §3 decision 36).
+/// (`embarch-core` decision 36).
 ///
 /// **Why this is a `doctor` check and not left to the moment of a flash.**
 /// Core refuses to flash an nRF54L part with probe-rs — that family stores
@@ -5093,8 +5093,8 @@ mod tests {
     /// `recommended_bind_address(setup_would_infer) == needed`, which is
     /// `0.0.0.0` for `remote` as well as for `wsl-host`, so a `remote`
     /// inference kept the `setup` offer. But `setup` inferring `remote`
-    /// installs *nothing* — umbrella does no remote orchestration (design.md
-    /// §3 decision 8) — so that is the one class where the offer cannot
+    /// installs *nothing* — umbrella does no remote orchestration (decision
+    /// 8) — so that is the one class where the offer cannot
     /// possibly widen the bind, and it must be withdrawn for a different
     /// reason than `local`'s: not "it reinstalls narrow" but "it reinstalls
     /// nothing".

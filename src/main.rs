@@ -23,7 +23,7 @@ use clap::{Parser, Subcommand};
 
 use embarch_topology::software::{winner, Attempt, ProbeOutcome, DEFAULT_CORE_PORT};
 
-/// Exit codes follow embarch-api's CLI convention (embarch-api/design.md §5a):
+/// Exit codes follow embarch-api's CLI convention (`embarch-api` interfaces/tools.md):
 /// 0 success, 1 any operation failure, 2 (clap's own) malformed invocation.
 const EXIT_FAILURE: i32 = 1;
 
@@ -62,7 +62,7 @@ enum Command {
         uninstall: bool,
 
         /// Local `embarch-dev-bench` checkout, for `doctor` check 13's
-        /// stale-firmware detection (design.md §3 decision 19). Saved to
+        /// stale-firmware detection (decision 19). Saved to
         /// state; omit on a later `setup` run to leave a previously-saved
         /// path unchanged.
         #[arg(long)]
@@ -156,7 +156,7 @@ enum Command {
         dry_run: bool,
 
         /// Do everything unelevated, write the elevated script, and print
-        /// the one command to run it — design.md §3 decision 7's posture,
+        /// the one command to run it — decision 7's posture,
         /// for when you would rather run the privileged half yourself.
         #[arg(long)]
         print_script: bool,
@@ -166,7 +166,7 @@ enum Command {
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     // stderr, so stdout stays reserved for command results and `--json`
-    // output — same split embarch-api's CLI uses (embarch-api/design.md §10).
+    // output — same split embarch-api's CLI uses (`embarch-api` interfaces/tools.md).
     tracing_subscriber::fmt().with_writer(std::io::stderr).init();
 
     let cli = Cli::parse();

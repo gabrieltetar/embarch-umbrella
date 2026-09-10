@@ -1,5 +1,5 @@
 //! Zephyr/west **shape** detection — the `embarch-umbrella` half of
-//! `design.md` §3 decision 17 (`embarch-api/design.md` §3 decision 12 is the
+//! decision 17 (`embarch-api` decision 12 is the
 //! full design, including the parts umbrella doesn't need).
 //!
 //! One caller, read-only, building and flashing nothing: `init`, answering

@@ -1,6 +1,6 @@
 //! `embarch init` — integrate the firmware repo in the current directory.
 //!
-//! design.md §3 decisions 10, 12, 13. The whole point is that a firmware repo
+//! Decisions 10, 12, 13. The whole point is that a firmware repo
 //! you don't own ends up with **nothing tracked modified**: the config lives
 //! in an `embarch/` folder excluded through `.git/info/exclude` (local to this
 //! clone, unlike a committed `.gitignore`), and the MCP server is registered
@@ -41,7 +41,7 @@ pub fn find_repo_root(start: &Path) -> Option<PathBuf> {
 /// this, so the shape is stable in practice.
 ///
 /// Why this field at all: it is the only reliable answer to west's
-/// build-directory trap (`embarch-api/design.md` §6). `west build -b <board>
+/// build-directory trap (`embarch-api` interfaces/config.md). `west build -b <board>
 /// app/foo` run from the repo root puts output in `<root>/build`, not
 /// `<root>/app/foo/build`, and guessing wrong makes a stale artifact look
 /// fresh — the worst failure mode during bring-up.
@@ -102,7 +102,7 @@ pub fn split_argv(command: &str) -> Vec<String> {
 /// Point a `west build` argv at EmbArch's own build directory.
 ///
 /// Replaces an existing `-d`/`--build-dir` rather than adding a second one.
-/// A separate build directory isn't optional (design.md §3 decision 10):
+/// A separate build directory isn't optional (decision 10):
 /// sharing one with the engineer's interactive builds means the two clobber
 /// each other's tree — different board revisions, different pristine state.
 pub fn with_build_dir(argv: &[String], build_dir: &str) -> Vec<String> {
@@ -134,7 +134,7 @@ pub fn with_build_dir(argv: &[String], build_dir: &str) -> Vec<String> {
 }
 
 /// The Windows-visible UNC form of a WSL2 path, for `artifact_path_for_core`
-/// (`embarch-api/design.md` §4, §9) — what a Windows-hosted Core needs in
+/// (`embarch-api` spec.md §4) — what a Windows-hosted Core needs in
 /// order to open a file the build wrote inside the WSL2 guest.
 pub fn wsl_unc_path(distro: &str, absolute: &Path) -> String {
     let tail = absolute
@@ -149,7 +149,7 @@ pub fn wsl_unc_path(distro: &str, absolute: &Path) -> String {
 /// Looks rather than assumes, deliberately: sysbuild puts it at
 /// `build/<app>/zephyr/zephyr.hex` while a plain build uses
 /// `build/zephyr/zephyr.hex`, and which one applies depends on the SDK
-/// (`embarch-dev-bench/design.md` §3 decision 4's correction). Shortest match
+/// (`embarch-dev-bench` decision 4's correction). Shortest match
 /// wins, so a plain build's path beats a nested one when both exist.
 pub fn find_artifact(build_dir: &Path, file_name: &str) -> Option<PathBuf> {
     let mut best: Option<PathBuf> = None;
@@ -455,12 +455,12 @@ pub fn scaffold_build_command(recorded: &[RecordedBuild], build_dir_rel: &str) -
 pub struct Scaffold {
     pub toml: String,
     /// Things `init` could not work out, to print rather than guess at
-    /// (design.md §3 decision 13).
+    /// (decision 13).
     pub warnings: Vec<String>,
 }
 
 /// Build the config text for a `discovery = "zephyr-west"` project
-/// (design.md §3 decision 17, `embarch-api/design.md` §3 decision 12): no
+/// (decision 17, `embarch-api` decision 12): no
 /// `build_command`/`chip`/`artifact_path`/`artifact_path_for_core` — those
 /// are resolved live, per call, by `embarch-api` instead.
 pub fn render_zephyr_west_config(
@@ -608,7 +608,7 @@ fn remove_from_git_exclude(repo: &Path) -> Result<bool> {
 
 /// Register the MCP server at local scope, or print the command if the
 /// `claude` CLI isn't available. Never writes a `.mcp.json` — that file is
-/// tracked, and this must not touch tracked files (design.md §3 decision 12).
+/// tracked, and this must not touch tracked files (decision 12).
 fn register_mcp(api: &Path, config: &Path) -> bool {
     let args = [
         "mcp".to_string(),
@@ -670,7 +670,7 @@ pub fn init(uninstall: bool) -> i32 {
     let build_dir_rel = "embarch/build";
     let build_info = repo.join("build").join("build_info.yml");
 
-    // design.md §3 decision 17: a repo shaped like a real Zephyr/west
+    // decision 17: a repo shaped like a real Zephyr/west
     // project (several boards/variants/revisions worth discovering live,
     // not one to guess) gets the minimal discovery = "zephyr-west" schema
     // instead of a single hand-picked board — `embarch init`'s old behavior
@@ -959,7 +959,7 @@ mod tests {
             Some("\\\\wsl.localhost\\Ubuntu\\home\\me\\fw\\x.hex"),
         );
         // Backslashes must survive into the TOML as escaped literals, or Core
-        // gets a mangled path — the failure embarch-api/design.md §9 records.
+        // gets a mangled path — the failure `embarch-api` spec.md §4 records.
         assert!(cfg.contains(r#"artifact_path_for_core = "\\\\wsl.localhost\\Ubuntu\\home\\me\\fw\\x.hex""#), "{cfg}");
         assert!(cfg.contains(r#"base_url = "auto""#));
         assert!(cfg.contains(r#"chip = "CHANGE-ME""#));

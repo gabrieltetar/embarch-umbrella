@@ -1,4 +1,4 @@
-//! Reading `embarch/embarch.toml` for `doctor` (design.md §5 checks 6-9).
+//! Reading `embarch/embarch.toml` for `doctor` (embarch-umbrella spec.md §5).
 //!
 //! `ProjectConfig` below mirrors the same shape `embarch-api/src/config.rs`
 //! deserializes — `doctor` has to see exactly what `embarch-api` would see,
@@ -6,7 +6,7 @@
 //! (`flash_format`, `env`; TOML tolerates the extra keys since neither struct
 //! denies unknown fields), and without `embarch-api`'s own validation, since
 //! `doctor`'s whole job is to report what's wrong rather than fail fast on
-//! the first bad field. Another liftable copy (design.md §3 decision 15's
+//! the first bad field. Another liftable copy (decision 15's
 //! pattern), scoped to the checks that need it.
 //!
 //! `CoreConfig` below is *not* mirrored from `embarch-api/src/config.rs` —
@@ -49,8 +49,8 @@ impl CoreConfig {
     }
 }
 
-/// Mirrors `embarch-api/src/config.rs`'s `Discovery` (`embarch-api/design.md`
-/// §3 decision 12) — another liftable copy, per this file's own header note.
+/// Mirrors `embarch-api/src/config.rs`'s `Discovery` (`embarch-api` decision
+/// 12) — another liftable copy, per this file's own header note.
 #[derive(Debug, Default, Deserialize, PartialEq, Eq, Clone, Copy)]
 #[serde(rename_all = "kebab-case")]
 pub enum Discovery {
@@ -69,7 +69,7 @@ pub struct ProjectConfig {
     pub build_cwd: Option<PathBuf>,
     /// Present for `discovery = "static"`; absent for `discovery =
     /// "zephyr-west"`, where it's assembled per call by `embarch-api`
-    /// instead (`embarch-api/design.md` §3 decision 12).
+    /// instead (`embarch-api` decision 12).
     #[serde(default)]
     pub build_command: Option<Vec<String>>,
     #[serde(default)]

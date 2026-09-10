@@ -2,7 +2,7 @@
 //! a WSL2 guest? `locate.rs`'s own Windows-exe lookup needs this directly,
 //! independent of resolving Core's address — everything *that* needs
 //! (gateway detection, the actual probe) now lives inside
-//! `embarch_topology::software::resolve_software_topology` (design.md §3
+//! `embarch_topology::software::resolve_software_topology` (`embarch-topology`
 //! decisions 2, 3), so this file shrank to just this.
 
 /// Is this a WSL2 guest?

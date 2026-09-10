@@ -2,8 +2,7 @@
 //! looking at it.
 //!
 //! All three share one problem (where is `embarch-core`, and can I control it
-//! from here?), which is why they live together. See design.md §3 decisions
-//! 3, 4, 7 and milestone-6.md §3.3.
+//! from here?), which is why they live together. See decisions 3, 4, 7.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -21,7 +20,7 @@ use crate::state::{self, State};
 /// here (embarch-token.md §3.1). Pure so the WSL2 translation is testable.
 ///
 /// This is an existence check only, not token discovery — reading and
-/// validating the value is `doctor`'s job (design.md §5 check 4), and needs
+/// validating the value is `doctor`'s job (embarch-umbrella spec.md §5), and needs
 /// the discovery logic `embarch-api` already has.
 pub fn token_path_for(class: TopologyClass, windows: bool) -> Option<PathBuf> {
     Some(data_dir_for(class, windows)?.join("token"))
@@ -54,7 +53,7 @@ pub fn data_dir_for(class: TopologyClass, windows: bool) -> Option<PathBuf> {
         }
         TopologyClass::Local => Some(PathBuf::from("/var/lib/embarch")),
         // No shared filesystem — the token has to be copied by hand
-        // (design.md §6), so there is no local path to check.
+        // (embarch-umbrella spec.md §6), so there is no local path to check.
         TopologyClass::Remote => None,
     }
 }
@@ -74,7 +73,7 @@ async fn make_plan(host: Option<&str>, port: u16) -> Plan {
     let core = locate::locate_core(saved.core_exe.as_deref(), under_wsl2);
 
     // If Core is already up, it has already answered the question
-    // (embarch-topology/design.md decisions 2, 3: live, in-process, every
+    // (`embarch-topology` decisions 2, 3: live, in-process, every
     // call — no local mirrored topology.rs/env.rs/probe.rs any more).
     let resolved = embarch_topology::software::resolve_software_topology(port, host, None).await;
 
@@ -101,7 +100,7 @@ async fn make_plan(host: Option<&str>, port: u16) -> Plan {
 /// Infer where Core belongs when nothing has answered a probe yet. Under
 /// WSL2 the whole point of the split is that the probe is a Windows USB
 /// device, so a locatable Windows-side binary means Core belongs there — not
-/// in the guest. Shared with `doctor` (design.md §5 check 2) so the two
+/// in the guest. Shared with `doctor` (embarch-umbrella spec.md §5) so the two
 /// commands never disagree about which class an unreachable Core "should" be.
 pub fn infer_class(host: Option<&str>, core: Option<&Located>) -> TopologyClass {
     if host.is_some() {
@@ -247,7 +246,7 @@ fn apply_plan(
         None => println!("embarch-core: not found"),
     }
 
-    // embarch-core/design.md §3 decision 6's amendment: Core's own default
+    // `embarch-core` decision 6's amendment: Core's own default
     // is loopback-only; widening it for the one topology that actually needs
     // a wider address is this call's job, not something a human has to
     // remember to type. Computed once and baked into every `install`
@@ -273,7 +272,7 @@ fn apply_plan(
             (TopologyClass::WslHost, Some(c)) => {
                 // Cannot be done from here: controlling a Windows service
                 // needs an elevated Windows shell, and umbrella never tries
-                // to obtain one (design.md §3 decision 7). Identical in both
+                // to obtain one (decision 7). Identical in both
                 // modes — it was already only ever a printed instruction.
                 println!(
                     "\nCore belongs on the Windows side. In an **elevated Windows** shell, run:\n  \
@@ -350,7 +349,7 @@ fn apply_plan(
             .map(|c| c.path.clone()),
         dev_bench_repo_path,
         // `setup` is about the topology; `deploy-core`'s own paths are its
-        // own (design.md §3 decision 37), and it saves them itself. Carried
+        // own (decision 32), and it saves them itself. Carried
         // through rather than defaulted so a `setup` re-run doesn't wipe
         // what a deploy remembered.
         deploy_source_root: previously_saved.deploy_source_root,
@@ -512,7 +511,7 @@ struct Deferral {
 }
 
 /// A Core on another machine can't be controlled from here — umbrella does
-/// no remote orchestration at all, by design (design.md §3 decision 8). Say
+/// no remote orchestration at all, by design (decision 8). Say
 /// so plainly rather than shelling out to a local binary that would start a
 /// *second*, wrong Core.
 fn refuse_if_remote(saved: &State, verb: &str) -> Option<String> {
@@ -533,7 +532,7 @@ fn refuse_if_remote(saved: &State, verb: &str) -> Option<String> {
 }
 
 /// Start Core. Prefers the installed service; never silently spawns a
-/// detached process (design.md §3 decision 4).
+/// detached process (decision 4).
 pub fn up(foreground: bool) -> i32 {
     let under_wsl2 = env::under_wsl2();
     let saved = state::load();
@@ -595,7 +594,7 @@ pub fn up(foreground: bool) -> i32 {
         _ => {
             // Deliberately not falling through to a detached `run`: a Core
             // that dies with the shell that started it is a worse outcome
-            // than a clear message (design.md §3 decision 4).
+            // than a clear message (decision 4).
             eprintln!(
                 "Could not start the service. Either it isn't installed yet:\n  \
                  sudo \"{}\" install\n\
@@ -680,7 +679,7 @@ mod tests {
     #[test]
     fn a_remote_core_has_no_local_token_path() {
         // Not an oversight: there's no shared filesystem, so the token is
-        // copied by hand (design.md §6).
+        // copied by hand (embarch-umbrella spec.md §6).
         assert_eq!(token_path_for(TopologyClass::Remote, false), None);
     }
 

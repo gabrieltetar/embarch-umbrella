@@ -49,7 +49,7 @@ cargo test
 
 ## Design doc
 
-The full design record — why this is its own sub-project, topology auto-detection, the `doctor` check list, per-firmware-repo integration, MCP-registration options and their trade-offs, and distribution — lives in [embarch-doc/embarch-umbrella/design.md](https://github.com/gabrieltetar/embarch-doc/blob/main/embarch-umbrella/design.md), treated as the durable source of truth ahead of any chat history that produced it. The guide it has to satisfy is [embarch-user-guide.md](https://github.com/gabrieltetar/embarch-doc/blob/main/embarch-user-guide.md).
+The full design record — current truth, open questions, and architecture decisions — lives in [embarch-doc/embarch-umbrella/spec.md](https://github.com/gabrieltetar/embarch-doc/blob/main/embarch-umbrella/spec.md) and its linked `decisions/` and `open.md` files, treated as the durable source of truth ahead of any chat history that produced it. The guide it has to satisfy is [embarch-user-guide.md](https://github.com/gabrieltetar/embarch-doc/blob/main/embarch-user-guide.md).
 
 ## License
 
