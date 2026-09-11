@@ -17,7 +17,7 @@
 //! `/probes/enrolled` or `/probes/enroll`) it must not label it in any way
 //! that implies a live check — "Validated", "Last validated", "Verified", or
 //! similar. That field is enrolment time only, unmoving until someone
-//! re-enrolls; `embarch-core` decision 54 (`decisions/surfaces.md`) is why
+//! re-enrolls; `embarch-core` decision 57 (`decisions/surfaces.md`) is why
 //! Core does not persist a real last-validation instant beside it. The
 //! honest word is **"Enrolled"** (or "Enrolled at"); a surface that wants to
 //! say something about freshness has to call `POST /validate` and show that
