@@ -23,7 +23,12 @@ pub struct State {
     /// `local` / `wsl-host` / `remote`, as concluded by `setup`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topology: Option<String>,
-    /// Only meaningful for `remote`.
+    /// The most recent explicit `--host` given to `setup`, if any — sticky
+    /// across every class, since `apply_plan` writes it forward on a
+    /// `local`/`wsl-host` conclusion exactly as it does on `remote`, never
+    /// clearing it. A stored value attests only to "some run once passed
+    /// `--host`", not to the current class (decision 48,
+    /// `embarch-umbrella/decisions/sticky-host.md`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
     /// Where a Windows-side `embarch-core.exe` was found, when running under
