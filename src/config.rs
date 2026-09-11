@@ -30,86 +30,28 @@
 //! `LoaderVerdict::Unanswerable` fallback) — which is why it's still worth
 //! keeping in sync rather than left maximally permissive.
 //!
-//! `CoreConfig` below is *not* mirrored from `embarch-api/src/config.rs` —
-//! that struct moved out to the shared `embarch-api/crates/embarch-core-client`
-//! crate on 2026-08-24 (`../embarch-doc/embarch-umbrella/decisions/mirrors.md`
-//! 20's amendment). This file still hand-keeps its own `CoreConfig` shape
-//! rather than depending on the shared one for it; see decision 20's
-//! amendment for why that half stays a mirror for now. It now also mirrors
-//! the five `*_timeout_secs` fields the shared crate's `CoreConfig` carries
-//! (`status`/`reset`/`flash`/`serial`/`study`) — absent here since 2026-08-24 and
-//! nothing consulted them, since umbrella's own doctor checks use their own
-//! fixed budgets, not the configured ones. Declared for shape-fidelity with
-//! the mirrored struct, not because anything here reads them yet.
+//! `CoreConfig` is no longer mirrored here at all (`../embarch-doc/embarch-umbrella/decisions/mirrors.md`
+//! 20's second amendment, closing the config half's `CoreConfig` strand):
+//! this file re-exports `embarch_core_client::CoreConfig` directly rather
+//! than hand-keeping a parallel struct, the same move decision 20's first
+//! amendment already made for token resolution. The shared type already
+//! carries both `is_auto()` and `resolve_token()`; doctor's check 4 still
+//! calls `embarch_core_client::token_discovery::resolve_token` directly
+//! (with `token`/`token_env` pulled out first) rather than the latter, so
+//! it can report resolution failures as its own check.
+//!
+//! `ProjectConfig` below is still a hand-kept mirror — see decisions/mirrors.md
+//! 20's second amendment for why that half could not follow `CoreConfig`
+//! out (the type lives inside `embarch-api`'s own binary, not in the shared
+//! crate) and what replaces the diff job for it instead:
+//! `tests/project_config_fixture.rs`.
 
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-fn default_core_port() -> u16 {
-    embarch_topology::software::DEFAULT_CORE_PORT
-}
-
-fn default_status_timeout_secs() -> u64 {
-    10
-}
-fn default_reset_timeout_secs() -> u64 {
-    10
-}
-fn default_flash_timeout_secs() -> u64 {
-    120
-}
-fn default_serial_timeout_secs() -> u64 {
-    15
-}
-fn default_study_timeout_secs() -> u64 {
-    30
-}
-
-#[derive(Debug, Deserialize)]
-pub struct CoreConfig {
-    pub base_url: String,
-    #[serde(default)]
-    pub host: Option<String>,
-    #[serde(default = "default_core_port")]
-    pub port: u16,
-    #[serde(default)]
-    pub token: Option<String>,
-    #[serde(default)]
-    pub token_env: Option<String>,
-    // Shape-fidelity only — nothing here reads these yet (see this file's
-    // header): doctor's own checks use fixed budgets, not the configured
-    // ones. `#[allow(dead_code)]` rather than dropping the fields, the same
-    // posture `zephyr.rs`'s `BoardYml::board` already takes for a field kept
-    // only so the shape parses.
-    #[allow(dead_code)]
-    #[serde(default = "default_status_timeout_secs")]
-    pub status_timeout_secs: u64,
-    #[allow(dead_code)]
-    #[serde(default = "default_reset_timeout_secs")]
-    pub reset_timeout_secs: u64,
-    #[allow(dead_code)]
-    #[serde(default = "default_flash_timeout_secs")]
-    pub flash_timeout_secs: u64,
-    #[allow(dead_code)]
-    #[serde(default = "default_serial_timeout_secs")]
-    pub serial_timeout_secs: u64,
-    #[allow(dead_code)]
-    #[serde(default = "default_study_timeout_secs")]
-    pub study_timeout_secs: u64,
-}
-
-impl CoreConfig {
-    /// Doctor's checks call `embarch_core_client::token_discovery::resolve_token`
-    /// directly with `token`/`token_env` pulled out first, since check 4
-    /// needs to report resolution failures as its own check rather than
-    /// bubbling an `anyhow::Error` — so this type carries no resolution
-    /// method of its own.
-    pub fn is_auto(&self) -> bool {
-        self.base_url.trim().eq_ignore_ascii_case("auto")
-    }
-}
+pub use embarch_core_client::CoreConfig;
 
 /// Mirrors `embarch-api/src/config.rs`'s `Discovery` (`embarch-api` decision
 /// 12) — another liftable copy, per this file's own header note.
@@ -345,5 +287,148 @@ mod tests {
         assert_eq!(config.projects[0].resolved_artifact_path(), None);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Drift guard for `ProjectConfig` — the one mirror `049` could not
+    /// close by depending on a shared crate, since the real type lives
+    /// inside `embarch-api`'s own binary rather than in
+    /// `embarch-api/crates/embarch-core-client`
+    /// (`../embarch-doc/embarch-umbrella/decisions/mirrors.md` 20's second
+    /// amendment). This is the cheaper half instead: a real
+    /// `embarch-api` config fixture (`embarch-api/config.example.toml`,
+    /// read from that repo directly, not copied here — a path-dep sibling
+    /// symlinked beside this worktree) is parsed two ways. First through a
+    /// shadow struct listing **every** field the real upstream
+    /// `ProjectConfig`/`Config` declare today with
+    /// `#[serde(deny_unknown_fields)]`, so a field `embarch-api` adds and
+    /// starts using in its own example config — one this file's mirror
+    /// does not yet know about — fails this test the moment the fixture
+    /// picks it up. Then through *this* file's real `Config`, confirming
+    /// this mirror still parses what upstream now ships.
+    ///
+    /// What this does **not** catch: a field added upstream that never
+    /// makes it into `config.example.toml`'s *uncommented* lines — most of
+    /// that file's optional fields are commented out, so this fixture
+    /// alone under-covers those. Narrower than a full diff job, but a real
+    /// improvement on "nothing fails when they drift" (see this file's own
+    /// header and `open.md`). Widening the fixture is `embarch-api`'s call,
+    /// not this repo's to make by editing that file.
+    ///
+    /// Keep `UpstreamProjectConfig`'s field list in step with
+    /// `embarch-api/src/config.rs`'s real `ProjectConfig` by hand — that's
+    /// the drift this test exists to catch, so there is no shortcut to
+    /// keeping the list itself current.
+    #[test]
+    fn embarch_api_example_config_has_no_field_this_mirror_does_not_know_about() {
+        use std::collections::HashMap;
+
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct UpstreamDefaultTarget {
+            #[serde(default)]
+            board: Option<String>,
+            #[serde(default)]
+            variant: Option<String>,
+            #[serde(default)]
+            revision: Option<String>,
+            #[serde(default)]
+            app: Option<String>,
+        }
+
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct UpstreamProjectConfig {
+            name: String,
+            source_path: PathBuf,
+            #[serde(default)]
+            discovery: Discovery,
+            #[serde(default)]
+            build_cwd: Option<PathBuf>,
+            #[serde(default)]
+            build_command: Option<Vec<String>>,
+            #[serde(default)]
+            artifact_path: Option<PathBuf>,
+            #[serde(default)]
+            chip: Option<String>,
+            flash_format: String,
+            #[serde(default)]
+            base_address: Option<u64>,
+            #[serde(default)]
+            build_timeout_secs: Option<u64>,
+            #[serde(default)]
+            env: HashMap<String, String>,
+            #[serde(default)]
+            serial_port: Option<String>,
+            #[serde(default)]
+            serial_baud: Option<u32>,
+            #[serde(default)]
+            probe_serial: Option<String>,
+            #[serde(default)]
+            west_binary: Option<PathBuf>,
+            #[serde(default)]
+            build_dir_root: Option<PathBuf>,
+            #[serde(default, rename = "targets")]
+            retired_targets: Vec<toml::Value>,
+            #[serde(default, rename = "soc_chip_overrides")]
+            retired_soc_chip_overrides: Option<toml::Value>,
+            #[serde(default)]
+            default_snippets: Vec<String>,
+            #[serde(default)]
+            default_target: Option<UpstreamDefaultTarget>,
+            #[serde(default)]
+            default_extra_args: Vec<String>,
+            #[serde(default)]
+            version_command: Option<Vec<String>>,
+        }
+
+        #[derive(Debug, Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct UpstreamConfig {
+            core: toml::Value,
+            #[serde(default, rename = "projects")]
+            projects: Vec<UpstreamProjectConfig>,
+            #[serde(default)]
+            dev_bench: Option<toml::Value>,
+        }
+
+        let fixture_path =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../embarch-api/config.example.toml");
+        let raw = std::fs::read_to_string(&fixture_path).unwrap_or_else(|e| {
+            panic!(
+                "could not read {} (path-dep sibling missing beside this worktree?): {e}",
+                fixture_path.display()
+            )
+        });
+
+        let upstream: UpstreamConfig = toml::from_str(&raw).unwrap_or_else(|e| {
+            panic!(
+                "{} declares a field `UpstreamProjectConfig`/`UpstreamConfig` in this test \
+                 does not know about (or is missing one this test requires) — \
+                 `embarch-api`'s `ProjectConfig`/`Config` shape moved. Update this test's \
+                 shadow struct to match `embarch-api/src/config.rs`, then check whether this \
+                 file's own `ProjectConfig` needs the same field: {e}",
+                fixture_path.display()
+            )
+        });
+        assert!(
+            !upstream.projects.is_empty(),
+            "{} declared no [[projects]] — nothing was actually exercised",
+            fixture_path.display()
+        );
+
+        // Confirm this repo's own mirror still parses the same fixture —
+        // catches this mirror rejecting a config upstream now ships (e.g. a
+        // newly-required field this file doesn't declare).
+        let mirrored = Config::load_from_path(&fixture_path).unwrap_or_else(|e| {
+            panic!(
+                "this file's own ProjectConfig rejected {}, which the real embarch-api accepts: \
+                 {e}",
+                fixture_path.display()
+            )
+        });
+        assert_eq!(mirrored.projects.len(), upstream.projects.len());
     }
 }
