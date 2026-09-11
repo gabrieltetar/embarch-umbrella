@@ -12,6 +12,16 @@
 //! **A skip always names the number it could not get and why.** That is the
 //! rule check 11 was violating for months by returning a hardcoded warn whose
 //! stated reason had stopped being true (decision 33).
+//!
+//! **If a future check ever renders `confirmed_at_utc_ms`** (from
+//! `/probes/enrolled` or `/probes/enroll`) it must not label it in any way
+//! that implies a live check — "Validated", "Last validated", "Verified", or
+//! similar. That field is enrolment time only, unmoving until someone
+//! re-enrolls; `embarch-core` decision 54 (`decisions/surfaces.md`) is why
+//! Core does not persist a real last-validation instant beside it. The
+//! honest word is **"Enrolled"** (or "Enrolled at"); a surface that wants to
+//! say something about freshness has to call `POST /validate` and show that
+//! response's own `validated_at_utc_ms` instead. See `tasks/umbrella/045`.
 
 use std::error::Error as _;
 use std::io::{BufRead, BufReader, Read, Write};
