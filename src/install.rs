@@ -141,11 +141,12 @@ fn sourcing_line(env_path: &Path) -> String {
 
 const MARKER: &str = "# added by `embarch setup` (embarch-umbrella decision 28, decisions/install.md)";
 
-/// The marker text this file wrote before the four-file split moved `design.md`
-/// out from under it — `design.md` itself no longer exists, but a machine set
-/// up before this change still carries this exact line in its rc file, and
-/// `ensure_not_sourced` (the uninstall half) must keep recognising it or an
-/// old install is left with a dangling comment nothing will ever remove.
+/// The exact text this file wrote before the four-file split moved the doc
+/// `LEGACY_MARKER` names out from under it — that doc no longer exists, but
+/// a machine set up before this change still carries this exact line in its
+/// rc file, and `ensure_not_sourced` (the uninstall half) must keep
+/// recognising it or an old install is left with a dangling comment nothing
+/// will ever remove.
 const LEGACY_MARKER: &str = "# added by `embarch setup` (embarch-umbrella/design.md decision 28)";
 
 /// Which rc files to consider. Only ones that already exist are ever

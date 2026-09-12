@@ -3538,31 +3538,58 @@ fn render_json(checks: &[Check], any_fail: bool) -> String {
 mod tests {
     use super::*;
 
-    /// Every user-visible `Check.detail`/`Check.fix` string is built from a
-    /// literal in this file, and the four-file split (`embarch.md` §6)
-    /// deleted `design.md` and every `milestone-*.md` — a string naming one
-    /// routes an operator to a `git show`-only file (task 025). A source
-    /// comment (`//` or `///`) is not user-visible and is exempt; this scans
-    /// only the code lines that are left once comment-only lines are
-    /// dropped.
+    /// The four-file split (`embarch.md` §6) deleted `design.md` and every
+    /// `milestone-*.md`; a string naming one — in code *or* in a comment,
+    /// since a stale comment misroutes a reader exactly as well as a stale
+    /// `Check.detail` misroutes an operator — routes at a `git show`-only
+    /// file (task 025). This walks every tracked `.rs` file under `src/`,
+    /// not just this one, and does not skip comments.
+    ///
+    /// Two exemptions, both by construction rather than by pattern:
+    /// - this file (`doctor.rs`) is skipped by path, because it necessarily
+    ///   contains the forbidden strings right here in its own test;
+    /// - a line naming `LEGACY_MARKER` (`install.rs`) is skipped by that
+    ///   identifier, because that constant's value must stay byte-for-byte
+    ///   equal to a marker line real installs already have in their rc
+    ///   files, `design.md` and all — see `install.rs` for why.
+    ///
+    /// Nothing else is exempt: inserting a forbidden string into a
+    /// production line of any other tracked source file must fail this
+    /// test.
     #[test]
     fn no_check_text_names_a_document_the_four_file_split_deleted() {
-        let source = include_str!("doctor.rs");
-        // Everything below this module is test code, including the literal
-        // document names this very test greps for — scan production code
-        // only, or the test would fail on its own assertion strings.
-        let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
-        for (i, line) in production.lines().enumerate() {
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("//") {
+        let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let this_file = Path::new(file!()).file_name().unwrap().to_str().unwrap().to_string();
+        for entry in std::fs::read_dir(&src_dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
                 continue;
             }
-            let lower = line.to_ascii_lowercase();
-            assert!(
-                !lower.contains("design.md") && !lower.contains("milestone"),
-                "doctor.rs:{}: non-comment line names a deleted doc: {line:?}",
-                i + 1
-            );
+            let file_name = path.file_name().unwrap().to_str().unwrap().to_string();
+            if file_name == this_file {
+                // Self-exempt by path: this very test necessarily contains
+                // the strings it forbids everywhere else.
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).unwrap();
+            // Test code legitimately exercises these strings (e.g.
+            // `install.rs`'s legacy-marker regression test); only the
+            // production half of each file is in scope.
+            let production = source.split("#[cfg(test)]\nmod tests {").next().unwrap();
+            for (i, line) in production.lines().enumerate() {
+                if line.contains("LEGACY_MARKER") {
+                    // Named exemption: `install.rs`'s LEGACY_MARKER must
+                    // keep the exact old marker text, `design.md` and all.
+                    continue;
+                }
+                let lower = line.to_ascii_lowercase();
+                assert!(
+                    !lower.contains("design.md") && !lower.contains("milestone"),
+                    "{}:{}: line names a deleted doc: {line:?}",
+                    file_name,
+                    i + 1
+                );
+            }
         }
     }
 
