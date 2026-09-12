@@ -27,8 +27,10 @@
 //! leaving the live Core down for several minutes. It happened again on
 //! 2026-08-27, in the session that wrote this module, which is what prompted
 //! it. A deploy that cannot tell success from that is not a deploy; so this
-//! compares the installed binary's length against the freshly built one and
-//! fails loudly when they disagree.
+//! hashes the installed binary against the freshly built one and fails
+//! loudly when they disagree. (A length check shipped first and missed a
+//! same-size rebuild twice in a row — decision 32's amendment — which is why
+//! this compares content instead.)
 //!
 //! **Elevation, and decision 7.** Umbrella's standing posture is that it
 //! never obtains elevation itself — it prints the elevated command and lets
@@ -276,15 +278,33 @@ pub fn elevated_script(win_install: &str, win_built: &str, win_log: &str, servic
     )
 }
 
-/// Did the deploy actually land? Length, not a timestamp: a copy preserves
-/// neither reliably across the `/mnt` boundary, and length is what §4a itself
-/// names as the thing to check.
+/// Did the deploy actually land? Content, not length — decision 32's
+/// amendment: a release rebuild of one constant, or a rename-only change,
+/// produces two builds the same size, and a length check reported "landed"
+/// on both a real cancelled deploy and (once) a genuine no-op it couldn't
+/// tell apart from success.
 ///
 /// Pure, and separate, because "exited 0 having done nothing" is the failure
 /// this whole module exists to catch and it deserves a test rather than a
-/// comment.
-pub fn landed(built_len: u64, installed_len_after: u64) -> bool {
-    built_len == installed_len_after
+/// comment. Parameters are named for what they hold, not what they measure,
+/// so a caller can no longer pass a byte count here by mistake.
+pub fn landed(built_digest: [u8; 32], installed_digest_after: [u8; 32]) -> bool {
+    built_digest == installed_digest_after
+}
+
+/// SHA-256 of a file's contents, for [`landed`]. Not a length and not a
+/// timestamp — a copy preserves neither reliably across the `/mnt` boundary,
+/// and length is exactly the check decision 32's amendment retired.
+fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
+    let bytes = std::fs::read(path)?;
+    Ok(hash_bytes(&bytes))
+}
+
+/// The digest [`hash_file`] takes off disk, split out so tests can hash a
+/// literal without writing a file.
+fn hash_bytes(bytes: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(bytes).into()
 }
 
 /// Runs the whole deploy. Returns a process exit code.
@@ -400,21 +420,17 @@ pub async fn deploy_core(
     }
 
     let built = plan.built_exe();
-    let built_len = match std::fs::metadata(&built) {
-        Ok(m) => m.len(),
+    let built_digest = match hash_file(&built) {
+        Ok(d) => d,
         Err(e) => {
             println!("deploy-core: no build output at {}: {e}", built.display());
             return EXIT_FAILURE;
         }
     };
-    let installed_len_before = std::fs::metadata(&plan.install_target).map(|m| m.len()).ok();
-    if installed_len_before == Some(built_len) {
-        println!(
-            "note: the installed binary is already {built_len} bytes — this deploy may be a \
-             no-op, and the verification below cannot tell the difference. Rebuild after a real \
-             change if that is unexpected."
-        );
-    }
+    // A same-length note used to gate on length here too, but length is
+    // exactly the signal decision 32's amendment retired — a same-size
+    // rebuild is the common case, not a corner case, so it is not worth
+    // printing on its own. The digest comparison below is the real check.
 
     // --- the elevated half ------------------------------------------------
     let Some(script_dir) = windows_temp_dir() else {
@@ -451,9 +467,14 @@ pub async fn deploy_core(
             "deploy-core: wrote {}\n\nRun this in a Windows shell (it will prompt for \
              elevation):\n  powershell -NoProfile -Command \"Start-Process powershell -Verb \
              RunAs -Wait -ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-File','{}'\"\n\n\
-             Then re-run with --verify-only to confirm it landed.",
+             This mode does not verify the result itself — there is no separate --verify-only \
+             flag. Check {} against the build at {} yourself (a hash, not a size — same-size \
+             rebuilds are common) or run `deploy-core` again without --print-script for the full, \
+             self-verifying path.",
             script_path.display(),
-            win_script
+            win_script,
+            win_install,
+            win_built
         );
         return 0;
     }
@@ -475,7 +496,12 @@ pub async fn deploy_core(
     }
 
     // The transcript is the only account of what the elevated child did —
-    // its console is gone by now (§4a).
+    // its console is gone by now (§4a). A missing transcript is a hard
+    // failure in its own right, checked before the content comparison below:
+    // decision 32's amendment is explicit that the success line must not
+    // depend on the service merely being `RUNNING`, which is true of a
+    // deploy that did nothing at all — and a missing transcript is exactly
+    // "the elevated child never started", the clearest case of that.
     match std::fs::read_to_string(&log_path) {
         Ok(text) => {
             println!("--- elevated transcript ---");
@@ -490,27 +516,31 @@ pub async fn deploy_core(
             }
             println!("---------------------------");
         }
-        Err(_) => println!(
-            "no transcript at {} — the elevated child never started, which is what a UAC \
-             prompt that never rendered looks like",
-            log_path.display()
-        ),
+        Err(_) => {
+            println!(
+                "deploy-core: FAILED. No transcript at {} — the elevated child never started, \
+                 which is what a UAC prompt that never rendered looks like. Re-run, or use \
+                 --print-script and run the elevated step yourself.",
+                log_path.display()
+            );
+            return EXIT_FAILURE;
+        }
     }
 
     // --- verify, because exit code 0 is not evidence ----------------------
-    let installed_len_after = match std::fs::metadata(&plan.install_target) {
-        Ok(m) => m.len(),
+    let installed_digest_after = match hash_file(&plan.install_target) {
+        Ok(d) => d,
         Err(e) => {
-            println!("deploy-core: can't stat {} afterwards: {e}", plan.install_target.display());
+            println!("deploy-core: can't read {} afterwards: {e}", plan.install_target.display());
             return EXIT_FAILURE;
         }
     };
-    if !landed(built_len, installed_len_after) {
+    if !landed(built_digest, installed_digest_after) {
         println!(
-            "deploy-core: FAILED to land. {} is {installed_len_after} bytes; the build is \
-             {built_len}. The commonest cause is a UAC consent dialog that never rendered — that \
-             exits 0 and does nothing (`embarch-dev-workflow.md` §4a). Re-run, or use \
-             --print-script and run the elevated step yourself.",
+            "deploy-core: FAILED to land. {} does not match the build's content. The commonest \
+             cause is a UAC consent dialog that never rendered — that exits 0 and does nothing \
+             (`embarch-dev-workflow.md` §4a). Re-run, or use --print-script and run the elevated \
+             step yourself.",
             plan.install_target.display()
         );
         return EXIT_FAILURE;
@@ -787,8 +817,25 @@ mod tests {
     /// nothing.
     #[test]
     fn a_deploy_that_did_nothing_is_not_a_deploy() {
-        assert!(landed(15_846_400, 15_846_400));
-        assert!(!landed(15_846_400, 15_838_720));
+        let a = [0xAA; 32];
+        let b = [0xBB; 32];
+        assert!(landed(a, a));
+        assert!(!landed(a, b));
+    }
+
+    /// Decision 32's amendment, the exact case a byte count cannot catch: two
+    /// builds the same length with different content — a rebuild of one
+    /// constant, or a rename-only change.
+    #[test]
+    fn same_length_different_content_is_not_landed() {
+        let built = hash_bytes(b"embarch-core build one, 4096 bytes padded......");
+        let installed = hash_bytes(b"embarch-core build two, 4096 bytes padded.....!");
+        assert_eq!(
+            b"embarch-core build one, 4096 bytes padded......".len(),
+            b"embarch-core build two, 4096 bytes padded.....!".len(),
+            "the test fixture itself must be the same-length case"
+        );
+        assert!(!landed(built, installed));
     }
 
     #[test]
