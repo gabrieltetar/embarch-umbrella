@@ -70,8 +70,8 @@ pub struct Check {
     pub detail: String,
     pub fix: Option<String>,
     /// A stable machine-readable outcome, for a check whose `status` alone
-    /// does not say which state it is in (decision 37). Checks 1, 5, 10 and
-    /// 14 carry one today; `None` renders as JSON `null` rather than being
+    /// does not say which state it is in (decision 37). Checks 1, 5, 10, 13,
+    /// 14 and 17 carry one today; `None` renders as JSON `null` rather than being
     /// omitted, so the key is always present and a consumer never has to
     /// distinguish "absent" from "no code".
     ///

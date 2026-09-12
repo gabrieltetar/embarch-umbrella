@@ -28,7 +28,7 @@ clap = { version = "4.6.2", features = ["derive"] }
 # probe-rs/serialport (see this file's own "deliberately absent" comment
 # below, which stays true with this dependency in place).
 embarch-topology = { path = "../embarch-topology" }
-# ../embarch-doc/embarch-umbrella/decisions/doctor.md 33: `doctor`'s check 11
+# decision 33: `doctor`'s check 11
 # needs a host-type schema version to compare Core's served one against, and
 # the only honest local source of one is this constant. Default features only
 # — the `std`/`gatt-extract`/`study-ui` halves are authoring-time tools this
