@@ -341,7 +341,12 @@ fn apply_plan(
     let saved = State {
         schema_version: state::STATE_SCHEMA_VERSION,
         topology: Some(plan.class.as_str().to_string()),
-        host: plan.host,
+        // Sticky only for `remote` (decision 51,
+        // `embarch-umbrella/decisions/sticky-host.md`): a `local`/`wsl-host`
+        // conclusion clears whatever `--host` a previous run recorded, so a
+        // stale value can't outlive the run that gave it and steer a later
+        // one into a wrong `Remote` inference.
+        host: if plan.class == TopologyClass::Remote { plan.host } else { None },
         core_exe: plan
             .core
             .as_ref()
@@ -812,6 +817,76 @@ mod tests {
         // plan says a copy would land at.
         let plan = install::plan_install(&source, &bin_dir, Some(&home));
         assert!(plan.destinations().contains(&bin_dir.join(locate::native_name("embarch-core"))));
+
+        std::fs::remove_dir_all(&sandbox).unwrap();
+    }
+
+    /// Decision 51: a `remote` conclusion writes `--host` forward.
+    #[test]
+    fn a_remote_conclusion_saves_the_host() {
+        let sandbox = std::env::temp_dir().join(format!(
+            "embarch-umbrella-host-save-{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&sandbox);
+        let state_path = sandbox.join("config").join("umbrella.toml");
+        let loc = Locations {
+            source_dir: None,
+            bin_dir: None,
+            home: None,
+            state_path: Some(state_path.clone()),
+        };
+        let plan = Plan {
+            class: TopologyClass::Remote,
+            host: Some("bench.local".to_string()),
+            core: None,
+            already_running: true,
+        };
+
+        apply_plan(plan, State::default(), None, &loc, false);
+
+        let saved = state::load_from(&state_path).unwrap();
+        assert_eq!(saved.host.as_deref(), Some("bench.local"));
+
+        std::fs::remove_dir_all(&sandbox).unwrap();
+    }
+
+    /// Decision 51: a later non-`remote` run clears whatever `--host` a
+    /// previous `remote` run left behind, rather than carrying it forward as
+    /// a leftover that could outlive the run that gave it.
+    #[test]
+    fn a_local_conclusion_clears_a_previously_saved_host() {
+        let sandbox = std::env::temp_dir().join(format!(
+            "embarch-umbrella-host-clear-{:?}",
+            std::thread::current().id()
+        ));
+        let _ = std::fs::remove_dir_all(&sandbox);
+        let state_path = sandbox.join("config").join("umbrella.toml");
+        let loc = Locations {
+            source_dir: None,
+            bin_dir: None,
+            home: None,
+            state_path: Some(state_path.clone()),
+        };
+        let previously_saved = State {
+            host: Some("bench.local".to_string()),
+            ..State::default()
+        };
+        let plan = Plan {
+            class: TopologyClass::Local,
+            // `make_plan` would have carried the saved host forward here
+            // (`host.map(...).or(saved.host)`) since no `--host` was given
+            // this run either — the clearing has to happen after that, on
+            // the concluded class, not by never inheriting it.
+            host: previously_saved.host.clone(),
+            core: None,
+            already_running: true,
+        };
+
+        apply_plan(plan, previously_saved, None, &loc, false);
+
+        let saved = state::load_from(&state_path).unwrap();
+        assert_eq!(saved.host, None, "a local conclusion must not keep a stale saved host");
 
         std::fs::remove_dir_all(&sandbox).unwrap();
     }

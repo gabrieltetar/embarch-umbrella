@@ -24,11 +24,12 @@ pub struct State {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub topology: Option<String>,
     /// The most recent explicit `--host` given to `setup`, if any — sticky
-    /// across every class, since `apply_plan` writes it forward on a
-    /// `local`/`wsl-host` conclusion exactly as it does on `remote`, never
-    /// clearing it. A stored value attests only to "some run once passed
-    /// `--host`", not to the current class (decision 48,
-    /// `embarch-umbrella/decisions/sticky-host.md`).
+    /// only across a `remote` conclusion: `apply_plan` carries it forward
+    /// when the run still concludes `remote`, but a `local`/`wsl-host`
+    /// conclusion clears it, since only `remote` ever has one. A stored
+    /// value attests only to "the run that wrote this file most recently
+    /// concluded `remote` with this host", not to anything earlier
+    /// (decisions 48 and 51, `embarch-umbrella/decisions/sticky-host.md`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host: Option<String>,
     /// Where a Windows-side `embarch-core.exe` was found, when running under
@@ -108,7 +109,7 @@ pub fn load() -> State {
     load_from(&path).unwrap_or_default()
 }
 
-fn load_from(path: &Path) -> Option<State> {
+pub(crate) fn load_from(path: &Path) -> Option<State> {
     let text = std::fs::read_to_string(path).ok()?;
     match toml::from_str::<State>(&text) {
         Ok(state) => Some(state),
