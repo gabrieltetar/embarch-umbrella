@@ -48,7 +48,7 @@ embarch-core-client = { path = "../embarch-api/crates/embarch-core-client" }
 # rustls rather than native-tls, matching embarch-api: no system OpenSSL
 # dependency, so this stays trivially buildable wherever Core happens to run.
 reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] }
-# embarch-umbrella decision 33 (deploy.md, amendment): `deploy-core`'s own
+# embarch-umbrella decisions 32/50 (deploy.md): `deploy-core`'s own
 # landed-check has to compare file content, not length — a release rebuild of
 # one constant, or a rename-only change, produces two builds the same size.
 # Pure Rust, no system OpenSSL, matching this crate's rustls choice above.
