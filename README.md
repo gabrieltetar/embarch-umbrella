@@ -41,6 +41,26 @@ human ------CLI------> embarch-api ----------------^
 
 ## Building
 
+**This repo does not build on its own.** Three sibling repos must be cloned into the
+same parent directory, because they are depended on by relative path:
+
+| Sibling | Why |
+|---|---|
+| [`embarch-topology`](https://github.com/gabrieltetar/embarch-topology) | the board registry |
+| [`embarch-study-designer`](https://github.com/gabrieltetar/embarch-study-designer) | the shared study/registry type model |
+| [`embarch-api`](https://github.com/gabrieltetar/embarch-api) | **not for itself** — for `crates/embarch-core-client`, which lives inside that repo |
+
+That third one is the trap: nothing in this repo's dependency list reads like
+"`embarch-api`", so a reader checking which siblings are needed will usually miss it.
+
+So the layout cargo expects is `<parent>/embarch-umbrella`, `<parent>/embarch-topology`,
+`<parent>/embarch-study-designer`, `<parent>/embarch-api`. Clone this repo on its own and
+`cargo build` fails with `failed to read ../embarch-topology/Cargo.toml` — an error naming
+a path outside this repo, which means nothing more than "the sibling is not there".
+
+Path dependencies rather than git or registry ones is a deliberate choice, not an
+oversight: `embarch-study-designer` decision 8 and `embarch-topology` decision 13.
+
 ```sh
 cargo build --release
 cargo clippy --all-targets -- -D warnings
