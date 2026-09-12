@@ -692,33 +692,37 @@ pub(crate) async fn authed_get(base_url: &str, path: &str, token: &str, budget: 
     Ok((status, body))
 }
 
-async fn check_token(probe: &CoreProbe, config: Option<&Config>) -> (Check, Option<AuthedStatus>) {
-    let Some(base_url) = &probe.winner_base_url else {
-        return (
-            check(4, "token resolves and matches", Status::Warn, "skipped — Core isn't reachable (see check 3)"),
+const CHECK_4_NAME: &str = "token resolves and matches";
+
+/// What check 4's `async` half learned, before any of it is judged. Each
+/// variant is exactly one thing the gathering step can come back with — a
+/// missing winner, a token-resolution error, or one `GET /status` outcome —
+/// so [`judge_token`] can be handed any of them without a network, a Core or
+/// a bench (decision 39; same split as [`judge_growth`]/[`check_growth`]).
+enum TokenAttempt {
+    Unreachable,
+    TokenError(String),
+    Ok200(String),
+    Unauthorized,
+    OtherStatus(u16, String),
+    RequestFailed(String),
+}
+
+/// The pure half of check 4, so every arm is testable without a live Core.
+fn judge_token(attempt: TokenAttempt) -> (Check, Option<AuthedStatus>) {
+    match attempt {
+        TokenAttempt::Unreachable => (
+            check(4, CHECK_4_NAME, Status::Warn, "skipped — Core isn't reachable (see check 3)"),
             None,
-        );
-    };
-
-    let (token_cfg, token_env) = config
-        .map(|c| (c.core.token.clone(), c.core.token_env.clone()))
-        .unwrap_or((None, None));
-
-    let token = match embarch_core_client::token_discovery::resolve_token(token_cfg, token_env) {
-        Ok(t) => t,
-        Err(e) => {
-            return (
-                with_fix(
-                    check(4, "token resolves and matches", Status::Fail, format!("{e:#}")),
-                    "see ../embarch-doc/embarch-token.md",
-                ),
-                None,
-            )
-        }
-    };
-
-    match authed_get(base_url, "/status", &token, DEVICE_SCAN_GET_TIMEOUT).await {
-        Ok((200, body)) => {
+        ),
+        TokenAttempt::TokenError(e) => (
+            with_fix(
+                check(4, CHECK_4_NAME, Status::Fail, e),
+                "see ../embarch-doc/embarch-token.md",
+            ),
+            None,
+        ),
+        TokenAttempt::Ok200(body) => {
             let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
             let probes = parsed
                 .as_ref()
@@ -736,23 +740,23 @@ async fn check_token(probe: &CoreProbe, config: Option<&Config>) -> (Check, Opti
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
             (
-                check(4, "token resolves and matches", Status::Pass, "authenticated (200)"),
+                check(4, CHECK_4_NAME, Status::Pass, "authenticated (200)"),
                 Some(AuthedStatus { probes, study_designer_schema_version, core_version }),
             )
         }
-        Ok((401, _)) => (
+        TokenAttempt::Unauthorized => (
             with_fix(
-                check(4, "token resolves and matches", Status::Fail, "Core rejected the token (401)"),
+                check(4, CHECK_4_NAME, Status::Fail, "Core rejected the token (401)"),
                 "the resolved token doesn't match Core's. See ../embarch-doc/embarch-token.md — if \
                  Core was reinstalled its token file changed underneath the old value.",
             ),
             None,
         ),
-        Ok((status, body)) => (
+        TokenAttempt::OtherStatus(status, body) => (
             with_fix(
                 check(
                     4,
-                    "token resolves and matches",
+                    CHECK_4_NAME,
                     Status::Fail,
                     format!("unexpected HTTP {status}: {}", one_line(&body)),
                 ),
@@ -760,14 +764,36 @@ async fn check_token(probe: &CoreProbe, config: Option<&Config>) -> (Check, Opti
             ),
             None,
         ),
-        Err(e) => (
+        TokenAttempt::RequestFailed(e) => (
             with_fix(
-                check(4, "token resolves and matches", Status::Fail, e),
+                check(4, CHECK_4_NAME, Status::Fail, e),
                 "Core answered the unauthenticated topology probe but not this request — check for a \
                  flaky connection",
             ),
             None,
         ),
+    }
+}
+
+async fn check_token(probe: &CoreProbe, config: Option<&Config>) -> (Check, Option<AuthedStatus>) {
+    let Some(base_url) = &probe.winner_base_url else {
+        return judge_token(TokenAttempt::Unreachable);
+    };
+
+    let (token_cfg, token_env) = config
+        .map(|c| (c.core.token.clone(), c.core.token_env.clone()))
+        .unwrap_or((None, None));
+
+    let token = match embarch_core_client::token_discovery::resolve_token(token_cfg, token_env) {
+        Ok(t) => t,
+        Err(e) => return judge_token(TokenAttempt::TokenError(format!("{e:#}"))),
+    };
+
+    match authed_get(base_url, "/status", &token, DEVICE_SCAN_GET_TIMEOUT).await {
+        Ok((200, body)) => judge_token(TokenAttempt::Ok200(body)),
+        Ok((401, _)) => judge_token(TokenAttempt::Unauthorized),
+        Ok((status, body)) => judge_token(TokenAttempt::OtherStatus(status, body)),
+        Err(e) => judge_token(TokenAttempt::RequestFailed(e)),
     }
 }
 
@@ -2270,15 +2296,56 @@ fn check_schema_versions(
 
 // ---- check 12: dev-bench port -----------------------------------------------
 
+const CHECK_12_NAME: &str = "dev-bench port detected";
+
+/// What check 12's `async` half learned, before any of it is judged. Same
+/// split as [`TokenAttempt`]/[`judge_token`]: one variant per thing the
+/// gathering step can come back with, so [`judge_dev_bench`] never touches a
+/// network, a Core or a bench (decision 39).
+enum DevBenchAttempt {
+    Unreachable,
+    NoAuthedStatus,
+    TokenError,
+    Ok200(String),
+    NotFound404,
+    OtherStatus(u16, String),
+    RequestFailed(String),
+}
+
+/// The pure half of check 12, so every arm is testable without a live Core.
+fn judge_dev_bench(attempt: DevBenchAttempt) -> Check {
+    match attempt {
+        DevBenchAttempt::Unreachable => {
+            check(12, CHECK_12_NAME, Status::Warn, "skipped — Core isn't reachable (see check 3)")
+        }
+        DevBenchAttempt::NoAuthedStatus => {
+            check(12, CHECK_12_NAME, Status::Warn, "skipped — no authenticated status (see check 4)")
+        }
+        DevBenchAttempt::TokenError => {
+            check(12, CHECK_12_NAME, Status::Warn, "skipped — could not resolve token")
+        }
+        DevBenchAttempt::Ok200(body) => {
+            check(12, CHECK_12_NAME, Status::Pass, format!("detected: {}", one_line(&body)))
+        }
+        DevBenchAttempt::NotFound404 => {
+            check(12, CHECK_12_NAME, Status::Pass, "not plugged in (expected if you have no bench)")
+        }
+        DevBenchAttempt::OtherStatus(status, body) => {
+            check(12, CHECK_12_NAME, Status::Warn, format!("HTTP {status}: {}", one_line(&body)))
+        }
+        DevBenchAttempt::RequestFailed(e) => check(12, CHECK_12_NAME, Status::Warn, e),
+    }
+}
+
 async fn check_dev_bench(probe: &CoreProbe, authed: Option<&AuthedStatus>, config: Option<&Config>) -> Check {
     let Some(base_url) = &probe.winner_base_url else {
-        return check(12, "dev-bench port detected", Status::Warn, "skipped — Core isn't reachable (see check 3)");
+        return judge_dev_bench(DevBenchAttempt::Unreachable);
     };
     // Not otherwise consulted here — its only job was proving a token exists
     // (check 4). Re-deriving that same token below is cheap and avoids
     // threading a raw secret through one more layer of state.
     if authed.is_none() {
-        return check(12, "dev-bench port detected", Status::Warn, "skipped — no authenticated status (see check 4)");
+        return judge_dev_bench(DevBenchAttempt::NoAuthedStatus);
     }
 
     let (token_cfg, token_env) = config
@@ -2286,18 +2353,14 @@ async fn check_dev_bench(probe: &CoreProbe, authed: Option<&AuthedStatus>, confi
         .unwrap_or((None, None));
     let token = match embarch_core_client::token_discovery::resolve_token(token_cfg, token_env) {
         Ok(t) => t,
-        Err(_) => return check(12, "dev-bench port detected", Status::Warn, "skipped — could not resolve token"),
+        Err(_) => return judge_dev_bench(DevBenchAttempt::TokenError),
     };
 
     match authed_get(base_url, "/dev-bench/port", &token, DEVICE_SCAN_GET_TIMEOUT).await {
-        Ok((200, body)) => {
-            check(12, "dev-bench port detected", Status::Pass, format!("detected: {}", one_line(&body)))
-        }
-        Ok((404, _)) => check(12, "dev-bench port detected", Status::Pass, "not plugged in (expected if you have no bench)"),
-        Ok((status, body)) => {
-            check(12, "dev-bench port detected", Status::Warn, format!("HTTP {status}: {}", one_line(&body)))
-        }
-        Err(e) => check(12, "dev-bench port detected", Status::Warn, e),
+        Ok((200, body)) => judge_dev_bench(DevBenchAttempt::Ok200(body)),
+        Ok((404, _)) => judge_dev_bench(DevBenchAttempt::NotFound404),
+        Ok((status, body)) => judge_dev_bench(DevBenchAttempt::OtherStatus(status, body)),
+        Err(e) => judge_dev_bench(DevBenchAttempt::RequestFailed(e)),
     }
 }
 
@@ -5506,10 +5569,11 @@ mod tests {
     /// before the break. So the guard is on the rendered text of *every*
     /// verdict, not on the arm that was caught.
     ///
-    /// **The two checks it cannot reach.** Checks 4 and 12 have no pure
-    /// judge: both are `async` and decide nothing without a live Core, so
-    /// their text is absent from this corpus and this test claims nothing
-    /// about it.
+    /// **Checks 4 and 12 go through [`judge_token`]/[`judge_dev_bench`], not
+    /// [`check_token`]/[`check_dev_bench`].** Both checks' `async` half only
+    /// gathers — a winner, a token, one HTTP response — and hands what it
+    /// gathered to a synchronous judge, the same split [`judge_growth`]
+    /// below uses. Every arm each judge can produce is in this corpus.
     ///
     /// **Check 16 goes through [`judge_growth`], not [`check_growth`].** The
     /// wrapper resolves a real data directory, which every test in this
@@ -5592,6 +5656,26 @@ mod tests {
             out.push(check_reachable(&reached));
             out.push(check_service(&reached, None, None, Some(&core)));
         }
+
+        // ---- check 4 --------------------------------------------------------
+        out.push(judge_token(TokenAttempt::Unreachable).0);
+        out.push(judge_token(TokenAttempt::TokenError("no token configured and EMBARCH_CORE_TOKEN is unset".to_string())).0);
+        out.push(judge_token(TokenAttempt::Ok200(r#"{"probes":[],"study_designer_schema_version":17,"core_version":"0.1.0"}"#.to_string())).0);
+        out.push(judge_token(TokenAttempt::Ok200("not json".to_string())).0);
+        out.push(judge_token(TokenAttempt::Unauthorized).0);
+        out.push(judge_token(TokenAttempt::OtherStatus(500, "internal error".to_string())).0);
+        out.push(judge_token(TokenAttempt::RequestFailed("request to http://127.0.0.1:4884/status timed out".to_string())).0);
+
+        // ---- check 12 -------------------------------------------------------
+        out.push(judge_dev_bench(DevBenchAttempt::Unreachable));
+        out.push(judge_dev_bench(DevBenchAttempt::NoAuthedStatus));
+        out.push(judge_dev_bench(DevBenchAttempt::TokenError));
+        out.push(judge_dev_bench(DevBenchAttempt::Ok200(r#"{"port":"COM17"}"#.to_string())));
+        out.push(judge_dev_bench(DevBenchAttempt::NotFound404));
+        out.push(judge_dev_bench(DevBenchAttempt::OtherStatus(500, "internal error".to_string())));
+        out.push(judge_dev_bench(DevBenchAttempt::RequestFailed(
+            "request to http://127.0.0.1:4884/dev-bench/port timed out".to_string(),
+        )));
 
         // ---- check 5 --------------------------------------------------------
         let usb = tempdir();
@@ -5789,12 +5873,11 @@ mod tests {
         let verdicts = pure_verdicts();
 
         // The corpus itself, asserted: an emptied or shrunken one would pass
-        // the guard below while guarding nothing. 4 and 12 are absent by
-        // construction — neither has a pure judge.
+        // the guard below while guarding nothing.
         let mut covered: Vec<u8> = verdicts.iter().map(|c| c.n).collect();
         covered.sort_unstable();
         covered.dedup();
-        assert_eq!(covered, vec![1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17]);
+        assert_eq!(covered, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
 
         let mut offenders: Vec<String> = Vec::new();
         let mut verbatim: Vec<u8> = Vec::new();
