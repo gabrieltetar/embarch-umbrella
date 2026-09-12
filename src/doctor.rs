@@ -3542,8 +3542,14 @@ mod tests {
     /// `milestone-*.md`; a string naming one — in code *or* in a comment,
     /// since a stale comment misroutes a reader exactly as well as a stale
     /// `Check.detail` misroutes an operator — routes at a `git show`-only
-    /// file (task 025). This walks every tracked `.rs` file under `src/`,
+    /// file (task 025). This walks every `.rs` file **directly in `src/`**,
     /// not just this one, and does not skip comments.
+    ///
+    /// `src/` is flat today (12 files, no subdirectories), so "directly in"
+    /// and "under" are the same set — but `read_dir` does not recurse, so the
+    /// first module moved into a subdirectory would leave this guard silently
+    /// enforcing less than it says. That is the exact shape of the defect
+    /// this test was widened to fix, so it is stated rather than assumed.
     ///
     /// Two exemptions, both by construction rather than by pattern:
     /// - this file (`doctor.rs`) is skipped by path, because it necessarily
