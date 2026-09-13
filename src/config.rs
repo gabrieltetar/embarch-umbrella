@@ -86,19 +86,14 @@ pub struct ProjectConfig {
     /// this mirror too, the same way it fails upstream.
     #[allow(dead_code)]
     pub flash_format: String,
-    /// **Not upstream** — `embarch-api` retired this field (its own
-    /// decision 15's UNC-guessing retrospective) but still tolerates it by
-    /// name, on the record, *because* `embarch-umbrella` still scaffolds and
-    /// reads it (`embarch-api` decision 64, `decisions/shape.md`): `init.rs`
-    /// writes it for a `discovery = "static"` project on a WSL2 split
-    /// (this repo's decision 16), and `doctor` check 9 is the WSL2
-    /// UNC-vs-real-path comparison decision 16 describes. This is
-    /// deliberately kept, not a fourth strand of drift to close — removing
-    /// it would need `init.rs`'s write removed in the same change *and*
-    /// `embarch-api` decision 64's toleration retired in step, which is a
-    /// change to another sub-project's repo and out of this task's scope.
-    #[serde(default)]
-    pub artifact_path_for_core: Option<String>,
+    // `artifact_path_for_core` used to be declared here — the one field this
+    // mirror carried that upstream had already retired (`embarch-api`
+    // decision 15). It is gone now that `init.rs` no longer scaffolds it and
+    // check 9 no longer reads it (suite task 038): this mirror carries
+    // upstream's shape **minus the fields nothing here reads** (decision 20),
+    // and it denies no unknown keys, so a config already in the field that
+    // still carries the key keeps loading here exactly as it does upstream.
+    // Removing it from this struct is not a refusal and must not read as one.
     /// Only meaningful for `discovery = "zephyr-west"`.
     #[serde(default)]
     pub west_binary: Option<PathBuf>,

@@ -133,16 +133,6 @@ pub fn with_build_dir(argv: &[String], build_dir: &str) -> Vec<String> {
     out
 }
 
-/// The Windows-visible UNC form of a WSL2 path, for `artifact_path_for_core`
-/// (`embarch-api` spec.md §4) — what a Windows-hosted Core needs in
-/// order to open a file the build wrote inside the WSL2 guest.
-pub fn wsl_unc_path(distro: &str, absolute: &Path) -> String {
-    let tail = absolute
-        .to_string_lossy()
-        .trim_start_matches('/')
-        .replace('/', "\\");
-    format!("\\\\wsl.localhost\\{distro}\\{tail}")
-}
 
 /// Find where a previous build actually put its artifact.
 ///
@@ -460,9 +450,9 @@ pub struct Scaffold {
 }
 
 /// Build the config text for a `discovery = "zephyr-west"` project
-/// (decision 17, `embarch-api` decision 12): no
-/// `build_command`/`chip`/`artifact_path`/`artifact_path_for_core` — those
-/// are resolved live, per call, by `embarch-api` instead.
+/// (decision 17, `embarch-api` decision 12): no `build_command`/`chip`/
+/// `artifact_path` — those are resolved live, per call, by `embarch-api`
+/// instead.
 pub fn render_zephyr_west_config(
     name: &str,
     source_path: &Path,
@@ -508,7 +498,6 @@ pub fn render_config(
     build_command: &[String],
     build_command_notes: &[String],
     artifact_path: &str,
-    unc_artifact: Option<&str>,
 ) -> String {
     let argv = build_command
         .iter()
@@ -528,14 +517,6 @@ pub fn render_config(
             }
         })
         .collect::<String>();
-    let unc_line = match unc_artifact {
-        Some(p) => format!(
-            "# Windows-visible form of the same file, for a Core running on the Windows\n\
-             # side of this WSL2 split (decision 16, decisions/mirrors.md).\nartifact_path_for_core = {:?}\n",
-            p
-        ),
-        None => String::new(),
-    };
     format!(
         "# Written by `embarch init`. Local to this clone — excluded via\n\
          # .git/info/exclude, so nothing tracked by this repo was modified.\n\
@@ -555,14 +536,12 @@ pub fn render_config(
          #   probe-rs chip list | grep -i <your soc>\n\
          chip = \"CHANGE-ME\"\n\
          flash_format = \"hex\"\n\
-         build_timeout_secs = 900\n\
-         {unc_line}",
+         build_timeout_secs = 900\n",
         name = name,
         source = source_path.to_string_lossy(),
         notes = notes,
         argv = argv,
         artifact_path = artifact_path,
-        unc_line = unc_line,
     )
 }
 
@@ -799,20 +778,8 @@ pub fn init(uninstall: bool) -> i32 {
         }
     };
 
-    let unc = std::env::var("WSL_DISTRO_NAME")
-        .ok()
-        .filter(|d| !d.is_empty())
-        .map(|distro| wsl_unc_path(&distro, &repo.join(&artifact_path)));
-
     let scaffold = Scaffold {
-        toml: render_config(
-            &name,
-            &repo,
-            &build_command,
-            &plan.notes,
-            &artifact_path,
-            unc.as_deref(),
-        ),
+        toml: render_config(&name, &repo, &build_command, &plan.notes, &artifact_path),
         warnings,
     };
 
@@ -941,26 +908,21 @@ mod tests {
     }
 
     #[test]
-    fn unc_path_matches_what_a_windows_core_needs() {
-        assert_eq!(
-            wsl_unc_path("Ubuntu-24.04", Path::new("/home/me/fw/embarch/build/zephyr/zephyr.hex")),
-            "\\\\wsl.localhost\\Ubuntu-24.04\\home\\me\\fw\\embarch\\build\\zephyr\\zephyr.hex"
-        );
-    }
-
-    #[test]
-    fn rendered_config_quotes_windows_paths_correctly() {
+    fn a_scaffolded_config_never_names_the_retired_unc_field() {
+        // `artifact_path_for_core` and its UNC computation are retired
+        // upstream (`embarch-api` decision 15), and this repo stopped
+        // scaffolding it — the first clause of `embarch-api` decision 64's
+        // "Ends when". `embarch-api` still *tolerates* the key for configs
+        // already in the field, so the property worth pinning here is that
+        // `init` produces no new one, not that the key is refused anywhere.
         let cfg = render_config(
             "fw",
             Path::new("/home/me/fw"),
             &["west".to_string(), "build".to_string()],
             &[],
             "embarch/build/zephyr/zephyr.hex",
-            Some("\\\\wsl.localhost\\Ubuntu\\home\\me\\fw\\x.hex"),
         );
-        // Backslashes must survive into the TOML as escaped literals, or Core
-        // gets a mangled path — the failure `embarch-api` spec.md §4 records.
-        assert!(cfg.contains(r#"artifact_path_for_core = "\\\\wsl.localhost\\Ubuntu\\home\\me\\fw\\x.hex""#), "{cfg}");
+        assert!(!cfg.contains("artifact_path_for_core"), "{cfg}");
         assert!(cfg.contains(r#"base_url = "auto""#));
         assert!(cfg.contains(r#"chip = "CHANGE-ME""#));
     }
@@ -973,7 +935,6 @@ mod tests {
             &["west".to_string(), "build".to_string(), "-d".to_string(), "embarch/build".to_string()],
             &["derived from build/build_info.yml".to_string(), String::new()],
             "embarch/build/zephyr/zephyr.hex",
-            None,
         );
         let parsed: toml::Value = toml::from_str(&cfg).expect("scaffolded config must be valid TOML");
         assert_eq!(parsed["core"]["base_url"].as_str(), Some("auto"));
@@ -1000,7 +961,6 @@ mod tests {
             &plan.argv,
             &plan.notes,
             "embarch/build/zephyr/zephyr.hex",
-            None,
         )
     }
 

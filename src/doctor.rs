@@ -1396,43 +1396,37 @@ fn check_chip(projects: &[ProjectConfig], config_path: Option<&Path>, api: Optio
     check(8, CHECK8_NAME, Status::Pass, format!("{} project(s) checked", projects.len()))
 }
 
-// ---- check 9: artifact_path / artifact_path_for_core -----------------------
+// ---- check 9: artifact_path resolvable -------------------------------------
 
-/// `\\wsl.localhost\<distro>\<tail>` back to `/<tail>` — the reverse of
-/// `init::wsl_unc_path`. Also accepts the older `\\wsl$\` alias.
-fn unc_to_wsl_path(unc: &str) -> Option<(String, PathBuf)> {
-    let rest = unc.strip_prefix(r"\\wsl.localhost\").or_else(|| unc.strip_prefix(r"\\wsl$\"))?;
-    let mut parts = rest.splitn(2, '\\');
-    let distro = parts.next()?.to_string();
-    let tail = parts.next().unwrap_or("").replace('\\', "/");
-    Some((distro, PathBuf::from(format!("/{tail}"))))
-}
+const CHECK9_NAME: &str = "artifact_path resolvable";
 
+/// Check 9 was `artifact_path` **and** its Windows-visible `artifact_path_for_core`
+/// twin: it reverse-translated the UNC form and compared canonicalized paths.
+/// That half is gone — `embarch-api` retired `artifact_path_for_core` (its
+/// decision 15) and this repo stopped scaffolding it (suite task 038), so
+/// there is nothing left to compare against and a check that still asked
+/// would be diagnosing a field nothing writes.
+///
+/// **The number is kept and the check re-scoped, not retired.** Check numbers
+/// are cited from `interfaces/doctor-chain.md` and from operator-facing text;
+/// a retired-in-place 9 with a renumbered 10..n behind it would invalidate
+/// every one of those citations to save nothing. What remains is the half
+/// that was always doing the work on its own: **`artifact_path` names a file
+/// that exists.**
 fn check_artifact_paths(projects: &[ProjectConfig]) -> Check {
     if projects.is_empty() {
-        return check(9, "artifact_path resolvable / matches artifact_path_for_core", Status::Warn, "no projects configured");
+        return check(9, CHECK9_NAME, Status::Warn, "no projects configured");
     }
-
-    let under_wsl2 = env::under_wsl2();
-    let current_distro = std::env::var("WSL_DISTRO_NAME").ok();
 
     let mut notes = Vec::new();
     let mut worst = Status::Pass;
-    let mut fix = None;
 
     for p in projects {
         if p.is_zephyr_west() {
-            // decision 17: artifact_path and artifact_path_for_core
-            // are both computed together, per call, from the same resolved
-            // build dir — there's nothing stored to compare here. All this
-            // check can verify ahead of time is that the WSL2 UNC-path
-            // translation itself would succeed for this repo, when it applies.
-            if under_wsl2 && current_distro.is_none() {
-                notes.push(format!("{}: under WSL2 but WSL_DISTRO_NAME is unset — artifact_path_for_core can't be computed at call time", p.name));
-                worst = Status::Fail;
-            } else {
-                notes.push(format!("{}: ok — computed per call, nothing to compare ahead of time", p.name));
-            }
+            // decision 17: `artifact_path` is resolved live, per call, from
+            // the build dir `embarch-api` picks — nothing is stored here to
+            // resolve ahead of time.
+            notes.push(format!("{}: ok — resolved per call, nothing stored to check ahead of time", p.name));
             continue;
         }
 
@@ -1448,55 +1442,10 @@ fn check_artifact_paths(projects: &[ProjectConfig]) -> Check {
             }
             continue;
         }
-
-        let Some(unc) = &p.artifact_path_for_core else {
-            notes.push(format!("{}: ok (no artifact_path_for_core set)", p.name));
-            continue;
-        };
-
-        if !under_wsl2 {
-            notes.push(format!("{}: artifact_path_for_core set but this only matters under WSL2 (topology iii) — skipped", p.name));
-            if worst == Status::Pass {
-                worst = Status::Warn;
-            }
-            continue;
-        }
-
-        match unc_to_wsl_path(unc) {
-            Some((distro, translated)) if current_distro.as_deref() == Some(distro.as_str()) => {
-                let same = match (std::fs::canonicalize(&resolved), std::fs::canonicalize(&translated)) {
-                    (Ok(a), Ok(b)) => a == b,
-                    _ => false,
-                };
-                if same {
-                    notes.push(format!("{}: ok — artifact_path_for_core names the same file", p.name));
-                } else {
-                    notes.push(format!(
-                        "{}: artifact_path resolves to {} but artifact_path_for_core resolves to {} — different files",
-                        p.name,
-                        resolved.display(),
-                        translated.display()
-                    ));
-                    worst = Status::Fail;
-                    fix = Some(
-                        "regenerate artifact_path_for_core (rerun `embarch init`, or fix it by hand) so \
-                         both name the same build output — see doctor-chain.md, check 9"
-                            .to_string(),
-                    );
-                }
-            }
-            _ => {
-                notes.push(format!("{}: artifact_path_for_core names a different WSL distro — can't verify from here", p.name));
-                if worst == Status::Pass {
-                    worst = Status::Warn;
-                }
-            }
-        }
+        notes.push(format!("{}: ok — {}", p.name, resolved.display()));
     }
 
-    let mut c = check(9, "artifact_path resolvable / matches artifact_path_for_core", worst, notes.join("; "));
-    c.fix = fix;
-    c
+    check(9, CHECK9_NAME, worst, notes.join("; "))
 }
 
 // ---- check 10: the MCP server is registered *and* answers --------------------
@@ -4093,26 +4042,12 @@ mod tests {
         assert!(unresolvable.detail.contains("not a commit"));
     }
 
-    #[test]
-    fn unc_round_trips_with_wsl_unc_path() {
-        let unc = crate::init::wsl_unc_path("Ubuntu-24.04", Path::new("/home/me/fw/embarch/build/zephyr/zephyr.hex"));
-        let (distro, back) = unc_to_wsl_path(&unc).expect("should parse the UNC form it just produced");
-        assert_eq!(distro, "Ubuntu-24.04");
-        assert_eq!(back, PathBuf::from("/home/me/fw/embarch/build/zephyr/zephyr.hex"));
-    }
-
-    #[test]
-    fn unc_parsing_rejects_non_unc_input() {
-        assert!(unc_to_wsl_path("/home/me/fw/zephyr.hex").is_none());
-        assert!(unc_to_wsl_path(r"C:\ProgramData\embarch\token").is_none());
-    }
-
-    #[test]
-    fn wsl_dollar_alias_is_also_accepted() {
-        let (distro, back) = unc_to_wsl_path(r"\\wsl$\Ubuntu-24.04\home\me\x.hex").unwrap();
-        assert_eq!(distro, "Ubuntu-24.04");
-        assert_eq!(back, PathBuf::from("/home/me/x.hex"));
-    }
+    // The three UNC round-trip tests that lived here went with check 9's
+    // `artifact_path_for_core` half (suite task 038). They pinned
+    // `unc_to_wsl_path`/`init::wsl_unc_path`, and both functions are gone —
+    // nothing in this crate computes or reads a Windows-visible form of a
+    // WSL2 path any more, because `embarch-api` uploads the bytes instead
+    // (`embarch-api` decision 15, `decisions/core-link.md`).
 
     #[test]
     fn resolve_program_finds_an_absolute_path() {
@@ -5010,7 +4945,6 @@ mod tests {
             artifact_path: Some(PathBuf::from("build/zephyr/zephyr.hex")),
             chip: Some(chip.to_string()),
             flash_format: "hex".to_string(),
-            artifact_path_for_core: None,
             west_binary: None,
             build_dir_root: None,
             retired_targets: Vec::new(),
@@ -5034,7 +4968,6 @@ mod tests {
             artifact_path: None,
             chip: None,
             flash_format: "hex".to_string(),
-            artifact_path_for_core: None,
             west_binary: Some(PathBuf::from("west")),
             build_dir_root: build_dir_root.map(PathBuf::from),
             retired_targets: Vec::new(),
