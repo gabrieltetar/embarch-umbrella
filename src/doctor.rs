@@ -1266,7 +1266,7 @@ enum TargetAnswer {
     /// this crate could say about someone else's repo layout.
     Rejected(String),
     /// The number could not be obtained at all. A warn naming why, never a
-    /// pass ([`doctor-chain.md`'s rule for the whole chain](../embarch-doc/embarch-umbrella/interfaces/doctor-chain.md)).
+    /// pass ([`doctor-chain.md`'s rule for the whole chain](../../embarch-doc/embarch-umbrella/interfaces/doctor-chain.md)).
     Unanswerable(String),
 }
 
