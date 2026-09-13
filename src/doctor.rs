@@ -566,7 +566,7 @@ struct AuthedStatus {
 ///
 /// Applied at **every** point where this module introduces another program's
 /// words into a `detail`, which is where
-/// [decision 43](../embarch-doc/embarch-umbrella/decisions/message-rendering.md)
+/// [decision 43](../../embarch-doc/embarch-umbrella/decisions/message-rendering.md)
 /// says the normalisation belongs. `tasks/umbrella/031` closed the general
 /// case: check 1 — which interpolates `embarch-core --version`'s stdout — was
 /// the last unnormalised site, and its stdout half is `tasks/core/015`.
@@ -718,7 +718,7 @@ fn judge_token(attempt: TokenAttempt) -> (Check, Option<AuthedStatus>) {
         TokenAttempt::TokenError(e) => (
             with_fix(
                 check(4, CHECK_4_NAME, Status::Fail, e),
-                "see ../embarch-doc/embarch-token.md",
+                "see ../../embarch-doc/embarch-token.md",
             ),
             None,
         ),
@@ -747,7 +747,7 @@ fn judge_token(attempt: TokenAttempt) -> (Check, Option<AuthedStatus>) {
         TokenAttempt::Unauthorized => (
             with_fix(
                 check(4, CHECK_4_NAME, Status::Fail, "Core rejected the token (401)"),
-                "the resolved token doesn't match Core's. See ../embarch-doc/embarch-token.md — if \
+                "the resolved token doesn't match Core's. See ../../embarch-doc/embarch-token.md — if \
                  Core was reinstalled its token file changed underneath the old value.",
             ),
             None,
@@ -2750,7 +2750,7 @@ fn check_growth(
 /// On `wsl-host` the path is `setup::data_dir_for`'s hardcoded
 /// `/mnt/c/ProgramData/embarch` — an *assumed* standard `%ProgramData%`,
 /// where `embarch-api`'s token discovery resolves the real value from the
-/// Windows side ([embarch-token.md](../embarch-doc/embarch-token.md) §5's
+/// Windows side ([embarch-token.md](../../embarch-doc/embarch-token.md) §5's
 /// last gap). So a relocated `ProgramData` reads here as "no studies yet"
 /// rather than as "wrong directory", and those are the two states a reader
 /// has to tell apart. When the directory *does* exist and holds runs, it is
