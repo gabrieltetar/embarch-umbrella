@@ -217,7 +217,7 @@ async fn main() {
 /// is its own reported fact, never silently folded into a count.
 enum ProbeReport {
     /// Core answered `GET /status` with `200` and this many entries in
-    /// `probes` ([embarch-core/interfaces.md](../embarch-doc/embarch-core/interfaces.md)'s `/status` row).
+    /// `probes` ([embarch-core/interfaces.md](../../embarch-doc/embarch-core/interfaces.md)'s `/status` row).
     Count(usize),
     /// No candidate answered as Core at all — nothing to authenticate to.
     Unreachable,

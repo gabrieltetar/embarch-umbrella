@@ -30,7 +30,7 @@
 //! `LoaderVerdict::Unanswerable` fallback) — which is why it's still worth
 //! keeping in sync rather than left maximally permissive.
 //!
-//! `CoreConfig` is no longer mirrored here at all (`../embarch-doc/embarch-umbrella/decisions/mirrors.md`
+//! `CoreConfig` is no longer mirrored here at all (`../../embarch-doc/embarch-umbrella/decisions/mirrors.md`
 //! 20's second amendment, closing the config half's `CoreConfig` strand):
 //! this file re-exports `embarch_core_client::CoreConfig` directly rather
 //! than hand-keeping a parallel struct, the same move decision 20's first
@@ -288,7 +288,7 @@ mod tests {
     /// close by depending on a shared crate, since the real type lives
     /// inside `embarch-api`'s own binary rather than in
     /// `embarch-api/crates/embarch-core-client`
-    /// (`../embarch-doc/embarch-umbrella/decisions/mirrors.md` 20's second
+    /// (`../../embarch-doc/embarch-umbrella/decisions/mirrors.md` 20's second
     /// amendment). This is the cheaper half instead: a real
     /// `embarch-api` config fixture (`embarch-api/config.example.toml`,
     /// read from that repo directly, not copied here — a path-dep sibling

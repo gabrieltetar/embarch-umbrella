@@ -29,7 +29,7 @@ pub fn token_path_for(class: TopologyClass, windows: bool) -> Option<PathBuf> {
 /// `embarch-core`'s machine-wide data directory, as seen from here — the one
 /// path convention that holds every artefact Core owns: the token,
 /// `study_results/`, `logs/` and `embarch-topology`'s `enrollment.toml`
-/// ([embarch-core/spec.md](../embarch-doc/embarch-core/spec.md) §6).
+/// ([embarch-core/spec.md](../../embarch-doc/embarch-core/spec.md) §6).
 ///
 /// Pure, and **class-aware rather than host-aware**, which is the whole
 /// reason `doctor`'s check 16 uses this and not
