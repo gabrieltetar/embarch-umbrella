@@ -18,7 +18,7 @@
 //! this file's. It does reproduce the two structural refusals that are
 //! **binary facts about the file**, not per-project reports: a duplicate
 //! project name, and the two config keys retired-by-refusal upstream
-//! (decisions 51/53) — [`Config::load_from_path`]'s `validate` below.
+//! (`embarch-api` decisions 53/13) — [`Config::load_from_path`]'s `validate` below.
 //!
 //! As of the check-6 rewrite (`doctor.rs`), this mirror is no longer the
 //! *only* thing standing between `doctor` and a config the real
@@ -90,7 +90,7 @@ pub struct ProjectConfig {
     // mirror carried that upstream had already retired (`embarch-api`
     // decision 15). It is gone now that `init.rs` no longer scaffolds it and
     // check 9 no longer reads it (suite task 038): this mirror carries
-    // upstream's shape **minus the fields nothing here reads** (decision 20),
+    // upstream's shape **minus the fields nothing here reads** (decision 16),
     // and it denies no unknown keys, so a config already in the field that
     // still carries the key keeps loading here exactly as it does upstream.
     // Removing it from this struct is not a refusal and must not read as one.

@@ -230,8 +230,9 @@ fn on_path(stem: &str) -> Option<Located> {
 /// Locate `embarch-core`, in the precedence order decisions 7
 /// and 28 specify: an explicit override, then what `setup` recorded, then
 /// `PATH` (populated for real by `setup`'s install step once decision 28 has
-/// run), then — under WSL2 only — the real canonical Windows location, then
-/// the older fixed conventional directories as a last resort.
+/// run), then — under WSL2 only — the Windows service's own registration
+/// (decision 38), then the real canonical Windows location, then the older
+/// fixed conventional directories as a last resort.
 pub fn locate_core(saved: Option<&Path>, under_wsl2: bool) -> Option<Located> {
     if let Some(raw) = std::env::var_os("EMBARCH_CORE_EXE") {
         let path = PathBuf::from(raw);
@@ -350,10 +351,11 @@ pub fn windows_core_service_state() -> Option<WindowsServiceState> {
 /// which is the only authoritative answer to "which `embarch-core.exe` does
 /// this machine actually run".
 ///
-/// `locate_core` deliberately guesses (decision 28's canonical location, then
-/// a short conventional list) because its job is to find *an* exe to invoke.
-/// Deploying is the opposite problem: replacing the wrong copy is worse than
-/// finding none, and on this bench the live service runs out of a
+/// `locate_core` reads this same registration first too (decision 38), and
+/// only falls back to guessing — decision 28's canonical location, then a
+/// short conventional list — when it cannot, because its job is to find *an*
+/// exe to invoke. Deploying is the opposite problem: replacing the wrong copy
+/// is worse than finding none, and on this bench the live service runs out of a
 /// release-archive directory that appears on no conventional list at all
 /// (`embarch-dev-workflow.md` §4a). `sc.exe qc` is read-only, so a wrong
 /// answer costs a check rather than a botched deploy.
