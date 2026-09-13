@@ -1,7 +1,7 @@
 //! `embarch doctor` — spec.md's check chain, each pass/warn/fail plus a fix
 //! line for anything short of a pass.
 //!
-//! Ordered the same as spec.md's table, and largely dependency-ordered too:
+//! Ordered the same as doctor-chain.md's table, and largely dependency-ordered too:
 //! checks 4/5/11/12/13/15 need check 3's winning candidate, checks 11/14/15
 //! shell out to a binary check 1 located, and checks 7-9 need
 //! check 6's config. When a prerequisite check didn't pass, the checks that
@@ -17,7 +17,7 @@
 //! `/probes/enrolled` or `/probes/enroll`) it must not label it in any way
 //! that implies a live check — "Validated", "Last validated", "Verified", or
 //! similar. That field is enrolment time only, unmoving until someone
-//! re-enrolls; `embarch-core` decision 57 (`decisions/surfaces.md`) is why
+//! re-enrolls; `embarch-core` decision 57 (`decisions/enrollment.md`) is why
 //! Core does not persist a real last-validation instant beside it. The
 //! honest word is **"Enrolled"** (or "Enrolled at"); a surface that wants to
 //! say something about freshness has to call `POST /validate` and show that
@@ -1028,7 +1028,7 @@ fn api_config_verdict_from_output(exit_code: Option<i32>, stdout: &str) -> Loade
 /// config — the same shell-out check 8 already does one function away
 /// (`api_target_answer`), for the same reason: there is a real loader one
 /// process away, and this crate's own permissive mirror (below) cannot
-/// answer for it (decision 16, `spec.md` check 6's row).
+/// answer for it (decision 16, `doctor-chain.md` check 6's row).
 fn api_config_verdict(api: Option<&Located>, config_path: &Path) -> LoaderVerdict {
     let Some(api) = api else {
         return LoaderVerdict::Unanswerable("embarch-api not located (see check 1)".to_string());
@@ -1266,7 +1266,7 @@ enum TargetAnswer {
     /// this crate could say about someone else's repo layout.
     Rejected(String),
     /// The number could not be obtained at all. A warn naming why, never a
-    /// pass ([`spec.md`'s rule for the whole chain](../../embarch-doc/embarch-umbrella/spec.md)).
+    /// pass ([`doctor-chain.md`'s rule for the whole chain](../embarch-doc/embarch-umbrella/interfaces/doctor-chain.md)).
     Unanswerable(String),
 }
 
@@ -1480,7 +1480,7 @@ fn check_artifact_paths(projects: &[ProjectConfig]) -> Check {
                     worst = Status::Fail;
                     fix = Some(
                         "regenerate artifact_path_for_core (rerun `embarch init`, or fix it by hand) so \
-                         both name the same build output — see spec.md, check 9"
+                         both name the same build output — see doctor-chain.md, check 9"
                             .to_string(),
                     );
                 }
@@ -3472,7 +3472,7 @@ fn check_flash_backend(core: Option<&Located>, class: TopologyClass) -> Check {
                 14,
                 NAME,
                 Status::Warn,
-                "this embarch-core has no `flash-backend` subcommand — it predates §3 decision 36 and \
+                "this embarch-core has no `flash-backend` subcommand — it predates embarch-core decision 36 and \
                  will flash every target with probe-rs, including Nordic RRAM parts",
             ),
             "no-flash-backend-subcommand",
