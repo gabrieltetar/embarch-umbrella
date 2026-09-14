@@ -698,7 +698,7 @@ const CHECK_4_NAME: &str = "token resolves and matches";
 /// variant is exactly one thing the gathering step can come back with — a
 /// missing winner, a token-resolution error, or one `GET /status` outcome —
 /// so [`judge_token`] can be handed any of them without a network, a Core or
-/// a bench (decision 39; same split as [`judge_growth`]/[`check_growth`]).
+/// a bench (decision 33; same split as [`judge_growth`]/[`check_growth`]).
 enum TokenAttempt {
     Unreachable,
     TokenError(String),
@@ -2250,7 +2250,7 @@ const CHECK_12_NAME: &str = "dev-bench port detected";
 /// What check 12's `async` half learned, before any of it is judged. Same
 /// split as [`TokenAttempt`]/[`judge_token`]: one variant per thing the
 /// gathering step can come back with, so [`judge_dev_bench`] never touches a
-/// network, a Core or a bench (decision 39).
+/// network, a Core or a bench (decision 33).
 enum DevBenchAttempt {
     Unreachable,
     NoAuthedStatus,
