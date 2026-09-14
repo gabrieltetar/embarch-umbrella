@@ -227,12 +227,17 @@ fn on_path(stem: &str) -> Option<Located> {
         })
 }
 
-/// Locate `embarch-core`, in the precedence order decisions 7
-/// and 28 specify: an explicit override, then what `setup` recorded, then
-/// `PATH` (populated for real by `setup`'s install step once decision 28 has
-/// run), then — under WSL2 only — the Windows service's own registration
-/// (decision 38), then the real canonical Windows location, then the older
-/// fixed conventional directories as a last resort.
+/// Locate `embarch-core`: an explicit override, then what `setup` recorded,
+/// then `PATH` (populated for real by `setup`'s install step) — then, under
+/// WSL2 only, the Windows service's own registration, then the real
+/// canonical Windows location, then the older fixed conventional
+/// directories as a last resort. Decision 28 specifies the first, second,
+/// third and fifth of those steps (env var → saved state → `PATH` → the
+/// real canonical Windows location); decision 38 specifies the fourth,
+/// inserted ahead of both Windows guesses because a reading beats a guess.
+/// The last step — the older fixed directories — is not itself specified by
+/// any decision: it predates decision 28 and survives only as an
+/// implementation fallback (see `windows_conventional_core_paths`).
 pub fn locate_core(saved: Option<&Path>, under_wsl2: bool) -> Option<Located> {
     if let Some(raw) = std::env::var_os("EMBARCH_CORE_EXE") {
         let path = PathBuf::from(raw);
