@@ -2,7 +2,7 @@
 
 ## Docs
 
-**Four files, not one.** Current truth: [spec.md](../embarch-doc/embarch-umbrella/spec.md). Why it is that way: [decisions.md](../embarch-doc/embarch-umbrella/decisions.md) — an index over `decisions/`, and a decision number addresses this sub-project, not a file. Unresolved: [open.md](../embarch-doc/embarch-umbrella/open.md).
+**Four files, not one.** Current truth: [spec.md](../embarch-doc/embarch-umbrella/spec.md). Why it is that way: [decisions.md](../embarch-doc/embarch-umbrella/decisions.md) — an index over `decisions/`, and a decision number addresses this sub-project, not a file. Unresolved: [open.md](../embarch-doc/embarch-umbrella/open.md). Reference: [interfaces/](../embarch-doc/embarch-umbrella/interfaces/).
 
 Update them proactively per [../embarch-doc/DOC-PROTOCOL.md](../embarch-doc/DOC-PROTOCOL.md) whenever a notable design decision, feature, or status change happens here — §4 says when, §5 says how, and history goes in a `changelog.d/` fragment rather than into a doc.
 
