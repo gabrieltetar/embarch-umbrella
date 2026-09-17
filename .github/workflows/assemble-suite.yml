@@ -9,7 +9,7 @@
 # off any one component's tag push: the three repos release independently,
 # and a suite release is a decision about which three versions form a
 # version-tested set together, not a mechanical consequence of any single
-# push. See milestone-6.md §3.7.
+# push. See embarch-umbrella decision 14.
 name: Assemble suite release
 
 on:
@@ -72,7 +72,7 @@ jobs:
             # prints the hit but also complains about the miss on stderr),
             # and pipefail turns that into a false failure even though the
             # pipeline's real output was correct — caught for real running
-            # this workflow the first time (milestone-6.md §3.8). nullglob
+            # this workflow the first time (embarch-umbrella decision 14). nullglob
             # plus a plain array sidesteps `ls`/`head` entirely.
             candidates=("$dir"/*.tar.gz "$dir"/*.zip)
             archive="${candidates[0]:-}"

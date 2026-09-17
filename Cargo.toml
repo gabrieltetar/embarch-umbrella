@@ -36,10 +36,11 @@ embarch-topology = { path = "../embarch-topology" }
 # hardware. Nothing else in this crate links a study type.
 embarch-study-designer = { path = "../embarch-study-designer" }
 # ../embarch-doc/embarch-umbrella/decisions/mirrors.md 20 (amended
-# 2026-09-08): the token fallback chain (formerly this crate's own
-# token.rs) now calls this shared crate live, in-process, rather than
-# carrying a hand-kept copy. Only `embarch_core_client::token_discovery`
-# is used here; nothing else in this crate calls into it. Cargo unifies
+# 2026-09-08 and 2026-09-10): the token fallback chain (formerly this
+# crate's own token.rs) and `CoreConfig` (formerly hand-mirrored in
+# src/config.rs) now call/re-export this shared crate live, in-process,
+# rather than carrying a hand-kept copy. `embarch_core_client::token_discovery`
+# and `CoreConfig` are the only things this crate uses from it. Cargo unifies
 # its `reqwest`/`tokio` features with this crate's own below — `bytes` and
 # tokio's `sync`/`fs`/`process` grow in as a result, but `probe-rs` and
 # `serialport` stay absent (verified via `cargo tree`), so this file's

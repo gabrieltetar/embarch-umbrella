@@ -4,7 +4,7 @@ Part of the [EmbArch](https://github.com/gabrieltetar/embarch-doc) suite — a s
 
 This is the binary you download first. `embarch` gets a firmware engineer from *nothing installed* to *`embarch-api build_and_flash my-project` works, from a terminal or from an AI coding agent* — on whatever topology their machine happens to be: Core native on Windows with the API in WSL2, both native on a Mac, both native on Linux, or Core on a separate box.
 
-> **Status: bootstrap only.** The command surface below parses and every command reports itself unimplemented. The behavior behind it is [Milestone 6](https://github.com/gabrieltetar/embarch-doc/blob/main/embarch-umbrella/milestone-6.md).
+> **Status: active.** The command surface below is implemented; current design and status live in [spec.md](https://github.com/gabrieltetar/embarch-doc/blob/main/embarch-umbrella/spec.md).
 
 ## What it does
 
@@ -69,7 +69,7 @@ cargo test
 
 ## Design doc
 
-The full design record — current truth, open questions, and architecture decisions — lives in [embarch-doc/embarch-umbrella/spec.md](https://github.com/gabrieltetar/embarch-doc/blob/main/embarch-umbrella/spec.md) and its linked `decisions/` and `open.md` files, treated as the durable source of truth ahead of any chat history that produced it. The guide it has to satisfy is [embarch-user-guide.md](https://github.com/gabrieltetar/embarch-doc/blob/main/embarch-user-guide.md).
+The full design record — current truth, open questions, and architecture decisions — lives in [embarch-doc/embarch-umbrella/spec.md](https://github.com/gabrieltetar/embarch-doc/blob/main/embarch-umbrella/spec.md) and its linked `decisions/` and `open.md` files, treated as the durable source of truth ahead of any chat history that produced it. The guide it has to satisfy is [the user guide](https://github.com/gabrieltetar/embarch-doc/blob/main/suite/user-guide.md).
 
 ## License
 

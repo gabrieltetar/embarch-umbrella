@@ -1,5 +1,5 @@
 # Release CI for embarch-umbrella's own binary, `embarch`
-# (embarch-umbrella/milestone-6.md §3.7).
+# (embarch-umbrella decision 14).
 #
 # Same shape as embarch-api's release.yml — no C dependency, so
 # aarch64-unknown-linux-gnu only needs a cross-linker, not `cross`. This is
@@ -74,13 +74,12 @@ jobs:
           - target: aarch64-apple-darwin
             os: macos-14
     runs-on: ${{ matrix.os }}
-    # Cargo.toml depends on embarch-topology as a sibling path dependency
-    # (DOC-PROTOCOL.md §2's layout — no Cargo workspace); unlike
-    # embarch-core/embarch-api, this crate has no embarch-study-designer
-    # dependency. `../embarch-topology` only resolves if this repo's own
-    # checkout also sits in a same-named sibling directory rather than at
-    # the workspace root — same fix as embarch-core's/embarch-api's own
-    # release.yml, for the same latent gap.
+    # Cargo.toml depends on embarch-topology, embarch-study-designer, and
+    # embarch-api (for crates/embarch-core-client) as sibling path
+    # dependencies (DOC-PROTOCOL.md §2's layout — no Cargo workspace). Each
+    # only resolves if this repo's own checkout also sits in a same-named
+    # sibling directory rather than at the workspace root — same fix as
+    # embarch-core's/embarch-api's own release.yml, for the same latent gap.
     defaults:
       run:
         working-directory: embarch-umbrella
@@ -92,6 +91,14 @@ jobs:
         with:
           repository: gabrieltetar/embarch-topology
           path: embarch-topology
+      - uses: actions/checkout@v4
+        with:
+          repository: gabrieltetar/embarch-study-designer
+          path: embarch-study-designer
+      - uses: actions/checkout@v4
+        with:
+          repository: gabrieltetar/embarch-api
+          path: embarch-api
 
       - uses: dtolnay/rust-toolchain@stable
         with:
