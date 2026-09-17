@@ -302,7 +302,7 @@ fn apply_plan(
                 }
             }
             (_, None) => {
-                println!(
+                eprintln!(
                     "\nCan't continue without embarch-core. It ships in the same archive as this \
                      binary — unpack them into one directory, or point EMBARCH_CORE_EXE at it."
                 );
@@ -310,7 +310,7 @@ fn apply_plan(
                 // nothing, and leaving that unsaid is exactly the doubt
                 // decision 21 exists to remove.
                 if dry_run {
-                    println!("\n--dry-run: nothing above was done.");
+                    eprintln!("\n--dry-run: nothing above was done.");
                 }
                 return 1;
             }
@@ -399,7 +399,7 @@ pub fn uninstall() -> i32 {
             match run(&c.path, &["uninstall"]) {
                 Ok(true) => println!("Service uninstalled."),
                 Ok(false) | Err(_) => {
-                    println!("Could not uninstall the service — this may need elevation:\n  sudo \"{}\" uninstall", c.path.display());
+                    eprintln!("Could not uninstall the service — this may need elevation:\n  sudo \"{}\" uninstall", c.path.display());
                 }
             }
         }
@@ -417,13 +417,13 @@ pub fn uninstall() -> i32 {
         match std::fs::remove_file(&token) {
             Ok(()) => println!("Removed token file: {}", token.display()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => println!("Could not remove token file {}: {e}", token.display()),
+            Err(e) => eprintln!("Could not remove token file {}: {e}", token.display()),
         }
     }
 
     match install::uninstall() {
         Ok(()) => println!("Removed the canonical install directory and PATH additions."),
-        Err(e) => println!("Could not fully undo the install: {e:#}"),
+        Err(e) => eprintln!("Could not fully undo the install: {e:#}"),
     }
 
     0
@@ -543,7 +543,7 @@ pub fn up(foreground: bool) -> i32 {
     let saved = state::load();
 
     if let Some(msg) = refuse_if_remote(&saved, "start") {
-        println!("{msg}");
+        eprintln!("{msg}");
         return 1;
     }
 
@@ -558,8 +558,12 @@ pub fn up(foreground: bool) -> i32 {
     // explicit-wins posture `EMBARCH_CORE_EXE` already has.
     match defer_to_windows_service(under_wsl2, &saved, "start") {
         Some(deferral) if !foreground => {
-            println!("{}", deferral.message);
-            return if deferral.satisfied { 0 } else { 1 };
+            if deferral.satisfied {
+                println!("{}", deferral.message);
+                return 0;
+            }
+            eprintln!("{}", deferral.message);
+            return 1;
         }
         Some(_) => eprintln!(
             "Warning: embarch-core is installed as a Windows service ({}) on this machine. \
@@ -575,7 +579,7 @@ pub fn up(foreground: bool) -> i32 {
     };
 
     if core.windows_exe_from_wsl2 {
-        println!(
+        eprintln!(
             "Core is on the Windows side and starting a Windows service needs elevation, which \
              this cannot obtain from WSL2. In an **elevated Windows** shell, run:\n  \"{}\" start",
             windows_display_path(&core.path)
@@ -618,7 +622,7 @@ pub fn down() -> i32 {
     let saved = state::load();
 
     if let Some(msg) = refuse_if_remote(&saved, "stop") {
-        println!("{msg}");
+        eprintln!("{msg}");
         return 1;
     }
 
@@ -628,8 +632,12 @@ pub fn down() -> i32 {
     // Core fails on a port bind, `down` stopping the wrong one succeeds
     // quietly and leaves the real Core running.
     if let Some(deferral) = defer_to_windows_service(under_wsl2, &saved, "stop") {
-        println!("{}", deferral.message);
-        return if deferral.satisfied { 0 } else { 1 };
+        if deferral.satisfied {
+            println!("{}", deferral.message);
+            return 0;
+        }
+        eprintln!("{}", deferral.message);
+        return 1;
     }
 
     let Some(core) = locate::locate_core(saved.core_exe.as_deref(), under_wsl2) else {
@@ -638,7 +646,7 @@ pub fn down() -> i32 {
     };
 
     if core.windows_exe_from_wsl2 {
-        println!(
+        eprintln!(
             "In an **elevated Windows** shell, run:\n  \"{}\" stop",
             windows_display_path(&core.path)
         );

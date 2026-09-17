@@ -859,12 +859,26 @@ enum UsbScan {
 /// Decides whether the scan can mean anything before running it. `cfg!` rather
 /// than `#[cfg]` so the scanner and every branch below compile — and are
 /// tested — on all three hosts.
-fn usb_scan_for(class: Option<TopologyClass>) -> UsbScan {
+///
+/// `class == Local` alone is not enough under WSL2: decision 30 is that
+/// mirrored networking makes a Windows-hosted Core answer at loopback exactly
+/// like a guest-hosted one, so `class` cannot tell them apart, and scanning
+/// this machine's bus on the strength of `class` alone would be a confident
+/// verdict about the wrong machine — the mistake decision 18 exists to avoid.
+/// What *can* tell them apart is the same evidence checks 1 and 14 already
+/// read through `locate_core` (decision 38): a located `embarch-core` that is
+/// a native Linux binary, not a Windows exe reached through WSL2 interop, is
+/// real evidence Core is on this machine. No located binary at all is the
+/// case `core_belongs_to` already treats as "assume the Windows host", for
+/// the same reason repeated here: a guest-local Core that `setup` installed
+/// would already be on `PATH`.
+fn usb_scan_for(class: Option<TopologyClass>, core: Option<&Located>, under_wsl2: bool) -> UsbScan {
     if !cfg!(target_os = "linux") {
         return UsbScan::NotLinux;
     }
+    let core_is_this_machine = !under_wsl2 || core.is_some_and(|c| !c.windows_exe_from_wsl2);
     match class {
-        Some(TopologyClass::Local) => {
+        Some(TopologyClass::Local) if core_is_this_machine => {
             UsbScan::Scanned(scan_usb_debug_probes(Path::new(SYSFS_USB_DEVICES)))
         }
         _ => UsbScan::CoreElsewhere,
@@ -3257,8 +3271,10 @@ pub async fn doctor(json: bool) -> i32 {
     let check3 = check_reachable(&core_probe);
     let (check4, authed) = check_token(&core_probe, config.as_ref()).await;
     // Decision 18: the USB-tree read only means something where Core
-    // enumerates on *this* machine, and only on Linux.
-    let usb_scan = usb_scan_for(core_probe.winner_class);
+    // enumerates on *this* machine, and only on Linux. Under WSL2 that is
+    // not `winner_class` alone (decision 30) — `usb_scan_for` also weighs
+    // the located binary's own evidence.
+    let usb_scan = usb_scan_for(core_probe.winner_class, core.as_ref(), under_wsl2);
     let check5 = check_probes(authed.as_ref(), &usb_scan);
     let projects: &[ProjectConfig] = config.as_ref().map(|c| c.projects.as_slice()).unwrap_or(&[]);
     let check7 = check_build_commands(projects);
@@ -3821,7 +3837,8 @@ mod tests {
     fn the_usb_scan_only_runs_on_linux_with_core_on_this_machine() {
         // The one assertion that has to hold on all three hosts: macOS and
         // Windows never scan, so decision 18 leaves them exactly as they were.
-        let local = usb_scan_for(Some(TopologyClass::Local));
+        // Not under WSL2, so `class == Local` is unambiguous on its own.
+        let local = usb_scan_for(Some(TopologyClass::Local), None, false);
         if cfg!(target_os = "linux") {
             assert!(matches!(local, UsbScan::Scanned(_)));
         } else {
@@ -3830,7 +3847,52 @@ mod tests {
         for elsewhere in [TopologyClass::WslHost, TopologyClass::Remote] {
             let expected =
                 if cfg!(target_os = "linux") { UsbScan::CoreElsewhere } else { UsbScan::NotLinux };
-            assert_eq!(usb_scan_for(Some(elsewhere)), expected);
+            assert_eq!(usb_scan_for(Some(elsewhere), None, false), expected);
+        }
+    }
+
+    #[test]
+    fn under_wsl2_a_local_winner_alone_does_not_scan_decision_30() {
+        // Mirrored networking makes a Windows-hosted Core answer at loopback
+        // exactly like a guest-hosted one (decision 30) — `winner_class ==
+        // Local` cannot tell them apart, and no `embarch-core` binary was
+        // located either, which `core_belongs_to` already reads as "assume
+        // the Windows host" for the same reason. Scanning this bus would be
+        // a confident verdict about the wrong machine.
+        let scan = usb_scan_for(Some(TopologyClass::Local), None, true);
+        if cfg!(target_os = "linux") {
+            assert_eq!(scan, UsbScan::CoreElsewhere);
+        } else {
+            assert_eq!(scan, UsbScan::NotLinux);
+        }
+    }
+
+    #[test]
+    fn under_wsl2_a_native_linux_located_core_does_scan() {
+        // A genuinely located native Linux `embarch-core` (not reached
+        // through WSL2 interop) is real evidence Core is on this machine,
+        // even under WSL2 — e.g. a guest-local install with a probe passed
+        // in via usbipd.
+        let native = a_located("/usr/local/bin/embarch-core", false);
+        let scan = usb_scan_for(Some(TopologyClass::Local), Some(&native), true);
+        if cfg!(target_os = "linux") {
+            assert!(matches!(scan, UsbScan::Scanned(_)));
+        } else {
+            assert_eq!(scan, UsbScan::NotLinux);
+        }
+    }
+
+    #[test]
+    fn under_wsl2_a_windows_exe_located_core_does_not_scan() {
+        // The located binary is real, but it is the Windows service's exe
+        // reached through interop — the same ambiguity as no binary at all,
+        // not evidence Core enumerates on this Linux guest's own bus.
+        let windows = a_located("/mnt/c/Program Files/embarch/embarch-core.exe", true);
+        let scan = usb_scan_for(Some(TopologyClass::Local), Some(&windows), true);
+        if cfg!(target_os = "linux") {
+            assert_eq!(scan, UsbScan::CoreElsewhere);
+        } else {
+            assert_eq!(scan, UsbScan::NotLinux);
         }
     }
 

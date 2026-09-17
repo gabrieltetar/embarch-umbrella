@@ -318,7 +318,7 @@ pub async fn deploy_core(
     print_script: bool,
 ) -> i32 {
     if !crate::env::under_wsl2() {
-        println!(
+        eprintln!(
             "deploy-core is a WSL2 -> Windows-service operation: it syncs Linux checkouts to \
              Windows source copies, builds with Windows `cargo.exe`, and replaces the binary a \
              Windows service runs. On a machine where Core is native, `embarch-core install` / \
@@ -341,7 +341,7 @@ pub async fn deploy_core(
     ) {
         Ok(r) => r,
         Err(e) => {
-            println!("deploy-core: {e}");
+            eprintln!("deploy-core: {e}");
             return EXIT_FAILURE;
         }
     };
@@ -365,7 +365,7 @@ pub async fn deploy_core(
     for crate_name in SYNC_CRATES {
         let from = plan.source_root.join(crate_name);
         if !from.is_dir() {
-            println!("deploy-core: {} isn't a directory", from.display());
+            eprintln!("deploy-core: {} isn't a directory", from.display());
             return EXIT_FAILURE;
         }
     }
@@ -391,11 +391,11 @@ pub async fn deploy_core(
         match status {
             Ok(s) if s.success() => {}
             Ok(s) => {
-                println!("deploy-core: rsync of {crate_name} failed ({s})");
+                eprintln!("deploy-core: rsync of {crate_name} failed ({s})");
                 return EXIT_FAILURE;
             }
             Err(e) => {
-                println!("deploy-core: couldn't run rsync: {e}");
+                eprintln!("deploy-core: couldn't run rsync: {e}");
                 return EXIT_FAILURE;
             }
         }
@@ -410,11 +410,11 @@ pub async fn deploy_core(
     match status {
         Ok(s) if s.success() => {}
         Ok(s) => {
-            println!("deploy-core: cargo build failed ({s})");
+            eprintln!("deploy-core: cargo build failed ({s})");
             return EXIT_FAILURE;
         }
         Err(e) => {
-            println!("deploy-core: couldn't run {}: {e}", plan.cargo_exe.display());
+            eprintln!("deploy-core: couldn't run {}: {e}", plan.cargo_exe.display());
             return EXIT_FAILURE;
         }
     }
@@ -423,7 +423,7 @@ pub async fn deploy_core(
     let built_digest = match hash_file(&built) {
         Ok(d) => d,
         Err(e) => {
-            println!("deploy-core: no build output at {}: {e}", built.display());
+            eprintln!("deploy-core: no build output at {}: {e}", built.display());
             return EXIT_FAILURE;
         }
     };
@@ -434,7 +434,7 @@ pub async fn deploy_core(
 
     // --- the elevated half ------------------------------------------------
     let Some(script_dir) = windows_temp_dir() else {
-        println!(
+        eprintln!(
             "deploy-core: couldn't find a Windows-visible temp directory to write the elevated \
              script into (needs `cmd.exe` + `wslpath`)"
         );
@@ -449,13 +449,13 @@ pub async fn deploy_core(
         to_windows_path(&script_path),
         to_windows_path(&log_path),
     ) else {
-        println!("deploy-core: couldn't translate one of the paths back to Windows form");
+        eprintln!("deploy-core: couldn't translate one of the paths back to Windows form");
         return EXIT_FAILURE;
     };
 
     let script = elevated_script(&win_install, &win_built, &win_log, &plan.service);
     if let Err(e) = std::fs::write(&script_path, &script) {
-        println!("deploy-core: couldn't write {}: {e}", script_path.display());
+        eprintln!("deploy-core: couldn't write {}: {e}", script_path.display());
         return EXIT_FAILURE;
     }
     let _ = std::fs::remove_file(&log_path);
@@ -491,7 +491,7 @@ pub async fn deploy_core(
         ])
         .status();
     if let Err(e) = status {
-        println!("deploy-core: couldn't launch powershell.exe: {e}");
+        eprintln!("deploy-core: couldn't launch powershell.exe: {e}");
         return EXIT_FAILURE;
     }
 
@@ -517,7 +517,7 @@ pub async fn deploy_core(
             println!("---------------------------");
         }
         Err(_) => {
-            println!(
+            eprintln!(
                 "deploy-core: FAILED. No transcript at {} — the elevated child never started, \
                  which is what a UAC prompt that never rendered looks like. Re-run, or use \
                  --print-script and run the elevated step yourself.",
@@ -531,12 +531,12 @@ pub async fn deploy_core(
     let installed_digest_after = match hash_file(&plan.install_target) {
         Ok(d) => d,
         Err(e) => {
-            println!("deploy-core: can't read {} afterwards: {e}", plan.install_target.display());
+            eprintln!("deploy-core: can't read {} afterwards: {e}", plan.install_target.display());
             return EXIT_FAILURE;
         }
     };
     if !landed(built_digest, installed_digest_after) {
-        println!(
+        eprintln!(
             "deploy-core: FAILED to land. {} does not match the build's content. The commonest \
              cause is a UAC consent dialog that never rendered — that exits 0 and does nothing \
              (`embarch-dev-workflow.md` §4a). Re-run, or use --print-script and run the elevated \
@@ -550,7 +550,7 @@ pub async fn deploy_core(
             println!("deploy-core: landed, and {} is running", plan.service)
         }
         Some(locate::WindowsServiceState::Installed) => {
-            println!(
+            eprintln!(
                 "deploy-core: the binary landed but {} is NOT running — the script's own \
                  transcript above says how far it got. `embarch up` starts it.",
                 plan.service
