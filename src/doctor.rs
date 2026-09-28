@@ -559,6 +559,12 @@ struct AuthedStatus {
     /// it. Deliberately **not** one of check 11's schema numbers: check 15
     /// asks a different question with it.
     core_version: Option<String>,
+    /// `binary_sha256` — full lowercase-hex SHA-256 of the running Core's own
+    /// binary, cached once at Core's first request (`embarch-core` decision
+    /// 68, citing 67). `None` for a Core predating the field, or one whose
+    /// own self-read failed — either reads as "unknown", never a mismatch
+    /// (`embarch-umbrella` decision 56).
+    binary_sha256: Option<String>,
 }
 
 /// Foreign text on one line: every run of whitespace — a newline included —
@@ -739,9 +745,14 @@ fn judge_token(attempt: TokenAttempt) -> (Check, Option<AuthedStatus>) {
                 .and_then(|v| v.get("core_version"))
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
+            let binary_sha256 = parsed
+                .as_ref()
+                .and_then(|v| v.get("binary_sha256"))
+                .and_then(|v| v.as_str())
+                .map(str::to_string);
             (
                 check(4, CHECK_4_NAME, Status::Pass, "authenticated (200)"),
-                Some(AuthedStatus { probes, study_designer_schema_version, core_version }),
+                Some(AuthedStatus { probes, study_designer_schema_version, core_version, binary_sha256 }),
             )
         }
         TokenAttempt::Unauthorized => (
@@ -2509,7 +2520,10 @@ fn check_firmware_version(hello: &HelloOutcome, saved: &state::State) -> Check {
 const CHECK_15_NAME: &str = "the running Core is the located build";
 
 /// `/status`'s `core_version` against the located `embarch-core` binary's own
-/// `--version` (`embarch-core` decision 13, `embarch-dev-workflow.md` §4a).
+/// `--version` (`embarch-core` decision 13, `embarch-dev-workflow.md` §4a) —
+/// and, where both sides have one, `/status`'s `binary_sha256` against a
+/// SHA-256 of that same located binary (`embarch-core` decisions 67/68,
+/// `embarch-umbrella` decision 56).
 ///
 /// **A different question from check 11's, which is why it is a different
 /// check.** Check 11 asks whether the pieces agree on a *wire contract*;
@@ -2519,19 +2533,34 @@ const CHECK_15_NAME: &str = "the running Core is the located build";
 /// its own check compares byte length — which cannot tell a release rebuild of
 /// one constant from the previous build.
 ///
-/// **The honest limit, stated in the check's own output rather than only
-/// here:** `core_version` is `CARGO_PKG_VERSION`, so it only moves when the
-/// crate version moves. This catches a **cross-version** stale deploy and
-/// cannot see a same-version one. Strictly better than nothing; not a hash
-/// comparison.
+/// **The version-only limit, stated in the check's own output rather than
+/// only here:** `core_version` is `CARGO_PKG_VERSION`, so it only moves when
+/// the crate version moves — a **cross-version** stale deploy is caught, a
+/// same-version one is not. **Decision 56 narrows that second case**: when
+/// both sides also serve a `binary_sha256`, a same-version match is no longer
+/// left unmeasured — a byte-for-bit hash agreement or disagreement is a real
+/// answer, not a shrug. A missing hash on either side (a Core predating
+/// decision 68, or a located binary whose own read failed) falls back to the
+/// old version-only verdict, unremarked beyond that verdict's own limit text.
 ///
-/// **Warn, never fail**, per `embarch-core` decision 13's "consumers warn,
-/// never refuse" and this sub-project's decision 24: independent per-repo
-/// versions are an expected state in a suite still iterating this fast.
-fn judge_core_build(served: Option<&str>, located_version_output: Option<&str>) -> Check {
+/// **Warn, never fail, in every arm** — including the hash mismatch —
+/// per `embarch-core` decision 13's "consumers warn, never refuse" and this
+/// sub-project's decision 24: independent per-repo versions (and, now, a
+/// same-version content disagreement) are an expected state in a suite still
+/// iterating this fast, action a human takes, not a state `doctor` blocks on
+/// (decision 56).
+fn judge_core_build(
+    served: Option<&str>,
+    located_version_output: Option<&str>,
+    served_sha256: Option<&str>,
+    located_sha256: Option<&str>,
+) -> Check {
     const N: u8 = 15;
     const LIMIT: &str = "only moves with the crate version, so a same-version stale deploy is \
                          invisible to this";
+    const REDEPLOY_FIX: &str = "re-run `embarch deploy-core` and confirm the elevated step actually \
+         ran; it reports `landed` even when the elevated child was cancelled and nothing was \
+         installed (embarch-dev-workflow.md §4a).";
 
     let Some(served) = served else {
         return check(
@@ -2554,15 +2583,8 @@ fn judge_core_build(served: Option<&str>, located_version_output: Option<&str>) 
         );
     };
 
-    if served == local {
-        check(
-            N,
-            CHECK_15_NAME,
-            Status::Pass,
-            format!("running Core answered core_version {served}, matching the located binary ({LIMIT})"),
-        )
-    } else {
-        with_fix(
+    if served != local {
+        return with_fix(
             check(
                 N,
                 CHECK_15_NAME,
@@ -2572,14 +2594,49 @@ fn judge_core_build(served: Option<&str>, located_version_output: Option<&str>) 
                      is {local} — the running service is not the build on disk"
                 ),
             ),
-            "re-run `embarch deploy-core` and confirm the elevated step actually ran; it reports \
-             `landed` even when the elevated child was cancelled and nothing was installed \
-             (embarch-dev-workflow.md §4a).",
-        )
+            REDEPLOY_FIX,
+        );
+    }
+
+    // Versions agree — exactly the case decision 34 named as blind, and the
+    // one place a `binary_sha256` on both sides adds real information.
+    match (served_sha256, located_sha256) {
+        (Some(s), Some(l)) if s == l => check(
+            N,
+            CHECK_15_NAME,
+            Status::Pass,
+            format!(
+                "running Core answered core_version {served} and binary_sha256 {s}, matching the \
+                 located binary bit-for-bit"
+            ),
+        ),
+        (Some(s), Some(l)) => with_fix(
+            check(
+                N,
+                CHECK_15_NAME,
+                Status::Warn,
+                format!(
+                    "running Core answered core_version {served}, matching the located binary's \
+                     version, but its binary_sha256 {s} does not match the located binary's {l} — \
+                     same version, different bytes: a same-version stale deploy"
+                ),
+            ),
+            REDEPLOY_FIX,
+        ),
+        _ => check(
+            N,
+            CHECK_15_NAME,
+            Status::Pass,
+            format!("running Core answered core_version {served}, matching the located binary ({LIMIT})"),
+        ),
     }
 }
 
-fn check_core_build(authed: Option<&AuthedStatus>, core_version_output: Option<&str>) -> Check {
+fn check_core_build(
+    authed: Option<&AuthedStatus>,
+    core_version_output: Option<&str>,
+    located_sha256: Option<&str>,
+) -> Check {
     match authed {
         None => check(
             15,
@@ -2587,8 +2644,17 @@ fn check_core_build(authed: Option<&AuthedStatus>, core_version_output: Option<&
             Status::Warn,
             "skipped — no authenticated /status (see checks 3 and 4)",
         ),
-        Some(a) => judge_core_build(a.core_version.as_deref(), core_version_output),
+        Some(a) => judge_core_build(a.core_version.as_deref(), core_version_output, a.binary_sha256.as_deref(), located_sha256),
     }
+}
+
+/// The located `embarch-core` binary's own SHA-256, hex-encoded to compare
+/// directly against `/status`'s `binary_sha256` (`embarch-core` decision 68).
+/// Reuses [`crate::deploy::hash_file`] — `deploy-core`'s own landed-check
+/// already hashes a located Core binary this way (decision 32); one hashing
+/// routine, not two.
+fn hash_located_core(path: &Path) -> Option<String> {
+    crate::deploy::hash_file(path).ok().map(|digest| digest.iter().map(|b| format!("{b:02x}")).collect())
 }
 
 // ---- check 16: what grows, and by how much ----------------------------------
@@ -3288,7 +3354,20 @@ pub async fn doctor(json: bool) -> i32 {
     let check12 = check_dev_bench(&core_probe, authed.as_ref(), config.as_ref()).await;
     let check13 = check_firmware_version(&hello, &saved);
     let check14 = check_flash_backend(core.as_ref(), core_class);
-    let check15 = check_core_build(authed.as_ref(), core_version_output.as_deref());
+    // Hashing the located binary is paid only where it can change check 15's
+    // verdict: `core_version` already matching is the one case decision 34
+    // named as blind, and the case decision 56 closes. A version mismatch
+    // already gets its own Warn with nothing a hash would add, so that path
+    // skips the disk read + SHA-256 of a whole install-sized binary.
+    let located_sha256 = authed.as_ref().and_then(|a| {
+        let served = a.core_version.as_deref()?;
+        let local = core_version_output.as_deref().and_then(crate::manifest::version_from_output)?;
+        if served != local {
+            return None;
+        }
+        core.as_ref().and_then(|c| hash_located_core(&c.path))
+    });
+    let check15 = check_core_build(authed.as_ref(), core_version_output.as_deref(), located_sha256.as_deref());
     // Check 3's winner is the honest source for *which machine* holds Core's
     // data directory; with no winner, this host's own shape is the stated
     // assumption rather than a silent one.
@@ -3791,7 +3870,12 @@ mod tests {
     }
 
     fn no_probes() -> AuthedStatus {
-        AuthedStatus { probes: Vec::new(), study_designer_schema_version: None, core_version: None }
+        AuthedStatus {
+            probes: Vec::new(),
+            study_designer_schema_version: None,
+            core_version: None,
+            binary_sha256: None,
+        }
     }
 
     #[test]
@@ -3923,6 +4007,7 @@ mod tests {
             probes: vec![serde_json::json!({"identifier": "whatever"})],
             study_designer_schema_version: None,
             core_version: None,
+            binary_sha256: None,
         };
         let dir = tempdir();
         usb_device(dir.path(), "1-2", "1366", Some("J-Link"));
@@ -4953,14 +5038,14 @@ mod tests {
 
     #[test]
     fn a_running_core_matching_the_located_binary_passes() {
-        let c = judge_core_build(Some("0.1.0"), Some("embarch-core 0.1.0"));
+        let c = judge_core_build(Some("0.1.0"), Some("embarch-core 0.1.0"), None, None);
         assert_eq!(c.status, Status::Pass);
         assert!(c.detail.contains("0.1.0"));
     }
 
     #[test]
     fn a_stale_cross_version_deploy_warns_and_names_both_builds() {
-        let c = judge_core_build(Some("0.1.0"), Some("embarch-core 0.2.0"));
+        let c = judge_core_build(Some("0.1.0"), Some("embarch-core 0.2.0"), None, None);
         // Warn, never fail — embarch-core decision 13, and decision 24 here.
         assert_eq!(c.status, Status::Warn);
         assert!(c.detail.contains("0.1.0") && c.detail.contains("0.2.0"), "{}", c.detail);
@@ -4968,31 +5053,87 @@ mod tests {
     }
 
     #[test]
-    fn a_same_version_stale_deploy_is_invisible_and_the_check_says_so() {
+    fn a_cross_version_mismatch_warns_the_same_way_even_with_hashes_present() {
+        // Decision 56: a hash on both sides only ever matters once the
+        // versions already agree — a cross-version mismatch keeps its
+        // existing verdict and message, hashes or not.
+        let c = judge_core_build(Some("0.1.0"), Some("embarch-core 0.2.0"), Some("aa"), Some("bb"));
+        assert_eq!(c.status, Status::Warn);
+        assert!(!c.detail.contains("binary_sha256"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_same_version_stale_deploy_is_invisible_with_no_hash_on_either_side() {
         // The honest limit, asserted rather than only documented: identical
-        // crate versions read as a match however different the binaries are.
-        let c = judge_core_build(Some("0.1.0"), Some("embarch-core 0.1.0"));
+        // crate versions read as a match however different the binaries are,
+        // when neither side has a binary_sha256 to compare.
+        let c = judge_core_build(Some("0.1.0"), Some("embarch-core 0.1.0"), None, None);
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.detail.contains("same-version stale deploy is invisible"), "{}", c.detail);
+    }
+
+    #[test]
+    fn matching_hashes_on_a_matching_version_close_the_blind_spot() {
+        // Decision 56's positive case: both sides serve binary_sha256 and
+        // agree, so the check states a real, measured match rather than the
+        // version-only shrug.
+        let hash = "e".repeat(64);
+        let c = judge_core_build(Some("0.1.0"), Some("embarch-core 0.1.0"), Some(&hash), Some(&hash));
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.detail.contains("binary_sha256"), "{}", c.detail);
+        assert!(!c.detail.contains("invisible"), "{}", c.detail);
+    }
+
+    #[test]
+    fn mismatched_hashes_on_a_matching_version_warn_as_a_same_version_stale_deploy() {
+        // The case decision 34 called unmeasurable and decision 56 measures:
+        // same core_version, disagreeing bytes.
+        let c = judge_core_build(
+            Some("0.1.0"),
+            Some("embarch-core 0.1.0"),
+            Some(&"a".repeat(64)),
+            Some(&"b".repeat(64)),
+        );
+        assert_eq!(c.status, Status::Warn);
+        assert!(c.detail.contains("same-version stale deploy"), "{}", c.detail);
+        assert!(c.fix.as_deref().unwrap().contains("deploy-core"));
+    }
+
+    #[test]
+    fn a_missing_local_hash_falls_back_to_the_version_only_verdict() {
+        // The located binary's own read failed (or was never attempted) —
+        // still a Pass, still naming the version-only limit, not a new warn.
+        let c = judge_core_build(Some("0.1.0"), Some("embarch-core 0.1.0"), Some(&"a".repeat(64)), None);
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.detail.contains("same-version stale deploy is invisible"), "{}", c.detail);
+    }
+
+    #[test]
+    fn a_missing_served_hash_falls_back_to_the_version_only_verdict() {
+        // A Core predating embarch-core decision 68 serves no binary_sha256
+        // at all — same fallback as a failed local read.
+        let c = judge_core_build(Some("0.1.0"), Some("embarch-core 0.1.0"), None, Some(&"a".repeat(64)));
         assert_eq!(c.status, Status::Pass);
         assert!(c.detail.contains("same-version stale deploy is invisible"), "{}", c.detail);
     }
 
     #[test]
     fn a_core_predating_core_version_is_a_skip_that_says_what_it_predates() {
-        let c = judge_core_build(None, Some("embarch-core 0.1.0"));
+        let c = judge_core_build(None, Some("embarch-core 0.1.0"), None, None);
         assert_eq!(c.status, Status::Warn);
         assert!(c.detail.contains("decision 13"), "{}", c.detail);
     }
 
     #[test]
     fn nothing_local_to_compare_against_is_a_skip_naming_check_1() {
-        let c = judge_core_build(Some("0.1.0"), None);
+        let c = judge_core_build(Some("0.1.0"), None, None, None);
         assert_eq!(c.status, Status::Warn);
         assert!(c.detail.contains("check 1"), "{}", c.detail);
     }
 
     #[test]
     fn check_15_skips_when_there_is_no_authenticated_status() {
-        let c = check_core_build(None, Some("embarch-core 0.1.0"));
+        let c = check_core_build(None, Some("embarch-core 0.1.0"), None);
         assert_eq!(c.status, Status::Warn);
         assert!(c.detail.starts_with("skipped —"), "{}", c.detail);
     }
@@ -5714,6 +5855,7 @@ mod tests {
             probes: vec![serde_json::json!({"id": "probe-1", "kind": "jlink"})],
             study_designer_schema_version: Some(17),
             core_version: Some("0.1.0".to_string()),
+            binary_sha256: None,
         };
         for scan in [
             UsbScan::NotLinux,
@@ -5824,8 +5966,25 @@ mod tests {
                 Some("embarch-core 0.2.0"),
                 Some("not a version line"),
             ] {
-                out.push(judge_core_build(served, located));
+                out.push(judge_core_build(served, located, None, None));
             }
+        }
+        // Decision 56's hash arms, reachable only once the versions agree.
+        let hash_a = "a".repeat(64);
+        let hash_b = "b".repeat(64);
+        for (served_sha256, located_sha256) in [
+            (None, None),
+            (Some(hash_a.as_str()), None),
+            (None, Some(hash_a.as_str())),
+            (Some(hash_a.as_str()), Some(hash_a.as_str())),
+            (Some(hash_a.as_str()), Some(hash_b.as_str())),
+        ] {
+            out.push(judge_core_build(
+                Some("0.1.0"),
+                Some("embarch-core 0.1.0"),
+                served_sha256,
+                located_sha256,
+            ));
         }
 
         // ---- check 16 -------------------------------------------------------

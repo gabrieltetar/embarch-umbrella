@@ -295,7 +295,11 @@ pub fn landed(built_digest: [u8; 32], installed_digest_after: [u8; 32]) -> bool 
 /// SHA-256 of a file's contents, for [`landed`]. Not a length and not a
 /// timestamp — a copy preserves neither reliably across the `/mnt` boundary,
 /// and length is exactly the check decision 32's amendment retired.
-fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
+///
+/// `pub(crate)`: check 15 (`doctor.rs`, `embarch-umbrella` decision 56) hashes
+/// the located `embarch-core` binary the same way, to compare against
+/// `/status`'s `binary_sha256` — one hashing routine, not two.
+pub(crate) fn hash_file(path: &Path) -> std::io::Result<[u8; 32]> {
     let bytes = std::fs::read(path)?;
     Ok(hash_bytes(&bytes))
 }
