@@ -52,12 +52,12 @@ use crate::state;
 /// Sync order: shared crates first, `embarch-core` last.
 ///
 /// Not alphabetical and not arbitrary. `embarch-core`'s `Cargo.toml` carries
-/// `path` dependencies on both of the others, so a run that copied Core
+/// `path` dependencies on all three others, so a run that copied Core
 /// first and was interrupted would leave a Windows tree whose Core is newer
 /// than the crates it is built against — which compiles cleanly and is
 /// wrong. Same ordering, same reason, as the commit ordering
 /// `embarch-dev-workflow.md` §6 requires.
-pub const SYNC_CRATES: [&str; 3] = ["embarch-study-designer", "embarch-topology", "embarch-core"];
+pub const SYNC_CRATES: [&str; 4] = ["embarch-study-designer", "embarch-topology", "embarch-smp", "embarch-core"];
 
 const EXIT_FAILURE: i32 = 1;
 
@@ -709,7 +709,7 @@ mod tests {
     }
 
     /// The ordering invariant, asserted rather than left to a comment:
-    /// `embarch-core` depends on both of the others by `path`, so a run that
+    /// `embarch-core` depends on all three others by `path`, so a run that
     /// copied it first and died would leave a tree that builds cleanly and
     /// is wrong.
     #[test]
@@ -717,6 +717,7 @@ mod tests {
         assert_eq!(*SYNC_CRATES.last().unwrap(), "embarch-core");
         assert!(SYNC_CRATES.contains(&"embarch-study-designer"));
         assert!(SYNC_CRATES.contains(&"embarch-topology"));
+        assert!(SYNC_CRATES.contains(&"embarch-smp"));
     }
 
     #[test]
