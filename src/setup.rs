@@ -257,6 +257,7 @@ fn apply_plan(
     // subsequent start.
     let bind_addr = embarch_topology::software::recommended_bind_address(plan.class);
 
+    let mut install_failed = false;
     if plan.already_running {
         println!("embarch-core is already running — nothing to install.");
     } else {
@@ -294,11 +295,14 @@ fn apply_plan(
                     // Almost always a privilege failure. Trying first is
                     // still right: someone who ran `sudo embarch setup` gets
                     // it done in one step.
-                    Ok(false) | Err(_) => println!(
-                        "Could not install the service — this needs elevation. Run:\n  \
-                         sudo \"{}\" install --bind {bind_addr}",
-                        c.path.display()
-                    ),
+                    Ok(false) | Err(_) => {
+                        install_failed = true;
+                        println!(
+                            "Could not install the service — this needs elevation. Run:\n  \
+                             sudo \"{}\" install --bind {bind_addr}",
+                            c.path.display()
+                        );
+                    }
                 }
             }
             (_, None) => {
@@ -381,7 +385,9 @@ fn apply_plan(
     } else {
         println!("\nNext: `embarch status` to confirm, then `embarch init` in a firmware repo.");
     }
-    0
+    // Decision 7's fallback: the exact command was printed, and the install
+    // did not happen, so a chained `&&` must stop.
+    if install_failed { 1 } else { 0 }
 }
 
 /// Reverse `setup`: stop and unregister the Core service (best-effort — a
@@ -389,6 +395,7 @@ fn apply_plan(
 /// `up`/`down` already have), remove the machine-wide token file, and undo
 /// decision 28's install (canonical binaries + `PATH` additions).
 pub fn uninstall() -> i32 {
+    let mut failed: Vec<&str> = Vec::new();
     let under_wsl2 = env::under_wsl2();
     let saved = state::load();
     let core = locate::locate_core(saved.core_exe.as_deref(), under_wsl2);
@@ -399,6 +406,7 @@ pub fn uninstall() -> i32 {
             match run(&c.path, &["uninstall"]) {
                 Ok(true) => println!("Service uninstalled."),
                 Ok(false) | Err(_) => {
+                    failed.push("service uninstall");
                     eprintln!("Could not uninstall the service — this may need elevation:\n  sudo \"{}\" uninstall", c.path.display());
                 }
             }
@@ -417,16 +425,33 @@ pub fn uninstall() -> i32 {
         match std::fs::remove_file(&token) {
             Ok(()) => println!("Removed token file: {}", token.display()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => eprintln!("Could not remove token file {}: {e}", token.display()),
+            Err(e) => {
+                failed.push("token removal");
+                eprintln!("Could not remove token file {}: {e}", token.display());
+            }
         }
     }
 
     match install::uninstall() {
         Ok(()) => println!("Removed the canonical install directory and PATH additions."),
-        Err(e) => eprintln!("Could not fully undo the install: {e:#}"),
+        Err(e) => {
+            failed.push("install undo");
+            eprintln!("Could not fully undo the install: {e:#}");
+        }
     }
 
-    0
+    uninstall_exit(&failed)
+}
+
+/// Exit status for `setup --uninstall` over the steps that were attempted and
+/// failed: 0 when none did, otherwise 1 with a final line naming each, so
+/// `embarch setup --uninstall && …` stops with Core still installed.
+fn uninstall_exit(failed: &[&str]) -> i32 {
+    if failed.is_empty() {
+        return 0;
+    }
+    eprintln!("Uninstall incomplete — failed: {}.", failed.join(", "));
+    1
 }
 
 pub fn topology_class_from_str(s: &str) -> Option<TopologyClass> {
@@ -671,6 +696,13 @@ pub fn down() -> i32 {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn uninstall_exit_is_zero_with_nothing_failed_and_one_naming_each_failure() {
+        assert_eq!(uninstall_exit(&[]), 0);
+        assert_eq!(uninstall_exit(&["service uninstall"]), 1);
+        assert_eq!(uninstall_exit(&["service uninstall", "token removal", "install undo"]), 1);
+    }
+
     use super::*;
 
     #[test]

@@ -333,7 +333,7 @@ fn check_binaries(
                                 check(
                                     1,
                                     "binaries found",
-                                    Status::Fail,
+                                    Status::Warn,
                                     format!(
                                         "{found}. Suite manifest v{} mismatch: {}.{note}{api_note}",
                                         m.suite_version,
@@ -456,11 +456,15 @@ fn check_service(
 
     let fix = match (class, core) {
         (TopologyClass::Remote, _) => {
-            "Core runs on another machine. On that machine: `embarch-core install` (elevated).".to_string()
+            format!(
+                "Core runs on another machine. On that machine: `embarch-core install --bind {bind}` (elevated).",
+                bind = embarch_topology::software::recommended_bind_address(class)
+            )
         }
         (TopologyClass::WslHost, Some(c)) => format!(
-            "Core belongs on the Windows side. In an **elevated Windows** shell: \"{}\" install",
-            setup::windows_display_path(&c.path)
+            "Core belongs on the Windows side. In an **elevated Windows** shell: \"{}\" install --bind {}",
+            setup::windows_display_path(&c.path),
+            embarch_topology::software::recommended_bind_address(class)
         ),
         (TopologyClass::Local, Some(c)) => {
             // One space before the parenthesis, not three: the module-wide
@@ -2418,6 +2422,13 @@ fn git_object_known(repo_path: &Path, remote_version: &str) -> bool {
 /// check's whole purpose goes uncaught for as long as nobody runs `setup
 /// --dev-bench-repo`.
 ///
+/// **A dirty checkout is its own verdict, `dirty-checkout`, a Warn
+/// (decision 19's amendment).** Local `X-dirty` against a bench flashed from
+/// clean `X` is not stale; the bench matches HEAD and the tree has
+/// uncommitted changes. Local `X-dirty` against bench `X-dirty` passes as
+/// `match`, which proves only that both were dirty on the same commit, not
+/// that the two diffs are the same.
+///
 /// **A `firmware_version` git can't find is reported as that, not as an
 /// ordinary stale mismatch (decision 47).** `git describe`'s hash survives
 /// unchanged in the flashed firmware even after the checkout's history is
@@ -2467,6 +2478,37 @@ fn check_firmware_version(hello: &HelloOutcome, saved: &state::State) -> Check {
             check(N, NAME, Status::Pass, format!("firmware_version '{remote}' matches {}", repo_path.display())),
             "match",
         ),
+        // The checkout is `X-dirty` and the bench was flashed from clean `X`:
+        // the bench matches HEAD, and the only difference is uncommitted
+        // work. Not "stale" — rebuild-and-reflash would not clear it
+        // (dev-bench's CMake runs `git describe` only at configure time).
+        Some(remote)
+            if local_version.strip_suffix("-dirty") == Some(remote.as_str())
+                && !remote.ends_with("-dirty") =>
+        {
+            with_code(
+                with_fix(
+                    check(
+                        N,
+                        NAME,
+                        Status::Warn,
+                        format!(
+                            "dev-bench reports firmware_version '{remote}', which matches HEAD of {}; \
+                             the checkout has uncommitted changes ('{local_version}'), which this check \
+                             cannot tell apart from firmware you have not flashed",
+                            repo_path.display()
+                        ),
+                    ),
+                    format!(
+                        "commit or stash the changes in {} and this passes; if they are firmware changes \
+                         you mean to test, rebuild with a forced reconfigure (`west build -p always`) and \
+                         reflash",
+                        repo_path.display()
+                    ),
+                ),
+                "dirty-checkout",
+            )
+        }
         Some(remote) if git_object_known(&repo_path, remote) => with_code(
             with_fix(
                 check(
@@ -4187,6 +4229,51 @@ mod tests {
         assert_eq!(unresolvable.status, Status::Fail);
         assert_eq!(unresolvable.code, Some("unresolvable"));
         assert!(unresolvable.detail.contains("not a commit"));
+    }
+
+    #[test]
+    fn check_13_a_dirty_checkout_against_a_clean_bench_is_not_stale() {
+        let dir = tempdir();
+        init_repo(dir.path());
+        let head = git_describe(dir.path()).unwrap();
+        let saved = state::State { dev_bench_repo_path: Some(dir.path().to_path_buf()), ..Default::default() };
+        let hello = |v: &str| {
+            HelloOutcome::Answered(HelloAck {
+                schema_version: Some(15),
+                compatible: Some(true),
+                firmware_version: Some(v.to_string()),
+                raw: "{}".to_string(),
+            })
+        };
+        std::fs::write(dir.path().join("f.txt"), "dirty").unwrap();
+        assert!(git_describe(dir.path()).unwrap().ends_with("-dirty"));
+
+        let c = check_firmware_version(&hello(&head), &saved);
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.code, Some("dirty-checkout"));
+        assert!(c.detail.contains("matches HEAD"), "{}", c.detail);
+        assert!(c.fix.unwrap().contains("commit or stash"));
+
+        // Dirty against dirty on the same commit passes, and proves no more.
+        let c = check_firmware_version(&hello(&format!("{head}-dirty")), &saved);
+        assert_eq!(c.status, Status::Pass);
+        assert_eq!(c.code, Some("match"));
+
+        // Following the fix clears it.
+        git(dir.path(), &["checkout", "--", "f.txt"]);
+        let c = check_firmware_version(&hello(&head), &saved);
+        assert_eq!(c.code, Some("match"));
+    }
+
+    #[test]
+    fn check_2_fix_lines_carry_the_bind_setup_passes_for_the_class() {
+        let win_core = a_located("/mnt/c/Program Files/embarch/embarch-core.exe", true);
+        let c = check_service(&nothing_answered_probe(), None, None, Some(&win_core));
+        let bind = embarch_topology::software::recommended_bind_address(TopologyClass::WslHost);
+        assert!(c.fix.unwrap().contains(&format!("install --bind {bind}")));
+        let c = check_service(&nothing_answered_probe(), Some("bench.local"), None, None);
+        let bind = embarch_topology::software::recommended_bind_address(TopologyClass::Remote);
+        assert!(c.fix.unwrap().contains(&format!("install --bind {bind}")));
     }
 
     // The three UNC round-trip tests that lived here went with check 9's
