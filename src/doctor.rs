@@ -1948,9 +1948,21 @@ enum HelloOutcome {
     /// `404` — Core sees no bench. An ordinary state on a machine that has
     /// none, not a fault.
     NoBench,
-    /// Anything else: Core unreachable, no token, a `409` mid-study, an HTTP
-    /// error. The string is the reason, phrased to follow "skipped — ".
+    /// `503` (`hw_lock` held, core decision 14) or `409` (a study or another
+    /// hello holds the link, core decision 4/14/15): the bench is **busy**, not
+    /// broken. Carries Core's plain-text body, which names the holder (Core
+    /// states no structured field for it, so the body is quoted, not parsed).
+    Busy { status: u16, body: String },
+    /// Anything else: Core unreachable, no token, an HTTP error. The string is
+    /// the reason, phrased to follow "skipped — ".
     Unavailable(String),
+}
+
+impl HelloOutcome {
+    /// "busy (HTTP 503): <Core's body>", phrased to follow "skipped — ".
+    fn busy_reason(status: u16, body: &str) -> String {
+        format!("dev-bench is busy (HTTP {status}): {}", one_line(body))
+    }
 }
 
 async fn fetch_dev_bench_hello(
@@ -1992,7 +2004,7 @@ async fn fetch_dev_bench_hello(
             })
         }
         Ok((404, _)) => HelloOutcome::NoBench,
-        Ok((409, body)) => HelloOutcome::Unavailable(format!("dev-bench is busy: {}", one_line(&body))),
+        Ok((status @ (409 | 503), body)) => HelloOutcome::Busy { status, body },
         Ok((status, body)) => HelloOutcome::Unavailable(format!("HTTP {status}: {}", one_line(&body))),
         Err(e) => HelloOutcome::Unavailable(e),
     }
@@ -2255,7 +2267,12 @@ fn check_schema_versions(
         ),
     };
 
+    let busy_why;
     let bench_wire = match hello {
+        HelloOutcome::Busy { status, body } => {
+            busy_why = HelloOutcome::busy_reason(*status, body);
+            Err(busy_why.as_str())
+        }
         HelloOutcome::Answered(ack) => match ack.schema_version {
             Some(wire) => Ok((wire, ack.compatible)),
             None => Err("dev-bench answered without a `schema_version`"),
@@ -2444,6 +2461,21 @@ fn check_firmware_version(hello: &HelloOutcome, saved: &state::State) -> Check {
         HelloOutcome::Answered(ack) => ack,
         HelloOutcome::NoBench => {
             return check(N, NAME, Status::Pass, "not plugged in (expected if you have no bench)")
+        }
+        HelloOutcome::Busy { status, body } => {
+            return with_code(
+                with_fix(
+                    check(
+                        N,
+                        NAME,
+                        Status::Warn,
+                        format!("skipped — {}", HelloOutcome::busy_reason(*status, body)),
+                    ),
+                    "wait for the study, flash or reset named above to finish, then re-run `embarch doctor`; \
+                     busy is not a firmware fault",
+                ),
+                "busy",
+            )
         }
         HelloOutcome::Unavailable(why) => return check(N, NAME, Status::Warn, format!("skipped — {why}")),
     };
@@ -4229,6 +4261,29 @@ mod tests {
         assert_eq!(unresolvable.status, Status::Fail);
         assert_eq!(unresolvable.code, Some("unresolvable"));
         assert!(unresolvable.detail.contains("not a commit"));
+    }
+
+    #[test]
+    fn check_13_a_busy_bench_is_a_warn_naming_the_holder_not_a_failure() {
+        for (status, body) in [
+            (503u16, "hw_lock held by POST /flash; GET /dev-bench/hello refused after waiting 500ms"),
+            (409, "dev-bench link is busy: POST /study is holding it"),
+        ] {
+            let c = check_firmware_version(
+                &HelloOutcome::Busy { status, body: body.to_string() },
+                &state::State::default(),
+            );
+            assert_eq!(c.status, Status::Warn);
+            assert_eq!(c.code, Some("busy"));
+            assert!(c.detail.contains("busy") && c.detail.contains(body), "{}", c.detail);
+            assert!(c.detail.contains(&format!("HTTP {status}")), "{}", c.detail);
+        }
+        // 502 and the like stay the generic skip, not "busy".
+        let c = check_firmware_version(
+            &HelloOutcome::Unavailable("HTTP 502: x".to_string()),
+            &state::State::default(),
+        );
+        assert_eq!(c.code, None);
     }
 
     #[test]
