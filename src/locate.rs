@@ -227,6 +227,34 @@ fn on_path(stem: &str) -> Option<Located> {
         })
 }
 
+/// Locate `embarch-desk` (decision 58): `EMBARCH_DESK_BIN` (not
+/// existence-checked, like the other overrides), then `PATH`, then the
+/// canonical install directory. The desk ships from its own repo, so there is
+/// no agent-registration or Windows-side source to consult.
+pub fn locate_desk() -> Option<Located> {
+    let canonical = crate::install::canonical_bin_dir()
+        .ok()
+        .map(|d| d.join(native_name("embarch-desk")))
+        .filter(|p| p.is_file());
+    choose_desk(std::env::var_os("EMBARCH_DESK_BIN").map(PathBuf::from), on_path("embarch-desk").map(|l| l.path), canonical)
+}
+
+fn choose_desk(env_override: Option<PathBuf>, on_path: Option<PathBuf>, canonical: Option<PathBuf>) -> Option<Located> {
+    let (path, found_by) = if let Some(p) = env_override {
+        (p, FoundBy::EnvVar)
+    } else if let Some(p) = on_path {
+        (p, FoundBy::Path)
+    } else {
+        (canonical?, FoundBy::CanonicalInstall)
+    };
+    Some(Located { path, found_by, windows_exe_from_wsl2: false })
+}
+
+/// `claude` on `PATH`, for the plugin step (decision 58).
+pub fn locate_claude() -> Option<PathBuf> {
+    on_path("claude").map(|l| l.path)
+}
+
 /// Locate `embarch-core`: an explicit override, then what `setup` recorded,
 /// then `PATH` (populated for real by `setup`'s install step) — then, under
 /// WSL2 only, the Windows service's own registration, then the real

@@ -11,6 +11,7 @@ use anyhow::{Context, Result};
 
 use embarch_topology::software::TopologyClass;
 
+use crate::desk;
 use crate::env;
 use crate::install;
 use crate::locate::{self, FoundBy, Located};
@@ -138,6 +139,12 @@ struct Locations {
     home: Option<PathBuf>,
     /// Where the concluded topology is recorded (`state.rs`).
     state_path: Option<PathBuf>,
+    /// The desk steps' inputs (decision 58), resolved here with everything
+    /// else so a test hands in `None` and a mock rather than reaching the
+    /// real `embarch-desk` and `claude` on the machine running it.
+    desk: Option<Located>,
+    claude: Option<PathBuf>,
+    runner: Box<dyn desk::Runner>,
 }
 
 impl Locations {
@@ -147,6 +154,9 @@ impl Locations {
             bin_dir: install::canonical_bin_dir().ok(),
             home: std::env::var_os("HOME").map(PathBuf::from),
             state_path: state::state_path().ok(),
+            desk: locate::locate_desk(),
+            claude: locate::locate_claude(),
+            runner: Box::new(desk::Real),
         }
     }
 }
@@ -335,6 +345,19 @@ fn apply_plan(
         }
     }
 
+    // Decision 58: the desk is optional, so it comes after Core and never
+    // stops the run; a failed step is reported and makes the exit non-zero.
+    let desk_steps = desk::install(
+        loc.desk.as_ref(),
+        loc.claude.as_deref(),
+        cfg!(target_os = "linux"),
+        dry_run,
+        loc.runner.as_ref(),
+    );
+    if desk::report("embarch-desk:", &desk_steps, dry_run) {
+        install_failed = true;
+    }
+
     let dev_bench_repo_path = dev_bench_repo
         .map(std::path::Path::to_path_buf)
         .or(previously_saved.dev_bench_repo_path);
@@ -430,6 +453,17 @@ pub fn uninstall() -> i32 {
                 eprintln!("Could not remove token file {}: {e}", token.display());
             }
         }
+    }
+
+    // Before the install undo: the desk's unit names a binary that undo deletes.
+    let desk_steps = desk::uninstall(
+        locate::locate_desk().as_ref(),
+        locate::locate_claude().as_deref(),
+        cfg!(target_os = "linux"),
+        &desk::Real,
+    );
+    if desk::report("embarch-desk:", &desk_steps, false) {
+        failed.push("desk");
     }
 
     match install::uninstall() {
@@ -800,6 +834,9 @@ mod tests {
             bin_dir: Some(bin_dir.clone()),
             home: Some(home.clone()),
             state_path: Some(sandbox.join("config").join("umbrella.toml")),
+            desk: None,
+            claude: None,
+            runner: Box::new(desk::Real),
         };
         let plan = Plan {
             class: TopologyClass::Local,
@@ -875,6 +912,9 @@ mod tests {
             bin_dir: None,
             home: None,
             state_path: Some(state_path.clone()),
+            desk: None,
+            claude: None,
+            runner: Box::new(desk::Real),
         };
         let plan = Plan {
             class: TopologyClass::Remote,
@@ -907,6 +947,9 @@ mod tests {
             bin_dir: None,
             home: None,
             state_path: Some(state_path.clone()),
+            desk: None,
+            claude: None,
+            runner: Box::new(desk::Real),
         };
         let previously_saved = State {
             host: Some("bench.local".to_string()),

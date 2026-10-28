@@ -6,6 +6,7 @@
 //! and dogfooding the guide are what remains.
 
 mod config;
+mod desk;
 mod deploy;
 mod doctor;
 mod env;
