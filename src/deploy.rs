@@ -407,9 +407,13 @@ pub async fn deploy_core(
 
     println!("building natively (this is the slow part)");
     let core_dir = plan.windows_root.join("embarch-core");
+    // Decision 57: the copy has no `.git`, so carry the Linux checkout's
+    // commit across, or the service's `--version` says `(commit unknown)`.
+    let stamp = checkout_stamp(&plan.source_root.join("embarch-core"));
     let status = std::process::Command::new(&plan.cargo_exe)
         .args(["build", "--release"])
         .current_dir(&core_dir)
+        .envs(stamp_env(stamp.as_ref(), std::env::var("WSLENV").ok().as_deref()))
         .status();
     match status {
         Ok(s) if s.success() => {}
@@ -604,6 +608,46 @@ fn parse_wire_schema_version(source: &str) -> Option<u32> {
     digits.parse().ok()
 }
 
+/// The Linux checkout's commit and dirty flag, for the Windows build
+/// (decision 57). The rsync above excludes `.git`, so `cargo.exe` building
+/// the copy would stamp `unknown`. `None` when git cannot say, and the build
+/// then does exactly that.
+fn checkout_stamp(dir: &Path) -> Option<(String, bool)> {
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .arg("--no-optional-locks")
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let commit = git(&["rev-parse", "HEAD"])?;
+    let changes = git(&["status", "--porcelain", "--untracked-files=no"])?;
+    Some((commit, !changes.is_empty()))
+}
+
+/// The environment `cargo.exe` gets so its `build.rs` stamps the Linux
+/// commit. A Win32 process started from WSL sees only the variables `WSLENV`
+/// names, so the two are appended to whatever `WSLENV` already lists.
+fn stamp_env(stamp: Option<&(String, bool)>, wslenv: Option<&str>) -> Vec<(String, String)> {
+    let Some((commit, dirty)) = stamp else {
+        return Vec::new();
+    };
+    let shared = "EMBARCH_BUILD_COMMIT:EMBARCH_BUILD_DIRTY";
+    let wslenv = match wslenv.map(str::trim).filter(|w| !w.is_empty()) {
+        Some(existing) => format!("{existing}:{shared}"),
+        None => shared.to_string(),
+    };
+    vec![
+        ("EMBARCH_BUILD_COMMIT".to_string(), commit.clone()),
+        ("EMBARCH_BUILD_DIRTY".to_string(), if *dirty { "1" } else { "0" }.to_string()),
+        ("WSLENV".to_string(), wslenv),
+    ]
+}
+
 /// `%USERPROFILE%\.cargo\bin\cargo.exe`, translated. Never on the WSL
 /// `PATH`, which is why every manual deploy has typed it out by hand.
 #[cfg(unix)]
@@ -700,6 +744,27 @@ fn cwd_repo_parent() -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Decision 57: the Windows build gets the Linux commit, shared through
+    /// `WSLENV` without dropping what it already lists.
+    #[test]
+    fn stamp_env_shares_the_commit_through_wslenv() {
+        assert!(stamp_env(None, Some("FOO")).is_empty());
+        let stamp = ("744b94be2b96".to_string(), true);
+        let env = stamp_env(Some(&stamp), Some("FOO/p"));
+        assert_eq!(
+            env,
+            vec![
+                ("EMBARCH_BUILD_COMMIT".to_string(), "744b94be2b96".to_string()),
+                ("EMBARCH_BUILD_DIRTY".to_string(), "1".to_string()),
+                ("WSLENV".to_string(), "FOO/p:EMBARCH_BUILD_COMMIT:EMBARCH_BUILD_DIRTY".to_string()),
+            ]
+        );
+        let clean = ("abc".to_string(), false);
+        let env = stamp_env(Some(&clean), Some("  "));
+        assert_eq!(env[1].1, "0");
+        assert_eq!(env[2].1, "EMBARCH_BUILD_COMMIT:EMBARCH_BUILD_DIRTY");
+    }
 
     fn state_with(windows_root: Option<&str>) -> state::State {
         state::State {

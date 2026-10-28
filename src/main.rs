@@ -30,7 +30,8 @@ const EXIT_FAILURE: i32 = 1;
 #[derive(Parser)]
 #[command(
     name = "embarch",
-    version,
+    // Names the commit this binary was built from (decision 57).
+    version = env!("EMBARCH_BUILD_VERSION"),
     about = "Setup and diagnostics for the EmbArch suite",
     long_about = "Sets up embarch-core and embarch-api on whatever topology this machine is, \
                   integrates a firmware repo, and diagnoses the whole chain.\n\n\

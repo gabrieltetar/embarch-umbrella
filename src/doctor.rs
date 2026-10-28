@@ -71,7 +71,7 @@ pub struct Check {
     pub fix: Option<String>,
     /// A stable machine-readable outcome, for a check whose `status` alone
     /// does not say which state it is in (decision 37). Checks 1, 5, 10, 13,
-    /// 14 and 17 carry one today; `None` renders as JSON `null` rather than being
+    /// 14, 17 and 18 carry one today; `None` renders as JSON `null` rather than being
     /// omitted, so the key is always present and a consumer never has to
     /// distinguish "absent" from "no code".
     ///
@@ -3482,9 +3482,13 @@ pub async fn doctor(json: bool) -> i32 {
         setup_would_infer: setup::infer_class(None, core.as_ref()),
     });
 
+    // Decision 57: is the installed embarch-api (and this binary) the HEAD of
+    // the checkout it was built in.
+    let check18 = check_build_freshness(api.as_ref());
+
     let checks = vec![
         check1, check2, check3, check4, check5, check6, check7, check8, check9, check10, check11, check12,
-        check13, check14, check15, check16, check17,
+        check13, check14, check15, check16, check17, check18,
     ];
 
     let any_fail = checks.iter().any(|c| c.status == Status::Fail);
@@ -3500,6 +3504,205 @@ pub async fn doctor(json: bool) -> i32 {
     } else {
         0
     }
+}
+
+// ---- check 18: an installed binary against the checkout it was built in ----
+
+/// What one binary says about the commit it was built from (decision 57).
+struct BuildIdentity {
+    commit: String,
+    dirty: bool,
+    source_dir: PathBuf,
+}
+
+/// Where a binary's commit stands in the checkout it was built in.
+enum Standing {
+    /// The checkout's `HEAD` is the binary's commit.
+    Current,
+    /// `HEAD` contains the commit, `by` commits later.
+    Behind { by: u32, head: String },
+    /// `HEAD` does not contain the commit: another branch, a rewritten
+    /// history, or a checkout reset behind the build.
+    NotInCheckout { head: String },
+    /// The source directory is not a git checkout on this machine — a
+    /// release install, built elsewhere. Nothing to compare.
+    NoCheckout,
+}
+
+/// One binary's row in check 18.
+enum Freshness {
+    /// Not located; check 1 already says so.
+    NotLocated,
+    /// Located, but it names no commit: it predates the stamp, or it was
+    /// built outside a checkout. The string says which.
+    NoIdentity(String),
+    Known(BuildIdentity, Standing),
+}
+
+fn short_sha(commit: &str) -> &str {
+    commit.get(..8).unwrap_or(commit)
+}
+
+/// One binary's sentence, and the code its state carries when it warns.
+fn freshness_line(name: &str, f: &Freshness) -> (String, Option<&'static str>) {
+    match f {
+        Freshness::NotLocated => (format!("{name} not located (see check 1)"), None),
+        Freshness::NoIdentity(why) => (format!("{name} names no build commit ({why})"), Some("no-build-identity")),
+        Freshness::Known(id, standing) => {
+            let built = if id.dirty {
+                format!("{}, built with uncommitted changes", short_sha(&id.commit))
+            } else {
+                short_sha(&id.commit).to_string()
+            };
+            let dir = id.source_dir.display();
+            match standing {
+                Standing::Current => (format!("{name} is its checkout's HEAD ({built}, {dir})"), None),
+                Standing::Behind { by, head } => (
+                    format!(
+                        "{name} is {by} commit{} behind its checkout (built {built}, HEAD {}, {dir})",
+                        if *by == 1 { "" } else { "s" },
+                        short_sha(head)
+                    ),
+                    Some("behind-checkout"),
+                ),
+                Standing::NotInCheckout { head } => (
+                    format!(
+                        "{name}'s commit {built} is not in the history of its checkout's HEAD {} ({dir})",
+                        short_sha(head)
+                    ),
+                    Some("not-in-checkout"),
+                ),
+                Standing::NoCheckout => (
+                    format!("{name} was built from {dir}, which is not a git checkout on this machine ({built})"),
+                    None,
+                ),
+            }
+        }
+    }
+}
+
+/// The order a reader acts on: a binary behind its checkout first.
+fn freshness_rank(code: Option<&'static str>) -> u8 {
+    match code {
+        Some("behind-checkout") => 3,
+        Some("not-in-checkout") => 2,
+        Some("no-build-identity") => 1,
+        _ => 0,
+    }
+}
+
+/// Check 18 (decision 57). Warns when an installed binary is not the `HEAD`
+/// of the checkout it was built in; never fails, because a stale binary still
+/// runs and the fix is a rebuild, not a broken machine.
+fn judge_build_freshness(rows: &[(&str, Freshness)]) -> Check {
+    const NAME: &str = "binaries match their checkouts";
+    let mut lines = Vec::new();
+    let mut code: Option<&'static str> = None;
+    for (name, f) in rows {
+        let (line, c) = freshness_line(name, f);
+        lines.push(line);
+        if freshness_rank(c) > freshness_rank(code) {
+            code = c;
+        }
+    }
+    let detail = lines.join("; ");
+    match code {
+        None => check(18, NAME, Status::Pass, detail),
+        Some(c) => with_fix(
+            with_code(check(18, NAME, Status::Warn, detail), c),
+            "rebuild the binary from its checkout and install it again; an MCP client keeps running the \
+             binary it spawned until it reconnects (`/mcp` in Claude Code)",
+        ),
+    }
+}
+
+/// Where `commit` stands in the git checkout at `dir`.
+fn standing_in(dir: &Path, commit: &str) -> Standing {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .arg("--no-optional-locks")
+            .args(args)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+    };
+    let Some(head) = git(&["rev-parse", "HEAD"]) else {
+        return Standing::NoCheckout;
+    };
+    if head == commit {
+        return Standing::Current;
+    }
+    if git(&["merge-base", "--is-ancestor", commit, "HEAD"]).is_some() {
+        let by = git(&["rev-list", "--count", &format!("{commit}..HEAD")])
+            .and_then(|n| n.parse().ok())
+            .unwrap_or(0);
+        return Standing::Behind { by, head };
+    }
+    Standing::NotInCheckout { head }
+}
+
+/// Read `commit`, `dirty` and `source_dir` out of what
+/// `embarch-api --json versions` printed (`embarch-api` decision 93). Split
+/// from the spawn so every shape is testable with no binary on disk, as
+/// check 11's reader is.
+fn api_build_from_output(ok: bool, stdout: &str) -> Result<BuildIdentity, String> {
+    if !ok {
+        return Err("`embarch-api --json versions` did not answer, see check 11".to_string());
+    }
+    let v = serde_json::from_str::<serde_json::Value>(stdout.trim())
+        .map_err(|e| format!("`embarch-api --json versions` printed no JSON object: {}", one_line(&e.to_string())))?;
+    let Some(commit) = v.get("commit").and_then(|c| c.as_str()) else {
+        return Err("it predates embarch-api decision 93".to_string());
+    };
+    if commit == "unknown" {
+        return Err("built outside a git checkout".to_string());
+    }
+    Ok(BuildIdentity {
+        commit: commit.to_string(),
+        dirty: v.get("dirty").and_then(|d| d.as_bool()).unwrap_or(false),
+        source_dir: PathBuf::from(v.get("source_dir").and_then(|s| s.as_str()).unwrap_or_default()),
+    })
+}
+
+fn freshness_of(identity: Result<BuildIdentity, String>) -> Freshness {
+    match identity {
+        Err(why) => Freshness::NoIdentity(why),
+        Ok(id) => {
+            let standing = standing_in(&id.source_dir, &id.commit);
+            Freshness::Known(id, standing)
+        }
+    }
+}
+
+/// This binary's own stamp, from `build.rs`.
+fn this_binary_build() -> Result<BuildIdentity, String> {
+    let commit = env!("EMBARCH_BUILD_COMMIT");
+    if commit == "unknown" {
+        return Err("built outside a git checkout".to_string());
+    }
+    Ok(BuildIdentity {
+        commit: commit.to_string(),
+        dirty: env!("EMBARCH_BUILD_DIRTY") == "1",
+        source_dir: PathBuf::from(env!("EMBARCH_BUILD_SOURCE")),
+    })
+}
+
+/// Check 18 over the located `embarch-api` and this binary. `embarch-core`
+/// is not compared: its `--version` names the commit for a person, nothing
+/// machine-readable carries it, and on `wsl-host` it is built from a copy
+/// that is not a checkout (decision 57).
+fn check_build_freshness(api: Option<&Located>) -> Check {
+    let api_row = match api {
+        None => Freshness::NotLocated,
+        Some(a) => freshness_of(match Command::new(&a.path).args(["--json", "versions"]).output() {
+            Ok(o) => api_build_from_output(o.status.success(), &String::from_utf8_lossy(&o.stdout)),
+            Err(e) => Err(format!("couldn't run `{} --json versions`: {}", a.path.display(), one_line(&e.to_string()))),
+        }),
+    };
+    judge_build_freshness(&[("embarch-api", api_row), ("embarch", freshness_of(this_binary_build()))])
 }
 
 // ---- check 14: the flashing backend each chip family resolves to ------------
@@ -6187,7 +6390,127 @@ mod tests {
             }
         }
 
+        // ---- check 18 -------------------------------------------------------
+        for row in freshness_fixtures() {
+            out.push(judge_build_freshness(&[("embarch-api", row), ("embarch", Freshness::NotLocated)]));
+        }
+
         out
+    }
+
+    fn an_identity(dirty: bool) -> BuildIdentity {
+        BuildIdentity {
+            commit: "744b94be2b96780f3e6539ba5ccc7e4cca34b960".to_string(),
+            dirty,
+            source_dir: PathBuf::from("/home/u/embarch-api"),
+        }
+    }
+
+    /// Every arm of check 18's row, for the pure-verdict corpus.
+    fn freshness_fixtures() -> Vec<Freshness> {
+        let head = "9d27e12a0000000000000000000000000000000a".to_string();
+        let mut rows = vec![Freshness::NotLocated, Freshness::NoIdentity("it predates embarch-api decision 93".into())];
+        for dirty in [false, true] {
+            rows.push(Freshness::Known(an_identity(dirty), Standing::Current));
+            rows.push(Freshness::Known(an_identity(dirty), Standing::Behind { by: 1, head: head.clone() }));
+            rows.push(Freshness::Known(an_identity(dirty), Standing::Behind { by: 12, head: head.clone() }));
+            rows.push(Freshness::Known(an_identity(dirty), Standing::NotInCheckout { head: head.clone() }));
+            rows.push(Freshness::Known(an_identity(dirty), Standing::NoCheckout));
+        }
+        rows
+    }
+
+    #[test]
+    fn check_18_passes_a_binary_that_is_its_checkouts_head() {
+        let c = judge_build_freshness(&[
+            ("embarch-api", Freshness::Known(an_identity(false), Standing::Current)),
+            ("embarch", Freshness::Known(an_identity(true), Standing::NoCheckout)),
+        ]);
+        assert_eq!(c.status, Status::Pass);
+        assert_eq!(c.code, None);
+        assert!(c.detail.contains("embarch-api is its checkout's HEAD (744b94be,"), "{}", c.detail);
+        assert!(c.detail.contains("not a git checkout on this machine"), "{}", c.detail);
+    }
+
+    #[test]
+    fn check_18_warns_behind_with_the_count_and_the_reconnect() {
+        let head = "9d27e12a0000000000000000000000000000000a".to_string();
+        let c = judge_build_freshness(&[
+            ("embarch-api", Freshness::Known(an_identity(false), Standing::Behind { by: 3, head })),
+            ("embarch", Freshness::NoIdentity("built outside a git checkout".into())),
+        ]);
+        assert_eq!(c.status, Status::Warn);
+        // Behind outranks a missing identity in the same run.
+        assert_eq!(c.code, Some("behind-checkout"));
+        assert!(c.detail.contains("3 commits behind its checkout (built 744b94be, HEAD 9d27e12a"), "{}", c.detail);
+        assert!(c.fix.as_deref().unwrap().contains("until it reconnects"));
+    }
+
+    #[test]
+    fn check_18_names_a_commit_its_checkout_does_not_contain() {
+        let c = judge_build_freshness(&[(
+            "embarch-api",
+            Freshness::Known(an_identity(true), Standing::NotInCheckout { head: "abcdef0123".into() }),
+        )]);
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.code, Some("not-in-checkout"));
+        assert!(c.detail.contains("built with uncommitted changes"), "{}", c.detail);
+    }
+
+    #[test]
+    fn api_build_reader_takes_each_shape_versions_can_print() {
+        let current = r#"{"success":true,"api_version":"0.1.0","commit":"744b94be2b96","dirty":true,"source_dir":"/x"}"#;
+        let id = api_build_from_output(true, current).unwrap();
+        assert_eq!((id.commit.as_str(), id.dirty, id.source_dir), ("744b94be2b96", true, PathBuf::from("/x")));
+
+        let old = r#"{"success":true,"api_version":"0.1.0","host_type_schema_version":20}"#;
+        assert_eq!(api_build_from_output(true, old).err().unwrap(), "it predates embarch-api decision 93");
+        let unknown = r#"{"commit":"unknown","dirty":false,"source_dir":"/x"}"#;
+        assert_eq!(api_build_from_output(true, unknown).err().unwrap(), "built outside a git checkout");
+        assert!(api_build_from_output(true, "not json").is_err());
+        assert!(api_build_from_output(false, current).is_err());
+    }
+
+    /// `standing_in` against a real throwaway repository: current, behind by
+    /// two, a commit the history does not hold, and a directory with no git.
+    #[test]
+    fn standing_in_reads_a_real_checkout() {
+        let dir = std::env::temp_dir().join(format!("embarch-doctor-standing-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let o = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap();
+            assert!(o.status.success(), "git {args:?}: {}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        let commit = |msg: &str| {
+            git(&["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--allow-empty", "-m", msg]);
+            git(&["rev-parse", "HEAD"])
+        };
+        let first = commit("one");
+        assert!(matches!(standing_in(&dir, &first), Standing::Current));
+        commit("two");
+        let third = commit("three");
+        match standing_in(&dir, &first) {
+            Standing::Behind { by, head } => assert_eq!((by, head), (2, third)),
+            _ => panic!("expected Behind"),
+        }
+        assert!(matches!(
+            standing_in(&dir, "0123456789abcdef0123456789abcdef01234567"),
+            Standing::NotInCheckout { .. }
+        ));
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let plain = std::env::temp_dir().join(format!("embarch-doctor-nogit-{}", std::process::id()));
+        std::fs::create_dir_all(&plain).unwrap();
+        // A temp directory can sit inside a repository on a dev machine; only
+        // assert the no-checkout arm where git agrees there is none.
+        let inside = Command::new("git").arg("-C").arg(&plain).args(["rev-parse", "HEAD"]).output().unwrap();
+        if !inside.status.success() {
+            assert!(matches!(standing_in(&plain, &first), Standing::NoCheckout));
+        }
+        std::fs::remove_dir_all(&plain).unwrap();
     }
 
     /// **No rendered verdict contains a run of two or more spaces**, in
@@ -6206,7 +6529,7 @@ mod tests {
         let mut covered: Vec<u8> = verdicts.iter().map(|c| c.n).collect();
         covered.sort_unstable();
         covered.dedup();
-        assert_eq!(covered, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17]);
+        assert_eq!(covered, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18]);
 
         let mut offenders: Vec<String> = Vec::new();
         let mut verbatim: Vec<u8> = Vec::new();

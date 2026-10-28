@@ -51,15 +51,18 @@ pub fn normalize_tag(tag: &str) -> &str {
     tag.strip_prefix('v').unwrap_or(tag)
 }
 
-/// Pull the version number off the end of a clap `--version` line
-/// (`"embarch-core 0.1.0"` -> `"0.1.0"`) — the binary name varies, but the
-/// version is always the last whitespace-separated field.
+/// Pull the version number out of a `--version` line — the field after the
+/// binary name: `"embarch-core 0.1.0"` and
+/// `"embarch-core 0.1.0 (commit 72bbd52f, dirty)"` both give `"0.1.0"`.
+///
+/// It read the **last** field until decision 57 put the commit after the
+/// version; the first field after the name is the one both shapes share. A
+/// line with only one field is taken as the version itself, as the old
+/// reading also did.
 pub fn version_from_output(output: &str) -> Option<&str> {
-    let trimmed = output.trim();
-    if trimmed.is_empty() {
-        return None;
-    }
-    trimmed.rsplit(' ').next()
+    let mut fields = output.split_whitespace();
+    let first = fields.next()?;
+    Some(fields.next().unwrap_or(first))
 }
 
 /// Does an actual `--version` output agree with what the manifest recorded
@@ -81,9 +84,17 @@ mod tests {
     }
 
     #[test]
-    fn version_from_output_takes_the_last_field() {
+    fn version_from_output_takes_the_field_after_the_name() {
         assert_eq!(version_from_output("embarch-core 0.1.0"), Some("0.1.0"));
         assert_eq!(version_from_output("embarch-api 0.1.0\n"), Some("0.1.0"));
+    }
+
+    #[test]
+    fn version_from_output_reads_past_the_commit_decision_57_added() {
+        assert_eq!(version_from_output("embarch-core 0.1.4 (commit 72bbd52f)"), Some("0.1.4"));
+        assert_eq!(version_from_output("embarch-api 0.1.0 (commit 744b94be, dirty)\n"), Some("0.1.0"));
+        assert_eq!(version_from_output("embarch-core 0.1.4 (commit unknown)"), Some("0.1.4"));
+        assert!(agrees("v0.1.4", "embarch-core 0.1.4 (commit 72bbd52f, dirty)"));
     }
 
     #[test]

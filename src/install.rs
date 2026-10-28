@@ -83,13 +83,44 @@ pub fn install_binaries(source_dir: &Path, dest_dir: &Path) -> Result<Vec<PathBu
             written.push(dst);
             continue;
         }
-        // std::fs::copy preserves the source's permission bits (including
-        // the executable bit on Unix), so nothing further is needed there.
-        std::fs::copy(&src, &dst)
-            .with_context(|| format!("could not copy {} to {}", src.display(), dst.display()))?;
+        replace_binary(&src, &dst, &name)?;
         written.push(dst);
     }
     Ok(written)
+}
+
+/// Put `src` at `dst` by writing a temporary file beside `dst` and renaming
+/// it over the old one (decision 57).
+///
+/// A plain `std::fs::copy` opens the destination for writing, which Linux
+/// refuses with `ETXTBSY` ("Text file busy") while that file is executing —
+/// and an installed `embarch-api` is executing whenever an MCP client has it
+/// open. A rename replaces the directory entry instead: the running process
+/// keeps the file it started from, and the next spawn gets the new one.
+///
+/// **Windows is unchanged:** a running `.exe` cannot be replaced, so the
+/// rename fails with access denied, and the error says so and names the file.
+/// The temporary file is removed on any failure.
+fn replace_binary(src: &Path, dst: &Path, name: &str) -> Result<()> {
+    let dir = dst.parent().unwrap_or_else(|| Path::new("."));
+    let tmp = dir.join(format!(".{name}.new-{}", std::process::id()));
+    // std::fs::copy preserves the source's permission bits (including the
+    // executable bit on Unix), so the rename carries them across.
+    if let Err(e) = std::fs::copy(src, &tmp) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| format!("could not copy {} to {}", src.display(), tmp.display()));
+    }
+    if let Err(e) = std::fs::rename(&tmp, dst) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e).with_context(|| {
+            format!(
+                "could not replace {} (on Windows a running binary cannot be replaced: stop the service \
+                 or MCP client that runs it first)",
+                dst.display()
+            )
+        });
+    }
+    Ok(())
 }
 
 fn paths_refer_to_the_same_file(a: &Path, b: &Path) -> bool {
@@ -632,6 +663,46 @@ mod tests {
         assert!(dst.join(locate::native_name("embarch")).is_file());
         assert!(dst.join(locate::native_name("embarch-core")).is_file());
         assert!(!dst.join(locate::native_name("embarch-api")).exists());
+
+        std::fs::remove_dir_all(&src).unwrap();
+        std::fs::remove_dir_all(&dst).unwrap();
+    }
+
+    /// Decision 57: an installed binary that is running is replaced, not
+    /// refused. `std::fs::copy` over a running file fails with `ETXTBSY` on
+    /// Linux, which is what an install with an MCP client open used to hit.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn install_binaries_replaces_a_binary_that_is_running() {
+        let Some(sleep) = ["/bin/sleep", "/usr/bin/sleep"].into_iter().map(Path::new).find(|p| p.is_file()) else {
+            return;
+        };
+        let src = tmp_dir("src-running");
+        let dst = tmp_dir("dst-running");
+        let installed = dst.join(locate::native_name("embarch-api"));
+        std::fs::copy(sleep, &installed).unwrap();
+        let mut running = std::process::Command::new(&installed).arg("30").spawn().unwrap();
+
+        // The precondition the old code failed on: writing the running file.
+        let busy = std::fs::OpenOptions::new().write(true).open(&installed);
+        let refused_in_place = busy.is_err();
+
+        std::fs::write(src.join(locate::native_name("embarch-api")), b"new build").unwrap();
+        let result = install_binaries(&src, &dst);
+
+        running.kill().unwrap();
+        running.wait().unwrap();
+
+        assert!(refused_in_place, "the running copy was writable in place, so this test proves nothing");
+        let written = result.expect("install over a running binary failed");
+        assert_eq!(written, vec![installed.clone()]);
+        assert_eq!(std::fs::read(&installed).unwrap(), b"new build");
+        let leftovers: Vec<_> = std::fs::read_dir(&dst)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().contains(".new-"))
+            .collect();
+        assert!(leftovers.is_empty(), "a temporary file was left behind");
 
         std::fs::remove_dir_all(&src).unwrap();
         std::fs::remove_dir_all(&dst).unwrap();
