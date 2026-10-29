@@ -681,7 +681,21 @@ mod tests {
         let dst = tmp_dir("dst-running");
         let installed = dst.join(locate::native_name("embarch-api"));
         std::fs::copy(sleep, &installed).unwrap();
-        let mut running = std::process::Command::new(&installed).arg("30").spawn().unwrap();
+        // A sibling test's fork can briefly hold the write fd of the copy we
+        // just made, so exec fails with ETXTBSY (seen 1 in 80 parallel runs):
+        // retry until that fork has exec'd.
+        let mut running = {
+            let mut tries = 0;
+            loop {
+                match std::process::Command::new(&installed).arg("30").spawn() {
+                    Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 200 => {
+                        tries += 1;
+                        std::thread::sleep(std::time::Duration::from_millis(10));
+                    }
+                    other => break other.unwrap(),
+                }
+            }
+        };
 
         // The precondition the old code failed on: writing the running file.
         let busy = std::fs::OpenOptions::new().write(true).open(&installed);
