@@ -3011,7 +3011,19 @@ struct BindEvidence<'a> {
     /// the Windows side of a `wsl-host` machine it infers `local`, installs
     /// the narrow bind again and overwrites the recorded class.
     setup_would_infer: TopologyClass,
+    /// Whether the registered service is stopped (`Some(true)`), running
+    /// (`Some(false)`), or unreadable (`None`: `sc.exe query` is a WSL2-guest
+    /// probe and answers nothing from a native Windows run). Read only on
+    /// the `bound-narrow` arm, whose detail must not claim a running service
+    /// it never saw.
+    service_stopped: Option<bool>,
 }
+
+/// What every fix line below names: `core/124`'s decision 106 made `install`
+/// rewrite a registered service in place, where an older Core dies on
+/// `CreateService FAILED 1073` and needs `uninstall` first.
+const REINSTALL_NOTE: &str = "Core 106 or newer rewrites the registered service in place; an older \
+     Core refuses with 1073, so `embarch-core uninstall` first";
 
 /// Is this bind address one that only the same machine can reach?
 ///
@@ -3059,6 +3071,11 @@ fn is_loopback_bind(addr: &str) -> bool {
 /// Passes `bind-matches-registered` when it is wide, and Warns
 /// `bind-unproven` when it cannot be read — a Warn that says it did not look
 /// at the route that matters rather than a Fail asserting what it never saw.
+///
+/// **`bind-too-narrow` cannot fire from a NAT-networked WSL2 guest** (decision
+/// 22, measured 2026-10-29): the guest's `127.0.0.1` is its own, so a running
+/// narrow Core reads as nothing answering and Fails `bound-narrow` instead.
+/// The arm is reachable from a mirrored-networking guest and has never met one.
 ///
 /// **What it refuses to restate.** With no winner and no registration to
 /// read, this is a Warn that points at check 3 rather than a second Fail for
@@ -3167,7 +3184,7 @@ fn judge_bind_address(e: &BindEvidence<'_>) -> Check {
                     // evidence destroyed.
                     format!(
                         "reinstall the service with the wide bind, in an elevated shell on the \
-                         machine running Core: `embarch-core install --bind {needed}`. Do not \
+                         machine running Core: `embarch-core install --bind {needed}` ({REINSTALL_NOTE}). Do not \
                          re-run `embarch setup` for this: Core answered, so `setup` installs \
                          nothing and overwrites the recorded class, which greens this check \
                          without widening the bind."
@@ -3211,7 +3228,7 @@ fn judge_bind_address(e: &BindEvidence<'_>) -> Check {
                          or `curl http://$(ip route show default | awk '{{print $3}}'):4884/status` \
                          there. If that cannot reach Core, reinstall the service with \
                          `embarch-core install --bind {needed}` in an elevated shell on the \
-                         machine running Core."
+                         machine running Core ({REINSTALL_NOTE})."
                     ),
                 ),
             };
@@ -3243,8 +3260,14 @@ fn judge_bind_address(e: &BindEvidence<'_>) -> Check {
                     format!(
                         "nothing answered on any candidate, and the Core service is registered \
                          `--bind {addr}` while this machine was set up as {recorded_str}, which \
-                         needs {needed}. The bind is why, not a stopped service — `setup` did not \
-                         widen it"
+                         needs {needed}. {} — `setup` did not widen it",
+                        match e.service_stopped {
+                            Some(true) => "The service is stopped and bound narrow: starting it \
+                                           alone would still be unreachable from there",
+                            Some(false) => "The bind is why, not a stopped service",
+                            None => "The bind is a reason; whether the service is also stopped \
+                                     was not read",
+                        }
                     ),
                 ),
                 "bound-narrow",
@@ -3263,12 +3286,12 @@ fn judge_bind_address(e: &BindEvidence<'_>) -> Check {
             match e.setup_would_infer {
                 TopologyClass::WslHost => format!(
                     "reinstall the service with the wide bind, in an elevated shell on the machine \
-                     running Core: `embarch-core install --bind {needed}` — or re-run `embarch \
-                     setup` from here, which infers wsl-host and passes it for you."
+                     running Core: `embarch-core install --bind {needed}` ({REINSTALL_NOTE}) — or \
+                     re-run `embarch setup` from here, which infers wsl-host and passes it for you."
                 ),
                 TopologyClass::Local => format!(
                     "reinstall the service with the wide bind, in an elevated shell on the machine \
-                     running Core: `embarch-core install --bind {needed}`. Do not re-run `embarch \
+                     running Core: `embarch-core install --bind {needed}` ({REINSTALL_NOTE}). Do not re-run `embarch \
                      setup` from here: run on this side it infers local, which needs {}, so it \
                      installs the narrow bind again and then rewrites the recorded class — after \
                      which this check passes `bind-matches` with the bind untouched. Run it from \
@@ -3277,7 +3300,7 @@ fn judge_bind_address(e: &BindEvidence<'_>) -> Check {
                 ),
                 TopologyClass::Remote => format!(
                     "reinstall the service with the wide bind, in an elevated shell on the machine \
-                     running Core: `embarch-core install --bind {needed}`. Do not re-run `embarch \
+                     running Core: `embarch-core install --bind {needed}` ({REINSTALL_NOTE}). Do not re-run `embarch \
                      setup` from here: run on this side it infers remote, and a remote setup \
                      installs nothing at all — it records where Core lives and leaves the bind \
                      exactly as narrow as it is. Run it from the WSL2 guest, or reinstall."
@@ -3480,6 +3503,8 @@ pub async fn doctor(json: bool) -> i32 {
         // here made the fix line name `remote` for a command that would
         // infer `wsl-host` (decision 22(a)).
         setup_would_infer: setup::infer_class(None, core.as_ref()),
+        service_stopped: locate::windows_core_service_state()
+            .map(|st| st == locate::WindowsServiceState::Installed),
     });
 
     // Decision 57: is the installed embarch-api (and this binary) the HEAD of
@@ -5715,6 +5740,7 @@ mod tests {
             reached,
             registered,
             setup_would_infer: TopologyClass::WslHost,
+            service_stopped: Some(false),
         }
     }
 
@@ -5737,6 +5763,51 @@ mod tests {
         assert!(c.detail.contains("wsl-host"), "{}", c.detail);
         assert!(c.detail.contains("0.0.0.0"), "{}", c.detail);
         assert!(c.fix.as_deref().unwrap().contains("--bind 0.0.0.0"));
+    }
+
+    /// Every arm's fix line names a command that works on a registered
+    /// service: Core 106's in-place rewrite, with the older-Core fallback.
+    #[test]
+    fn check_17s_fix_lines_say_what_install_does_over_a_registered_service() {
+        for reached in [None, Some((TopologyClass::Local, "http://127.0.0.1:4884"))] {
+            let c = judge_bind_address(&bind_evidence(
+                Some(TopologyClass::WslHost),
+                reached,
+                Some("127.0.0.1"),
+            ));
+            let fix = c.fix.as_deref().unwrap();
+            assert!(fix.contains("--bind 0.0.0.0"), "{fix}");
+            assert!(fix.contains("rewrites the registered service in place"), "{fix}");
+            assert!(fix.contains("1073"), "{fix}");
+        }
+        let c = judge_bind_address(&bind_evidence(
+            Some(TopologyClass::WslHost),
+            Some((TopologyClass::Local, "http://127.0.0.1:4884")),
+            None,
+        ));
+        assert!(c.fix.as_deref().unwrap().contains("rewrites the registered service in place"));
+    }
+
+    /// `bound-narrow` must not say "not a stopped service" of a service it
+    /// saw stopped (measured 2026-10-29), nor of one it could not read.
+    #[test]
+    fn check_17s_bound_narrow_says_stopped_when_the_registration_reads_stopped() {
+        let mk = |service_stopped| {
+            judge_bind_address(&BindEvidence {
+                recorded: Some(TopologyClass::WslHost),
+                reached: None,
+                registered: Some("127.0.0.1"),
+                setup_would_infer: TopologyClass::WslHost,
+                service_stopped,
+            })
+        };
+        let stopped = mk(Some(true));
+        assert_eq!(stopped.code, Some("bound-narrow"));
+        assert!(stopped.detail.contains("stopped and bound narrow"), "{}", stopped.detail);
+        assert!(!stopped.detail.contains("not a stopped service"), "{}", stopped.detail);
+        assert!(mk(Some(false)).detail.contains("not a stopped service"));
+        let unknown = mk(None);
+        assert!(!unknown.detail.contains("not a stopped service"), "{}", unknown.detail);
     }
 
     /// **The defect this arm shipped with.** Its fix offered `embarch setup`
@@ -5898,6 +5969,7 @@ mod tests {
             reached: None,
             registered: Some("127.0.0.1"),
             setup_would_infer: TopologyClass::Local,
+            service_stopped: Some(false),
         });
         assert_eq!(c.status, Status::Fail);
         assert_eq!(c.code, Some("bound-narrow"));
@@ -5925,6 +5997,7 @@ mod tests {
             reached: None,
             registered: Some("127.0.0.1"),
             setup_would_infer: TopologyClass::Remote,
+            service_stopped: Some(false),
         });
         assert_eq!(c.status, Status::Fail);
         assert_eq!(c.code, Some("bound-narrow"));
@@ -6384,6 +6457,7 @@ mod tests {
                             reached,
                             registered: registered_bind,
                             setup_would_infer,
+                            service_stopped: None,
                         }));
                     }
                 }
