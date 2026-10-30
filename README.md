@@ -67,6 +67,15 @@ cargo clippy --all-targets -- -D warnings
 cargo test
 ```
 
+## Claude Code plugins
+
+This repo is also the suite's `embarch` plugin marketplace ([`.claude-plugin/marketplace.json`](.claude-plugin/marketplace.json)): `embarch-desk`, `embarch-promptu` and `embarch-chat`, each from the `plugin/` folder of its own repo.
+
+```sh
+claude plugin marketplace add gabrieltetar/embarch-umbrella
+claude plugin install embarch-desk@embarch
+```
+
 ## Design doc
 
 The full design record — current truth, open questions, and architecture decisions — lives in [embarch-doc/embarch-umbrella/spec.md](https://github.com/gabrieltetar/embarch-doc/blob/main/embarch-umbrella/spec.md) and its linked `decisions/` and `open.md` files, treated as the durable source of truth ahead of any chat history that produced it. The guide it has to satisfy is [the user guide](https://github.com/gabrieltetar/embarch-doc/blob/main/suite/user-guide.md).

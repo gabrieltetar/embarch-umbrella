@@ -1,0 +1,24 @@
+{
+  "name": "embarch",
+  "description": "EmbArch's Claude Code plugins",
+  "owner": {
+    "name": "Gabriel Tetar"
+  },
+  "plugins": [
+    {
+      "name": "embarch-desk",
+      "source": { "source": "github", "repo": "gabrieltetar/embarch-desk", "path": "plugin" },
+      "description": "Session time, commits and milestones onto EmbArch Desk work items."
+    },
+    {
+      "name": "embarch-promptu",
+      "source": { "source": "github", "repo": "gabrieltetar/embarch-promptu", "path": "plugin" },
+      "description": "Promptu: every write into Claude Code's auto memory is checked — a kind on each memory, a review date on status, a source on references, index lines of 150 characters under a domain header — warn mode first. Needs the promptu binary on PATH."
+    },
+    {
+      "name": "embarch-chat",
+      "source": { "source": "github", "repo": "gabrieltetar/embarch-chat", "path": "plugin" },
+      "description": "Generic EmbArch commands and skills: repo setup, and the build, flash and verify loop."
+    }
+  ]
+}

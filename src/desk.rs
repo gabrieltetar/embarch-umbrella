@@ -94,8 +94,8 @@ pub fn install(desk: Option<&Located>, claude: Option<&Path>, linux: bool, dry_r
             r,
             c,
             &["plugin", "install", PLUGIN],
-            "; if the `embarch` marketplace is unknown, from an embarch-desk checkout run \
-             `claude plugin marketplace add \"$PWD\"` and re-run setup",
+            "; if the `embarch` marketplace is unknown, run \
+             `claude plugin marketplace add gabrieltetar/embarch-umbrella` and re-run setup",
         ),
     };
     vec![Step { name: SERVICE, outcome: service }, Step { name: PLUGIN_STEP, outcome: plugin }]
@@ -220,7 +220,7 @@ mod tests {
         let mut m = Mock::new();
         m.fail = vec!["plugin install"];
         let steps = install(Some(&desk()), Some(Path::new(CLAUDE)), true, false, &m);
-        assert!(matches!(&steps[1].outcome, Outcome::Failed(w) if w.contains("marketplace add")));
+        assert!(matches!(&steps[1].outcome, Outcome::Failed(w) if w.contains("marketplace add gabrieltetar/embarch-umbrella")));
     }
 
     #[test]
