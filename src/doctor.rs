@@ -1936,7 +1936,14 @@ struct HelloAck {
     /// Core's compiled wire constant is not served anywhere, and a second
     /// comparison here would be a mirror that drifts.
     compatible: Option<bool>,
-    firmware_version: Option<String>,
+    /// The bench's own build — its wire `HelloAck.firmware_version` — which
+    /// Core serves on this route as `dev_bench_version` since `embarch-core`
+    /// decision 108. **Read under that key only.** A Core older than the
+    /// rename serves it as `firmware_version`, and that key is not read as a
+    /// fallback: on a `Study` the same name is the DUT's, which is the
+    /// collision the rename ended, and `None` here becomes check 13's own
+    /// warn naming the cause rather than a comparison against a guess.
+    dev_bench_version: Option<String>,
     raw: String,
 }
 
@@ -1986,27 +1993,31 @@ async fn fetch_dev_bench_hello(
     };
 
     match authed_get(base_url, "/dev-bench/hello", &token, LINK_HANDSHAKE_GET_TIMEOUT).await {
-        Ok((200, body)) => {
-            let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
-            HelloOutcome::Answered(HelloAck {
-                schema_version: parsed
-                    .as_ref()
-                    .and_then(|v| v.get("schema_version"))
-                    .and_then(|v| v.as_u64())
-                    .and_then(|n| u32::try_from(n).ok()),
-                compatible: parsed.as_ref().and_then(|v| v.get("compatible")).and_then(|v| v.as_bool()),
-                firmware_version: parsed
-                    .as_ref()
-                    .and_then(|v| v.get("firmware_version"))
-                    .and_then(|v| v.as_str())
-                    .map(str::to_string),
-                raw: body,
-            })
-        }
+        Ok((200, body)) => HelloOutcome::Answered(parse_hello_ack(body)),
         Ok((404, _)) => HelloOutcome::NoBench,
         Ok((status @ (409 | 503), body)) => HelloOutcome::Busy { status, body },
         Ok((status, body)) => HelloOutcome::Unavailable(format!("HTTP {status}: {}", one_line(&body))),
         Err(e) => HelloOutcome::Unavailable(e),
+    }
+}
+
+/// `/dev-bench/hello`'s `200` body, read field by field so a missing or
+/// malformed one is `None` rather than a failed parse of the whole answer.
+fn parse_hello_ack(body: String) -> HelloAck {
+    let parsed = serde_json::from_str::<serde_json::Value>(&body).ok();
+    HelloAck {
+        schema_version: parsed
+            .as_ref()
+            .and_then(|v| v.get("schema_version"))
+            .and_then(|v| v.as_u64())
+            .and_then(|n| u32::try_from(n).ok()),
+        compatible: parsed.as_ref().and_then(|v| v.get("compatible")).and_then(|v| v.as_bool()),
+        dev_bench_version: parsed
+            .as_ref()
+            .and_then(|v| v.get("dev_bench_version"))
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        raw: body,
     }
 }
 
@@ -2505,7 +2516,7 @@ fn check_firmware_version(hello: &HelloOutcome, saved: &state::State) -> Check {
         }
     };
 
-    match &ack.firmware_version {
+    match &ack.dev_bench_version {
         Some(remote) if *remote == local_version => with_code(
             check(N, NAME, Status::Pass, format!("firmware_version '{remote}' matches {}", repo_path.display())),
             "match",
@@ -2580,11 +2591,24 @@ fn check_firmware_version(hello: &HelloOutcome, saved: &state::State) -> Check {
             ),
             "unresolvable",
         ),
-        None => check(
-            N,
-            NAME,
-            Status::Warn,
-            format!("unexpected /dev-bench/hello response: {}", one_line(&ack.raw)),
+        // Not a pass and not a mismatch: nothing was compared. The common
+        // cause is a Core older than `embarch-core` decision 108, which serves
+        // the bench's build as `firmware_version` — named in the message, and
+        // deliberately not read as a fallback (see `HelloAck`).
+        None => with_fix(
+            check(
+                N,
+                NAME,
+                Status::Warn,
+                format!(
+                    "skipped — /dev-bench/hello carried no dev_bench_version to compare, so nothing was \
+                     compared; a Core older than embarch-core decision 108 serves the bench's build as \
+                     firmware_version instead: {}",
+                    one_line(&ack.raw)
+                ),
+            ),
+            "run a Core built at or after embarch-core decision 108 (`embarch deploy-core` for the Windows service); \
+             check 15 says whether the running Core is the located build",
         ),
     }
 }
@@ -4428,7 +4452,7 @@ mod tests {
         let ack = HelloAck {
             schema_version: Some(15),
             compatible: Some(true),
-            firmware_version: Some("abc12345".to_string()),
+            dev_bench_version: Some("abc12345".to_string()),
             raw: "{}".to_string(),
         };
         let c = check_firmware_version(&HelloOutcome::Answered(ack), &state::State::default());
@@ -4449,7 +4473,7 @@ mod tests {
             &HelloOutcome::Answered(HelloAck {
                 schema_version: Some(15),
                 compatible: Some(true),
-                firmware_version: Some(head.clone()),
+                dev_bench_version: Some(head.clone()),
                 raw: "{}".to_string(),
             }),
             &saved,
@@ -4466,7 +4490,7 @@ mod tests {
             &HelloOutcome::Answered(HelloAck {
                 schema_version: Some(15),
                 compatible: Some(true),
-                firmware_version: Some(first_commit),
+                dev_bench_version: Some(first_commit),
                 raw: "{}".to_string(),
             }),
             &saved,
@@ -4481,7 +4505,7 @@ mod tests {
             &HelloOutcome::Answered(HelloAck {
                 schema_version: Some(15),
                 compatible: Some(true),
-                firmware_version: Some("49958d34".to_string()),
+                dev_bench_version: Some("49958d34".to_string()),
                 raw: "{}".to_string(),
             }),
             &saved,
@@ -4489,6 +4513,45 @@ mod tests {
         assert_eq!(unresolvable.status, Status::Fail);
         assert_eq!(unresolvable.code, Some("unresolvable"));
         assert!(unresolvable.detail.contains("not a commit"));
+    }
+
+    /// `embarch-core` decision 108 serves the bench's build as
+    /// `dev_bench_version`. That key is the one read; the old
+    /// `firmware_version` is never taken in its place, because on a `Study`
+    /// that name is the DUT's.
+    #[test]
+    fn check_13_reads_dev_bench_version_and_never_falls_back_to_firmware_version() {
+        let renamed = parse_hello_ack(
+            r#"{"schema_version":15,"compatible":true,"dev_bench_version":"g1a2b3c4"}"#.to_string(),
+        );
+        assert_eq!(renamed.dev_bench_version.as_deref(), Some("g1a2b3c4"));
+
+        let older_core = parse_hello_ack(
+            r#"{"schema_version":15,"compatible":true,"firmware_version":"g1a2b3c4"}"#.to_string(),
+        );
+        assert_eq!(older_core.schema_version, Some(15));
+        assert_eq!(older_core.compatible, Some(true));
+        assert_eq!(older_core.dev_bench_version, None);
+    }
+
+    /// A Core older than decision 108 leaves check 13 nothing to compare: a
+    /// warn that names the cause and the fix, never a pass and never a stale
+    /// verdict against a value it did not read.
+    #[test]
+    fn check_13_warns_naming_the_rename_when_core_sends_no_dev_bench_version() {
+        let dir = tempdir();
+        init_repo(dir.path());
+        let saved = state::State { dev_bench_repo_path: Some(dir.path().to_path_buf()), ..Default::default() };
+        let older_core = parse_hello_ack(
+            r#"{"schema_version":15,"compatible":true,"firmware_version":"g1a2b3c4"}"#.to_string(),
+        );
+
+        let c = check_firmware_version(&HelloOutcome::Answered(older_core), &saved);
+        assert_eq!(c.status, Status::Warn);
+        assert_eq!(c.code, None);
+        assert!(c.detail.contains("no dev_bench_version"), "{}", c.detail);
+        assert!(c.detail.contains("embarch-core decision 108"), "{}", c.detail);
+        assert!(c.fix.unwrap().contains("deploy-core"));
     }
 
     #[test]
@@ -4524,7 +4587,7 @@ mod tests {
             HelloOutcome::Answered(HelloAck {
                 schema_version: Some(15),
                 compatible: Some(true),
-                firmware_version: Some(v.to_string()),
+                dev_bench_version: Some(v.to_string()),
                 raw: "{}".to_string(),
             })
         };
@@ -6363,7 +6426,7 @@ mod tests {
             &HelloOutcome::Answered(HelloAck {
                 schema_version: Some(15),
                 compatible: Some(true),
-                firmware_version: Some("v7".to_string()),
+                dev_bench_version: Some("v7".to_string()),
                 raw: "{}".to_string(),
             }),
             &saved,
