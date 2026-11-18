@@ -16,8 +16,12 @@ on:
 env:
   BIN: embarch
 
+# The build jobs get no `id-token` and no write scope: they only compile and
+# upload workflow artifacts. The one `sign` job below holds both, so a release
+# is one approval of the `release` environment and signing never runs next to
+# the toolchain steps.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   # embarch-umbrella decisions 27/29: no release may build a binary whose
@@ -138,8 +142,51 @@ jobs:
             echo "asset=embarch-umbrella/dist/${name}.tar.gz" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Upload release asset
+      - name: Upload archive as a workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: archive-${{ matrix.target }}
+          path: ${{ steps.package.outputs.asset }}
+          if-no-files-found: error
+
+  # Signs and publishes every archive. No signing step lives in a reusable
+  # workflow: the certificate identity names the workflow that ran `cosign`,
+  # and it must be this file (`assemble-suite.yml` verifies exactly
+  # `.../embarch-umbrella/.github/workflows/release.yml@refs/tags/<tag>`).
+  sign:
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          pattern: archive-*
+          merge-multiple: true
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v3.0.4
+      - name: Sign every archive
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          assets=(dist/*.tar.gz dist/*.zip)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "::error::no archives were downloaded"
+            exit 1
+          fi
+          for asset in "${assets[@]}"; do
+            cosign sign-blob --yes --bundle "${asset}.sigstore.json" "$asset"
+          done
+      - name: Publish archives and bundles
         uses: softprops/action-gh-release@v2
         with:
-          files: ${{ steps.package.outputs.asset }}
+          files: |
+            dist/*.tar.gz
+            dist/*.zip
+            dist/*.sigstore.json
           fail_on_unmatched_files: true

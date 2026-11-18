@@ -79,8 +79,7 @@ impl TrustRootSource {
 pub struct ComponentInfo {
     pub name: String,
     pub tag: String,
-    /// The commit, when the manifest records one (EMB-190's manifest does;
-    /// the manifest `doctor` reads today names tags only).
+    /// The commit from the manifest's `commits` object, when it lists one.
     pub commit: Option<String>,
 }
 
@@ -151,20 +150,16 @@ impl fmt::Display for VerifyError {
 
 impl std::error::Error for VerifyError {}
 
-/// A component entry is a bare tag today and an object once the signed
-/// manifest records commits.
-#[derive(Deserialize)]
-#[serde(untagged)]
-enum ComponentEntry {
-    Tag(String),
-    Detail { tag: String, #[serde(default)] commit: Option<String> },
-}
-
 #[derive(Deserialize)]
 struct SignedManifest {
     suite_version: String,
+    /// Component name to release tag, the shape `manifest.rs` reads.
     #[serde(default)]
-    components: BTreeMap<String, ComponentEntry>,
+    components: BTreeMap<String, String>,
+    /// Component name to the full commit its tag points at. A sibling of
+    /// `components`, not a change to it, so `manifest.rs` reads the same file.
+    #[serde(default)]
+    commits: BTreeMap<String, String>,
     /// Relative path to SHA-256, lowercase hex.
     #[serde(default)]
     files: BTreeMap<String, String>,
@@ -234,9 +229,9 @@ pub fn verify_release_with_root(
         components: manifest
             .components
             .into_iter()
-            .map(|(name, entry)| match entry {
-                ComponentEntry::Tag(tag) => ComponentInfo { name, tag, commit: None },
-                ComponentEntry::Detail { tag, commit } => ComponentInfo { name, tag, commit },
+            .map(|(name, tag)| {
+                let commit = manifest.commits.get(&name).cloned();
+                ComponentInfo { name, tag, commit }
             })
             .collect(),
         identity: result.identity().map(|i| i.as_str().to_string()).unwrap_or(identity),
@@ -561,15 +556,28 @@ mod tests {
     }
 
     #[test]
-    fn components_accept_a_bare_tag_or_a_tag_with_commit() {
+    fn components_are_tags_and_commits_a_sibling_object() {
         let m: SignedManifest = serde_json::from_str(
-            r#"{"suite_version":"0.2.0","components":{
-                "embarch":"v0.2.0",
-                "embarch-core":{"tag":"v0.1.4","commit":"72bbd52f"}},
+            r#"{"suite_version":"0.2.0",
+               "components":{"embarch":"v0.2.0","embarch-core":"v0.1.4"},
+               "commits":{"embarch-core":"72bbd52f"},
                "files":{}}"#,
         )
         .unwrap();
-        assert!(matches!(m.components["embarch"], ComponentEntry::Tag(_)));
-        assert!(matches!(&m.components["embarch-core"], ComponentEntry::Detail { commit: Some(c), .. } if c == "72bbd52f"));
+        assert_eq!(m.components["embarch"], "v0.2.0");
+        assert_eq!(m.commits["embarch-core"], "72bbd52f");
+        assert!(!m.commits.contains_key("embarch"));
+    }
+
+    #[test]
+    fn the_manifest_doctor_reads_parses_the_signed_shape_too() {
+        let raw = r#"{"suite_version":"0.2.0","target":"x","components":{
+            "embarch":"v0.2.0","embarch-core":"v0.1.4","embarch-api":"v0.1.0"},
+            "commits":{"embarch":"a","embarch-core":"b","embarch-api":"c"},
+            "files":{"embarch":"00"}}"#;
+        let m: crate::manifest::Manifest = serde_json::from_str(raw).unwrap();
+        assert_eq!(m.components.embarch_api, "v0.1.0");
+        let s: SignedManifest = serde_json::from_str(raw).unwrap();
+        assert_eq!(s.files.len(), 1);
     }
 }

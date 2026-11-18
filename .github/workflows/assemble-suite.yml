@@ -1,35 +1,29 @@
 # Assembles the suite release archive: `embarch-<version>-<target>.{tar.gz,zip}`
 # carrying all three binaries from one already-tagged release of each
-# component (embarch-umbrella decision 14). This is what the
-# user guide links to — the per-repo releases (release.yml, here and in
-# embarch-core/embarch-api) exist for developers working on one component,
-# not for a new engineer's first download.
+# component (embarch-umbrella decision 14). This is what the user guide links
+# to; the per-repo releases (release.yml, here and in embarch-core/embarch-api)
+# exist for developers working on one component.
 #
-# Deliberately manual (workflow_dispatch) rather than chained automatically
-# off any one component's tag push: the three repos release independently,
-# and a suite release is a decision about which three versions form a
-# version-tested set together, not a mechanical consequence of any single
-# push. See embarch-umbrella decision 14.
+# The human act is committing `suite.toml` (the component tags) and pushing a
+# `suite-v<version>` tag. A suite release is a decision about which three
+# versions form a version-tested set, not a mechanical consequence of any one
+# component's push, so nothing chains this off a component tag.
+#
+# Every component archive is verified with cosign against its own repo's
+# `release.yml` identity before it is repackaged, the manifest lists the
+# SHA-256 of every file in the archive, and the manifest is signed here.
+# `embarch verify-release` checks that signature under the identity
+# `.../embarch-umbrella/.github/workflows/assemble-suite.yml@refs/tags/suite-v<version>`,
+# so the signing step must stay in this file and not move into a reusable
+# workflow.
 name: Assemble suite release
 
 on:
-  workflow_dispatch:
-    inputs:
-      suite_version:
-        description: "Suite version to publish, e.g. 0.1.0 (no leading v)"
-        required: true
-      core_tag:
-        description: "embarch-core release tag to pull in, e.g. v0.1.0"
-        required: true
-      api_tag:
-        description: "embarch-api release tag to pull in, e.g. v0.1.0"
-        required: true
-      umbrella_tag:
-        description: "embarch-umbrella release tag to pull in, e.g. v0.1.0"
-        required: true
+  push:
+    tags: ["suite-v*.*.*"]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
   assemble:
@@ -44,70 +38,176 @@ jobs:
           - aarch64-apple-darwin
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      TARGET: ${{ matrix.target }}
     steps:
-      - name: Download embarch-core
-        run: gh release download "${{ inputs.core_tag }}" -R gabrieltetar/embarch-core -p "embarch-core-${{ matrix.target }}.*" -D core
+      - uses: actions/checkout@v4
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v3.0.4
 
-      - name: Download embarch-api
-        run: gh release download "${{ inputs.api_tag }}" -R gabrieltetar/embarch-api -p "embarch-api-${{ matrix.target }}.*" -D api
+      - name: Read the component tags from suite.toml
+        run: |
+          set -euo pipefail
+          python3 - <<'PY' >> "$GITHUB_ENV"
+          import tomllib
+          t = tomllib.load(open("suite.toml", "rb"))
+          for key in ("core", "api", "umbrella"):
+              print(f"{key.upper()}_TAG={t[key]}")
+          PY
+          echo "SUITE_VERSION=${GITHUB_REF_NAME#suite-v}" >> "$GITHUB_ENV"
 
-      - name: Download embarch
-        run: gh release download "${{ inputs.umbrella_tag }}" -R gabrieltetar/embarch-umbrella -p "embarch-${{ matrix.target }}.*" -D umbrella
-
-      # Each per-repo archive contains one directory (its own package step's
-      # `name`) holding just that component's binary. Unpacked here without
-      # that wrapping directory, so all three binaries land flat, side by
-      # side, in the same directory init.rs's locate.rs sibling-lookup
-      # already expects them in.
-      - name: Assemble
+      # Each component: download the archive and its bundle, verify the pair
+      # under the exact identity of that repo's release.yml at that tag
+      # (never a regexp), and only then unpack. A failure fails the job.
+      - name: Download and verify the components
         shell: bash
         run: |
           set -euo pipefail
           shopt -s nullglob
-          name="embarch-${{ inputs.suite_version }}-${{ matrix.target }}"
+          # key repo asset-prefix tag
+          components=(
+            "core embarch-core embarch-core-${TARGET} ${CORE_TAG}"
+            "api embarch-api embarch-api-${TARGET} ${API_TAG}"
+            "umbrella embarch-umbrella embarch-${TARGET} ${UMBRELLA_TAG}"
+          )
+          for entry in "${components[@]}"; do
+            read -r key repo prefix tag <<< "$entry"
+            gh release download "$tag" -R "gabrieltetar/${repo}" -p "${prefix}.*" -D "$key"
+            candidates=("$key"/*.tar.gz "$key"/*.zip)
+            archive="${candidates[0]:-}"
+            if [ -z "$archive" ]; then
+              echo "::error::no release asset found for target ${TARGET} in ${repo} ${tag}"
+              exit 1
+            fi
+            if [ ! -f "${archive}.sigstore.json" ]; then
+              echo "::error::${repo} ${tag} has no ${archive##*/}.sigstore.json bundle; it was not signed"
+              exit 1
+            fi
+            cosign verify-blob "$archive" \
+              --bundle "${archive}.sigstore.json" \
+              --certificate-identity "https://github.com/gabrieltetar/${repo}/.github/workflows/release.yml@refs/tags/${tag}" \
+              --certificate-oidc-issuer https://token.actions.githubusercontent.com
+            echo "$key" "$repo" "$tag" "$(gh api "repos/gabrieltetar/${repo}/commits/${tag}" --jq .sha)" >> components.txt
+          done
+
+      # Each per-repo archive contains one directory (its own package step's
+      # `name`) holding just that component's binary. Unpacked without that
+      # wrapping directory, so all three land flat, side by side, where
+      # locate.rs's sibling-lookup expects them. `nullglob` and an array
+      # rather than `ls | head`: `ls` exits non-zero when only one of two
+      # globs matches, and pipefail makes that fatal (decision 14).
+      - name: Assemble the archive and its manifest
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          name="embarch-${SUITE_VERSION}-${TARGET}"
           mkdir -p "dist/${name}"
           for dir in core api umbrella; do
-            # Each target only ever has one of .tar.gz/.zip. `ls a.tar.gz
-            # b.zip` still exits non-zero when only one glob matches (it
-            # prints the hit but also complains about the miss on stderr),
-            # and pipefail turns that into a false failure even though the
-            # pipeline's real output was correct — caught for real running
-            # this workflow the first time (embarch-umbrella decision 14). nullglob
-            # plus a plain array sidesteps `ls`/`head` entirely.
             candidates=("$dir"/*.tar.gz "$dir"/*.zip)
-            archive="${candidates[0]:-}"
+            archive="${candidates[0]}"
             case "$archive" in
               *.zip) unzip -j -o "$archive" -d "dist/${name}" ;;
               *.tar.gz) tar xzf "$archive" -C "dist/${name}" --strip-components=1 ;;
-              *) echo "no release asset found for target ${{ matrix.target }} in $dir" >&2; exit 1 ;;
             esac
           done
 
-          cat > "dist/${name}/embarch-manifest.json" <<EOF
-          {
-            "suite_version": "${{ inputs.suite_version }}",
-            "target": "${{ matrix.target }}",
-            "components": {
-              "embarch": "${{ inputs.umbrella_tag }}",
-              "embarch-core": "${{ inputs.core_tag }}",
-              "embarch-api": "${{ inputs.api_tag }}"
-            }
+          # `components` stays a map of name to tag, the shape `manifest.rs`
+          # (doctor's check 1) reads; `commits` and `files` are siblings it
+          # ignores. `files` covers every file of the archive but the manifest.
+          python3 - "dist/${name}" <<'PY'
+          import hashlib, json, os, sys
+          root = sys.argv[1]
+          names = {"core": "embarch-core", "api": "embarch-api", "umbrella": "embarch"}
+          components, commits = {}, {}
+          for line in open("components.txt"):
+              key, repo, tag, sha = line.split()
+              components[names[key]] = tag
+              commits[names[key]] = sha
+          files = {}
+          for base, _, fnames in os.walk(root):
+              for f in fnames:
+                  path = os.path.join(base, f)
+                  rel = os.path.relpath(path, root).replace(os.sep, "/")
+                  with open(path, "rb") as fh:
+                      files[rel] = hashlib.sha256(fh.read()).hexdigest()
+          manifest = {
+              "suite_version": os.environ["SUITE_VERSION"],
+              "target": os.environ["TARGET"],
+              "components": components,
+              "commits": commits,
+              "files": dict(sorted(files.items())),
           }
-          EOF
+          with open(os.path.join(root, "embarch-manifest.json"), "w") as out:
+              json.dump(manifest, out, indent=2)
+              out.write("\n")
+          PY
 
+          mkdir -p "out/${TARGET}"
+          cp "dist/${name}/embarch-manifest.json" "out/${TARGET}/embarch-manifest.json"
           cd dist
-          if [[ "${{ matrix.target }}" == *windows* ]]; then
+          if [[ "$TARGET" == *windows* ]]; then
             7z a "${name}.zip" "${name}" >/dev/null
-            echo "ASSET=dist/${name}.zip" >> "$GITHUB_ENV"
+            cp "${name}.zip" "../out/${TARGET}/"
           else
             tar czf "${name}.tar.gz" "${name}"
-            echo "ASSET=dist/${name}.tar.gz" >> "$GITHUB_ENV"
+            cp "${name}.tar.gz" "../out/${TARGET}/"
           fi
 
+      - uses: actions/upload-artifact@v4
+        with:
+          name: suite-${{ matrix.target }}
+          path: out/${{ matrix.target }}
+          if-no-files-found: error
+
+  # One approval of the `release` environment for the whole release; the
+  # build matrix above holds no `id-token`.
+  sign:
+    needs: assemble
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: out
+          pattern: suite-*
+      - uses: sigstore/cosign-installer@v3
+        with:
+          cosign-release: v3.0.4
+      - name: Sign each target's manifest
+        run: |
+          set -euo pipefail
+          mkdir -p publish
+          for dir in out/suite-*; do
+            target="${dir#out/suite-}"
+            # The four manifests differ by target, so the release assets
+            # carry the target in their names. The bundle signs the bytes,
+            # not the filename: rename both to embarch-manifest.json and
+            # embarch-manifest.json.sigstore.json beside the unpacked archive.
+            cosign sign-blob --yes \
+              --bundle "publish/embarch-manifest-${target}.json.sigstore.json" \
+              "${dir}/embarch-manifest.json"
+            cp "${dir}/embarch-manifest.json" "publish/embarch-manifest-${target}.json"
+            cp "${dir}"/*.tar.gz "${dir}"/*.zip publish/ 2>/dev/null || true
+          done
+          ls -l publish
+      - name: Attest build provenance of each suite archive
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-path: |
+            publish/*.tar.gz
+            publish/*.zip
       - name: Publish suite release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: suite-v${{ inputs.suite_version }}
-          name: "EmbArch suite v${{ inputs.suite_version }}"
-          files: ${{ env.ASSET }}
+          name: "EmbArch suite ${{ github.ref_name }}"
+          files: |
+            publish/*.tar.gz
+            publish/*.zip
+            publish/*.json
+            publish/*.sigstore.json
           fail_on_unmatched_files: true

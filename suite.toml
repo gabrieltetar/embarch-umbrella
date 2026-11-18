@@ -1,0 +1,12 @@
+# The component release tags a suite release assembles (embarch-umbrella
+# decision 14). `.github/workflows/assemble-suite.yml` reads this file when a
+# `suite-v<version>` tag is pushed; the suite version is the tag's, not a field
+# here. Committing this file and pushing that tag is the human act.
+#
+# These are the newest tags as of 2026-11-17, none of them signed: a component
+# release is verified against its own `release.yml` identity, and only tags cut
+# after EMB-190's sibling tasks (core/127, api/160, umbrella/098) carry a bundle.
+# The first signed suite release needs new component tags here.
+core = "v0.1.4"
+api = "v0.1.0"
+umbrella = "v0.1.0"
