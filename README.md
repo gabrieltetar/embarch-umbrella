@@ -2,7 +2,7 @@
 
 Part of the [EmbArch](https://github.com/gabrieltetar/embarch-doc) suite — a set of tools for firmware engineers that spans from software to the physical hardware bench.
 
-This is the binary you download first. `embarch` gets a firmware engineer from *nothing installed* to *`embarch-api build_and_flash my-project` works, from a terminal or from an AI coding agent* — on whatever topology their machine happens to be: Core native on Windows with the API in WSL2, both native on a Mac, both native on Linux, or Core on a separate box.
+This is the binary you download first. `embarch` gets a firmware engineer from *nothing installed* to *`embarch-api build_and_flash my-project` works, from a terminal or from an LLM coding agent* — on whatever topology their machine happens to be: Core native on Windows with the API in WSL2, both native on a Mac, both native on Linux, or Core on a separate box.
 
 > **Status: active.** The command surface below is implemented; current design and status live in [spec.md](https://github.com/gabrieltetar/embarch-doc/blob/main/embarch-umbrella/spec.md).
 
