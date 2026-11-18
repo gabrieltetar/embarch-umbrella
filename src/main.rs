@@ -16,6 +16,7 @@ mod locate;
 mod manifest;
 mod setup;
 mod state;
+mod verify_release;
 mod zephyr;
 
 use std::path::PathBuf;
@@ -46,6 +47,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
+    /// Check an unpacked suite release offline: the manifest's Sigstore
+    /// signature under the exact release-workflow identity, then every
+    /// listed file's SHA-256. Fetches nothing unless --refresh-trust-root.
+    VerifyRelease {
+        /// Folder holding embarch-manifest.json, its .sigstore.json bundle
+        /// and the files it lists. Defaults to this binary's own folder.
+        dir: Option<PathBuf>,
+
+        /// Use this Sigstore trusted_root.json instead of the embedded one.
+        #[arg(long, value_name = "FILE", conflicts_with = "refresh_trust_root")]
+        trusted_root: Option<PathBuf>,
+
+        /// Fetch the Sigstore trust root through TUF for this run only, and
+        /// never cache it. For a release logged to a newer log shard than the
+        /// embedded root knows. The only option that uses the network.
+        #[arg(long)]
+        refresh_trust_root: bool,
+    },
     /// One-time per-machine setup: detect the topology, install Core as a
     /// service that starts at boot, copy the suite's binaries to a
     /// canonical location, and add it to PATH.
@@ -181,6 +200,9 @@ async fn main() {
             } else {
                 setup::setup(host.as_deref(), port, dev_bench_repo.as_deref(), dry_run).await
             }
+        }
+        Command::VerifyRelease { dir, trusted_root, refresh_trust_root } => {
+            verify_release::run(dir, trusted_root, refresh_trust_root).await
         }
         Command::Init { uninstall } => init::init(uninstall),
         Command::Doctor { json } => doctor::doctor(json).await,

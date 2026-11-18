@@ -54,6 +54,14 @@ reqwest = { version = "0.13.4", default-features = false, features = ["rustls"] 
 # one constant, or a rename-only change, produces two builds the same size.
 # Pure Rust, no system OpenSSL, matching this crate's rustls choice above.
 sha2 = "0.10"
+# Step 3 of embarch-doc/embarch-release-signing-proposal.md (EMB-192): `verify-release`
+# checks a suite release's signed manifest offline. Pinned exactly, since the
+# crate is pre-1.0 and its pin moves only with the fixture tests passing.
+# `sigstore-trust-root`'s `tuf` and `rustls` features (HTTP client, Tokio) are
+# reached only by `--refresh-trust-root`. Adds `aws-lc-sys` (a C and cmake build).
+sigstore-verify = "=0.16.0"
+sigstore-types = "=0.16.0"
+sigstore-trust-root = { version = "=0.16.0", default-features = false, features = ["aws-lc-rs", "tuf", "rustls"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
 serde_yaml = "0.9"
