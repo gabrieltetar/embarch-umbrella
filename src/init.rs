@@ -682,24 +682,23 @@ pub fn init(uninstall: bool, dry_run: bool) -> i32 {
         return 1;
     };
 
+    let embarch_dir = repo.join("embarch");
+    let config_path = embarch_dir.join("embarch.toml");
+
     if dry_run {
+        if !uninstall && config_path.exists() {
+            return print_completion_plan(&repo, &config_path);
+        }
         return print_plan(&repo, uninstall);
     }
     if uninstall {
         return uninit(&repo);
     }
 
-    let embarch_dir = repo.join("embarch");
-    let config_path = embarch_dir.join("embarch.toml");
     println!("Repo: {}", repo.display());
 
     if config_path.exists() {
-        println!(
-            "{} already exists — leaving it alone. Delete it, or run `embarch init --uninstall` \
-             first, to regenerate.",
-            config_path.display()
-        );
-        return 1;
+        return complete_existing(&repo, &config_path);
     }
 
     let name = repo
@@ -884,6 +883,57 @@ pub fn init(uninstall: bool, dry_run: bool) -> i32 {
         println!("  - {w}");
     }
     println!("\nThen: `embarch status`, and `embarch-api --config {} build {name}`.", config_path.display());
+    0
+}
+
+/// What an initialised repo still lacks, by looking only at the skill file and
+/// `.git/info/exclude` — never the config (decision 60).
+fn missing_pieces(repo: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let skill = repo.join(SKILL_DIR_REL).join("SKILL.md");
+    if !std::fs::read_to_string(&skill).is_ok_and(|t| t == SKILL_TEXT) {
+        out.push(format!("the embarch-hil skill at {SKILL_DIR_REL}/"));
+    }
+    let exclude = std::fs::read_to_string(repo.join(".git").join("info").join("exclude"))
+        .unwrap_or_default();
+    for entry in [EXCLUDE_ENTRY, SKILL_EXCLUDE_ENTRY] {
+        if !exclude.lines().any(|l| l.trim() == entry) {
+            out.push(format!(".git/info/exclude entry {entry}"));
+        }
+    }
+    out
+}
+
+/// `init` on a repo whose config exists: install what is missing, leave the
+/// config and the MCP registration alone, exit `0` (decision 60).
+fn complete_existing(repo: &Path, config_path: &Path) -> i32 {
+    println!("{} already exists — leaving it alone.", config_path.display());
+    if missing_pieces(repo).is_empty() {
+        println!("Nothing to add: this repo already has everything `init` installs.");
+        return 0;
+    }
+    match add_to_git_exclude(repo) {
+        Ok(true) => println!("Excluded embarch/ and the skill via .git/info/exclude (nothing tracked changed)"),
+        Ok(false) => println!(".git/info/exclude already had both entries"),
+        Err(e) => println!("Could not update .git/info/exclude: {e:#}"),
+    }
+    skill_step(repo);
+    println!("The MCP registration was not checked; if the agent lacks the server, run `claude mcp add {MCP_SERVER_NAME} -- <path to embarch-api> --config {}`.", config_path.display());
+    0
+}
+
+/// `--dry-run` on a repo whose config exists: name what `init` would add.
+fn print_completion_plan(repo: &Path, config_path: &Path) -> i32 {
+    println!("Repo: {}", repo.display());
+    println!("Dry run — nothing will be written or removed.");
+    println!("{} already exists — it would be left alone.", config_path.display());
+    let missing = missing_pieces(repo);
+    if missing.is_empty() {
+        println!("Nothing to add: this repo already has everything `init` installs.");
+    }
+    for m in missing {
+        println!("Would add {m}");
+    }
     0
 }
 
@@ -1256,6 +1306,58 @@ mod tests {
         fs::create_dir_all(&other).unwrap();
         assert!(remove_skill(repo.path()).unwrap());
         assert!(other.is_dir());
+    }
+
+    fn initialised_repo() -> (TempDir, PathBuf, &'static str) {
+        let repo = scratch_repo();
+        let cfg = repo.path().join("embarch/embarch.toml");
+        fs::create_dir_all(cfg.parent().unwrap()).unwrap();
+        // Deliberately not valid TOML and oddly formatted: it must never be read.
+        let text = "chip   =  \"mine\"   \n\n\n[[[ not toml";
+        fs::write(&cfg, text).unwrap();
+        (repo, cfg, text)
+    }
+
+    #[test]
+    fn an_initialised_repo_gets_what_it_lacks_and_its_config_is_untouched() {
+        let (repo, cfg, text) = initialised_repo();
+        assert_eq!(missing_pieces(repo.path()).len(), 3);
+        assert_eq!(complete_existing(repo.path(), &cfg), 0);
+        assert_eq!(fs::read_to_string(&cfg).unwrap(), text);
+        assert_eq!(
+            fs::read_to_string(repo.path().join(SKILL_DIR_REL).join("SKILL.md")).unwrap(),
+            SKILL_TEXT
+        );
+        let exclude = fs::read_to_string(repo.path().join(".git/info/exclude")).unwrap();
+        assert!(exclude.lines().any(|l| l == EXCLUDE_ENTRY));
+        assert!(exclude.lines().any(|l| l == SKILL_EXCLUDE_ENTRY));
+        assert!(missing_pieces(repo.path()).is_empty());
+    }
+
+    #[test]
+    fn a_repo_that_lacks_nothing_is_left_byte_identical() {
+        let (repo, cfg, text) = initialised_repo();
+        complete_existing(repo.path(), &cfg);
+        let exclude_path = repo.path().join(".git/info/exclude");
+        let before = fs::read_to_string(&exclude_path).unwrap();
+        let skill_path = repo.path().join(SKILL_DIR_REL).join("SKILL.md");
+        let skill_mtime = fs::metadata(&skill_path).unwrap().modified().unwrap();
+        assert_eq!(complete_existing(repo.path(), &cfg), 0);
+        assert_eq!(fs::read_to_string(&exclude_path).unwrap(), before);
+        assert_eq!(fs::metadata(&skill_path).unwrap().modified().unwrap(), skill_mtime);
+        assert_eq!(fs::read_to_string(&cfg).unwrap(), text);
+    }
+
+    #[test]
+    fn dry_run_on_an_initialised_repo_writes_nothing() {
+        let (repo, cfg, text) = initialised_repo();
+        assert_eq!(print_completion_plan(repo.path(), &cfg), 0);
+        assert!(!repo.path().join(".claude").exists());
+        assert!(fs::read_to_string(repo.path().join(".git/info/exclude")).is_err());
+        assert_eq!(fs::read_to_string(&cfg).unwrap(), text);
+        complete_existing(repo.path(), &cfg);
+        assert_eq!(print_completion_plan(repo.path(), &cfg), 0);
+        assert!(missing_pieces(repo.path()).is_empty());
     }
 
     #[test]
