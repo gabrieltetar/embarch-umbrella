@@ -18,6 +18,13 @@ const EXCLUDE_MARKER: &str = "# added by `embarch init`";
 const EXCLUDE_ENTRY: &str = "embarch/";
 const MCP_SERVER_NAME: &str = "embarch";
 
+/// The `embarch-hil` skill, pinned from `embarch-api/skills/embarch-hil/SKILL.md`
+/// (`embarch-umbrella` decision 59). A test compares the two byte for byte.
+const SKILL_TEXT: &str = include_str!("skills/embarch-hil/SKILL.md");
+/// Where the agent CLI reads a project's skills, relative to the repo root.
+const SKILL_DIR_REL: &str = ".claude/skills/embarch-hil";
+const SKILL_EXCLUDE_ENTRY: &str = ".claude/skills/embarch-hil/";
+
 /// The one sentinel this file uses for "`init` could not know this — you do".
 /// Deliberately the same string `chip` has always used: a scaffolded config
 /// already ships in a state that cannot run until a human edits it, and the
@@ -546,9 +553,17 @@ pub fn render_config(
 }
 
 fn add_to_git_exclude(repo: &Path) -> Result<bool> {
+    let mut changed = false;
+    for entry in [EXCLUDE_ENTRY, SKILL_EXCLUDE_ENTRY] {
+        changed |= add_exclude_entry(repo, entry)?;
+    }
+    Ok(changed)
+}
+
+fn add_exclude_entry(repo: &Path, entry: &str) -> Result<bool> {
     let exclude = repo.join(".git").join("info").join("exclude");
     let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
-    if existing.lines().any(|l| l.trim() == EXCLUDE_ENTRY) {
+    if existing.lines().any(|l| l.trim() == entry) {
         return Ok(false);
     }
     if let Some(dir) = exclude.parent() {
@@ -558,10 +573,50 @@ fn add_to_git_exclude(repo: &Path) -> Result<bool> {
     if !text.is_empty() && !text.ends_with('\n') {
         text.push('\n');
     }
-    text.push_str(&format!("{EXCLUDE_MARKER}\n{EXCLUDE_ENTRY}\n"));
+    text.push_str(&format!("{EXCLUDE_MARKER}\n{entry}\n"));
     std::fs::write(&exclude, text)
         .with_context(|| format!("could not write {}", exclude.display()))?;
     Ok(true)
+}
+
+/// Write the `embarch-hil` skill into the repo. `Ok(false)` when it is already
+/// there byte for byte.
+fn install_skill(repo: &Path) -> Result<bool> {
+    let file = repo.join(SKILL_DIR_REL).join("SKILL.md");
+    if std::fs::read_to_string(&file).is_ok_and(|t| t == SKILL_TEXT) {
+        return Ok(false);
+    }
+    if let Some(dir) = file.parent() {
+        std::fs::create_dir_all(dir)
+            .with_context(|| format!("could not create {}", dir.display()))?;
+    }
+    std::fs::write(&file, SKILL_TEXT)
+        .with_context(|| format!("could not write {}", file.display()))?;
+    Ok(true)
+}
+
+/// Remove the skill's directory, and `.claude/skills` and `.claude` after it
+/// when that leaves them empty. `Ok(false)` when there was none.
+fn remove_skill(repo: &Path) -> Result<bool> {
+    let dir = repo.join(SKILL_DIR_REL);
+    match std::fs::remove_dir_all(&dir) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e).with_context(|| format!("could not remove {}", dir.display())),
+    }
+    for parent in [repo.join(".claude").join("skills"), repo.join(".claude")] {
+        // Fails when not empty, which is the point.
+        let _ = std::fs::remove_dir(parent);
+    }
+    Ok(true)
+}
+
+fn skill_step(repo: &Path) {
+    match install_skill(repo) {
+        Ok(true) => println!("Installed the embarch-hil skill at {SKILL_DIR_REL}/ (excluded locally)"),
+        Ok(false) => println!("The embarch-hil skill was already installed"),
+        Err(e) => println!("Could not install the embarch-hil skill: {e:#}"),
+    }
 }
 
 fn remove_from_git_exclude(repo: &Path) -> Result<bool> {
@@ -571,7 +626,10 @@ fn remove_from_git_exclude(repo: &Path) -> Result<bool> {
     };
     let kept: Vec<&str> = existing
         .lines()
-        .filter(|l| l.trim() != EXCLUDE_ENTRY && l.trim() != EXCLUDE_MARKER)
+        .filter(|l| {
+            let l = l.trim();
+            l != EXCLUDE_ENTRY && l != SKILL_EXCLUDE_ENTRY && l != EXCLUDE_MARKER
+        })
         .collect();
     if kept.len() == existing.lines().count() {
         return Ok(false);
@@ -611,7 +669,7 @@ fn register_mcp(api: &Path, config: &Path) -> bool {
     }
 }
 
-pub fn init(uninstall: bool) -> i32 {
+pub fn init(uninstall: bool, dry_run: bool) -> i32 {
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {
@@ -624,6 +682,9 @@ pub fn init(uninstall: bool) -> i32 {
         return 1;
     };
 
+    if dry_run {
+        return print_plan(&repo, uninstall);
+    }
     if uninstall {
         return uninit(&repo);
     }
@@ -690,6 +751,8 @@ pub fn init(uninstall: bool) -> i32 {
             Ok(false) => println!("embarch/ was already excluded"),
             Err(e) => println!("Could not update .git/info/exclude: {e:#}"),
         }
+
+        skill_step(&repo);
 
         print!("Registering the MCP server for this repo... ");
         match locate::locate_api(None) {
@@ -799,6 +862,8 @@ pub fn init(uninstall: bool) -> i32 {
         Err(e) => println!("Could not update .git/info/exclude: {e:#}"),
     }
 
+    skill_step(&repo);
+
     print!("Registering the MCP server for this repo... ");
     match locate::locate_api(None) {
         Some(api) => {
@@ -822,6 +887,23 @@ pub fn init(uninstall: bool) -> i32 {
     0
 }
 
+/// `--dry-run`: say what `init` (or `init --uninstall`) would do, write nothing.
+fn print_plan(repo: &Path, uninstall: bool) -> i32 {
+    println!("Repo: {}", repo.display());
+    println!("Dry run — nothing will be written or removed.");
+    let verb = if uninstall { "remove" } else { "write" };
+    println!("Would {verb} {}", repo.join("embarch").display());
+    println!("Would {verb} the embarch-hil skill at {}", repo.join(SKILL_DIR_REL).display());
+    let exclude = if uninstall { "remove from" } else { "add to" };
+    println!("Would {exclude} .git/info/exclude: {EXCLUDE_ENTRY}, {SKILL_EXCLUDE_ENTRY}");
+    if uninstall {
+        println!("Would run: claude mcp remove {MCP_SERVER_NAME}");
+    } else {
+        println!("Would register the MCP server: claude mcp add {MCP_SERVER_NAME} -- <embarch-api> --config <embarch.toml>");
+    }
+    0
+}
+
 fn uninit(repo: &Path) -> i32 {
     let embarch_dir = repo.join("embarch");
     println!("Repo: {}", repo.display());
@@ -838,6 +920,12 @@ fn uninit(repo: &Path) -> i32 {
         Ok(true) => println!("Removed embarch/ from .git/info/exclude"),
         Ok(false) => println!("Nothing to remove from .git/info/exclude"),
         Err(e) => println!("Could not update .git/info/exclude: {e:#}"),
+    }
+
+    match remove_skill(repo) {
+        Ok(true) => println!("Removed the embarch-hil skill"),
+        Ok(false) => println!("No embarch-hil skill to remove"),
+        Err(e) => println!("Could not remove the embarch-hil skill: {e:#}"),
     }
 
     match Command::new("claude")
@@ -1119,6 +1207,65 @@ mod tests {
                 "twister-out/a/b/build_info.yml",
             ]
         );
+    }
+
+    fn scratch_repo() -> TempDir {
+        let dir = tempdir();
+        fs::create_dir_all(dir.path().join(".git").join("info")).unwrap();
+        dir
+    }
+
+    #[test]
+    fn the_pinned_skill_matches_what_embarch_api_ships() {
+        let upstream = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../embarch-api/skills/embarch-hil/SKILL.md");
+        let shipped = fs::read_to_string(&upstream).unwrap_or_else(|e| {
+            panic!("could not read {} (sibling missing beside this checkout?): {e}", upstream.display())
+        });
+        assert_eq!(
+            SKILL_TEXT, shipped,
+            "src/skills/embarch-hil/SKILL.md drifted from embarch-api's; copy it over (decision 59)"
+        );
+    }
+
+    #[test]
+    fn the_skill_installs_is_excluded_and_uninstalls_clean() {
+        let repo = scratch_repo();
+        assert!(install_skill(repo.path()).unwrap());
+        assert!(!install_skill(repo.path()).unwrap(), "a second install is a no-op");
+        let file = repo.path().join(SKILL_DIR_REL).join("SKILL.md");
+        assert_eq!(fs::read_to_string(&file).unwrap(), SKILL_TEXT);
+
+        assert!(add_to_git_exclude(repo.path()).unwrap());
+        let exclude = fs::read_to_string(repo.path().join(".git/info/exclude")).unwrap();
+        assert!(exclude.lines().any(|l| l == SKILL_EXCLUDE_ENTRY));
+
+        assert!(remove_skill(repo.path()).unwrap());
+        assert!(!repo.path().join(".claude").exists(), "empty parents go too");
+        assert!(!remove_skill(repo.path()).unwrap());
+        assert!(remove_from_git_exclude(repo.path()).unwrap());
+        let exclude = fs::read_to_string(repo.path().join(".git/info/exclude")).unwrap();
+        assert!(!exclude.contains("embarch"), "{exclude}");
+    }
+
+    #[test]
+    fn uninstalling_the_skill_leaves_other_skills_alone() {
+        let repo = scratch_repo();
+        install_skill(repo.path()).unwrap();
+        let other = repo.path().join(".claude/skills/mine");
+        fs::create_dir_all(&other).unwrap();
+        assert!(remove_skill(repo.path()).unwrap());
+        assert!(other.is_dir());
+    }
+
+    #[test]
+    fn dry_run_writes_nothing() {
+        let repo = scratch_repo();
+        assert_eq!(print_plan(repo.path(), false), 0);
+        assert_eq!(print_plan(repo.path(), true), 0);
+        assert!(!repo.path().join(".claude").exists());
+        assert!(!repo.path().join("embarch").exists());
+        assert!(fs::read_to_string(repo.path().join(".git/info/exclude")).is_err());
     }
 
     struct TempDir(PathBuf);

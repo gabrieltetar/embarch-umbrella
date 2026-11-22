@@ -102,6 +102,9 @@ enum Command {
         /// Reverse everything `init` did in this repo.
         #[arg(long)]
         uninstall: bool,
+        /// Print what would be written (or, with `--uninstall`, removed) and change nothing.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Verify the whole chain, with a fix for every failed check.
@@ -204,7 +207,7 @@ async fn main() {
         Command::VerifyRelease { dir, trusted_root, refresh_trust_root } => {
             verify_release::run(dir, trusted_root, refresh_trust_root).await
         }
-        Command::Init { uninstall } => init::init(uninstall),
+        Command::Init { uninstall, dry_run } => init::init(uninstall, dry_run),
         Command::Doctor { json } => doctor::doctor(json).await,
         Command::Up { foreground } => setup::up(foreground),
         Command::Down => setup::down(),
