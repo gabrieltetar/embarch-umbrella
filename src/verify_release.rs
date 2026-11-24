@@ -13,6 +13,10 @@
 //!    anything**; only [`TrustRootSource::Refresh`] touches the network, and
 //!    it never caches what it got.
 //!
+//! After the signature, the certificate's Source Repository URI, Ref and Build
+//! Config URI extensions must equal the repository, `refs/tags/suite-v<version>`
+//! and the identity, exactly; a missing one fails naming it.
+//!
 //! The check returns a [`Verified`] or a [`VerifyError`] and prints nothing,
 //! so the checked elevated install (step 4) can call [`verify_release`].
 
@@ -45,6 +49,15 @@ pub fn suite_identity(suite_version: &str) -> String {
     format!(
         "https://github.com/gabrieltetar/embarch-umbrella/.github/workflows/assemble-suite.yml@refs/tags/suite-v{suite_version}"
     )
+}
+
+/// The umbrella repository the suite identity names, as the certificate's
+/// Source Repository URI extension spells it.
+pub const SUITE_REPOSITORY: &str = "https://github.com/gabrieltetar/embarch-umbrella";
+
+/// The ref the certificate's Source Repository Ref extension must carry.
+pub fn suite_ref(suite_version: &str) -> String {
+    format!("refs/tags/suite-v{suite_version}")
 }
 
 /// Where the Sigstore trust root comes from.
@@ -111,6 +124,9 @@ pub enum VerifyError {
     LogNotTrusted { detail: String, root: String },
     /// The signature, identity, issuer, certificate or log evidence failed.
     Signature(String),
+    /// A certificate extension is absent (`found` is `None`) or differs from
+    /// the value the release must carry.
+    CertificateClaim { extension: &'static str, expected: String, found: Option<String> },
     /// The manifest lists a path that is absolute or climbs out of the folder.
     UnsafePath(String),
     FileMissing(String),
@@ -135,6 +151,14 @@ impl fmt::Display for VerifyError {
             VerifyError::Signature(m) => {
                 write!(f, "the manifest's signature check failed: {m}")
             }
+            VerifyError::CertificateClaim { extension, expected, found: None } => write!(
+                f,
+                "the signing certificate has no {extension} extension; expected {expected:?}"
+            ),
+            VerifyError::CertificateClaim { extension, expected, found: Some(found) } => write!(
+                f,
+                "the signing certificate's {extension} is {found:?}, expected {expected:?}"
+            ),
             VerifyError::UnsafePath(p) => write!(
                 f,
                 "the manifest lists {p:?}, which is not a plain relative path inside the release folder"
@@ -222,6 +246,13 @@ pub fn verify_release_with_root(
         GITHUB_ACTIONS_ISSUER,
     )?;
 
+    check_certificate_claims(
+        &bundle_json,
+        SUITE_REPOSITORY,
+        &suite_ref(&manifest.suite_version),
+        &identity,
+    )?;
+
     let files_checked = check_files(dir, &manifest.files)?;
 
     Ok(Verified {
@@ -264,6 +295,40 @@ fn verify_blob_bundle<'a>(
         ) => VerifyError::LogNotTrusted { detail: log.to_string(), root: root_label.to_string() },
         other => VerifyError::Signature(other.to_string()),
     })
+}
+
+/// The signing certificate's Source Repository URI, Source Repository Ref and
+/// Build Config URI extensions equal the given values, exactly. The identity
+/// alone is a string in the certificate's SAN; these are separate claims
+/// Fulcio copied from the workflow's token, so all three are asked.
+fn check_certificate_claims(
+    bundle_json: &str,
+    repository: &str,
+    git_ref: &str,
+    build_config: &str,
+) -> Result<(), VerifyError> {
+    let bundle = Bundle::from_json(bundle_json).map_err(|e| VerifyError::Bundle(e.to_string()))?;
+    let der = bundle
+        .signing_certificate()
+        .ok_or_else(|| VerifyError::Bundle("it carries no signing certificate".to_string()))?;
+    let info = sigstore_verify::crypto::parse_certificate_info(der)
+        .map_err(|e| VerifyError::Signature(format!("signing certificate unreadable: {e}")))?;
+    let claims = info.ci_claims;
+    let wanted = [
+        ("Source Repository URI (1.3.6.1.4.1.57264.1.12)", repository, claims.source_repository_uri),
+        ("Source Repository Ref (1.3.6.1.4.1.57264.1.14)", git_ref, claims.source_repository_ref),
+        ("Build Config URI (1.3.6.1.4.1.57264.1.18)", build_config, claims.build_config_uri),
+    ];
+    for (extension, expected, found) in wanted {
+        if found.as_deref() != Some(expected) {
+            return Err(VerifyError::CertificateClaim {
+                extension,
+                expected: expected.to_string(),
+                found,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Every listed file exists under `dir` with the listed SHA-256. Returns how
@@ -473,6 +538,54 @@ mod tests {
         assert!(text.contains("--trusted-root"));
         assert!(text.contains("never caches"));
         assert!(text.contains("unknown transparency log abc"));
+    }
+
+    const UV_REPOSITORY: &str = "https://github.com/astral-sh/uv";
+    const UV_REF: &str = "refs/heads/main";
+
+    #[test]
+    fn the_three_certificate_extensions_are_read_from_a_real_bundle() {
+        let info = sigstore_verify::crypto::parse_certificate_info(
+            Bundle::from_json(UV_BUNDLE).unwrap().signing_certificate().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(info.ci_claims.source_repository_uri.as_deref(), Some(UV_REPOSITORY));
+        assert_eq!(info.ci_claims.source_repository_ref.as_deref(), Some(UV_REF));
+        assert_eq!(info.ci_claims.build_config_uri.as_deref(), Some(UV_IDENTITY));
+        check_certificate_claims(UV_BUNDLE, UV_REPOSITORY, UV_REF, UV_IDENTITY).unwrap();
+    }
+
+    #[test]
+    fn a_differing_expected_extension_fails_naming_it() {
+        let cases = [
+            (("https://github.com/other/repo", UV_REF, UV_IDENTITY), "Source Repository URI"),
+            ((UV_REPOSITORY, "refs/tags/suite-v1.0.0", UV_IDENTITY), "Source Repository Ref"),
+            ((UV_REPOSITORY, UV_REF, "https://example.com/wf@refs/heads/main"), "Build Config URI"),
+        ];
+        for ((repo, git_ref, config), name) in cases {
+            let err = check_certificate_claims(UV_BUNDLE, repo, git_ref, config).unwrap_err();
+            assert!(matches!(err, VerifyError::CertificateClaim { found: Some(_), .. }), "{err}");
+            let text = err.to_string();
+            assert!(text.contains(name), "{text}");
+            assert!(text.contains("expected"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_certificate_without_the_extensions_fails_naming_the_first() {
+        // The cosign fixture's certificate is a human identity: it carries
+        // an issuer extension and none of the CI claims.
+        let err = check_certificate_claims(COSIGN_BUNDLE, UV_REPOSITORY, UV_REF, UV_IDENTITY)
+            .unwrap_err();
+        assert!(matches!(err, VerifyError::CertificateClaim { found: None, .. }), "{err}");
+        assert!(err.to_string().contains("Source Repository URI"), "{err}");
+    }
+
+    #[test]
+    fn suite_repository_and_ref_are_the_identitys_parts() {
+        let identity = suite_identity("0.2.0");
+        assert!(identity.starts_with(SUITE_REPOSITORY));
+        assert!(identity.ends_with(&format!("@{}", suite_ref("0.2.0"))));
     }
 
     #[test]
