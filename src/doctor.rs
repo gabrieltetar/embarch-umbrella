@@ -3901,12 +3901,29 @@ fn render_json(checks: &[Check], any_fail: bool) -> String {
             })
         })
         .collect();
-    serde_json::json!({ "success": !any_fail, "checks": checks_json }).to_string()
+    serde_json::json!({
+        "schema_version": crate::JSON_SCHEMA_VERSION,
+        "success": !any_fail,
+        "checks": checks_json,
+    })
+    .to_string()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Pins `doctor --json`'s top-level keys and version, so a dropped key or a
+    /// shape change without a `JSON_SCHEMA_VERSION` bump fails here.
+    #[test]
+    fn doctor_json_top_level_keys_and_version_are_pinned() {
+        let v: serde_json::Value = serde_json::from_str(&render_json(&[], false)).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["checks", "schema_version", "success"]);
+        assert_eq!(v["schema_version"], 1);
+        assert_eq!(crate::JSON_SCHEMA_VERSION, 1, "bump the pinned shape tests with the constant");
+    }
 
     /// The four-file split (`embarch.md` §6) deleted `design.md` and every
     /// `milestone-*.md`; a string naming one — in code *or* in a comment,

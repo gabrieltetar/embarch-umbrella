@@ -23,6 +23,11 @@ use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 
+/// `schema_version` on every `--json` object `embarch` emits (`status`, `doctor`).
+/// Hand-bumped when either object's shape changes; the umbrella's own counter,
+/// not `embarch-api`'s (`embarch-umbrella` decision 11, after `embarch-api` 24).
+pub const JSON_SCHEMA_VERSION: u32 = 1;
+
 use embarch_topology::software::{winner, Attempt, ProbeOutcome, DEFAULT_CORE_PORT};
 
 /// Exit codes follow embarch-api's CLI convention (`embarch-api` interfaces/tools.md):
@@ -428,6 +433,8 @@ fn probes_json(probes: &ProbeReport) -> serde_json::Value {
 fn status_json(attempts: &[Attempt], probes: &ProbeReport) -> String {
     let found = winner(attempts);
     serde_json::json!({
+        "schema_version": JSON_SCHEMA_VERSION,
+        "success": true,
         "reachable": found.is_some(),
         "base_url": found.map(|a| a.candidate.base_url.clone()),
         "topology": found.map(|a| a.candidate.class.as_str()),
@@ -549,5 +556,22 @@ mod tests {
     fn a_non_200_status_is_still_request_failed() {
         let report = interpret_probe_response(500, "");
         assert_eq!(report.state_str(), "request-failed");
+    }
+
+    /// Pins `status --json`'s top-level keys and version: dropping a key, or
+    /// changing the shape without moving `JSON_SCHEMA_VERSION`, fails here.
+    #[test]
+    fn status_json_top_level_keys_and_version_are_pinned() {
+        let v: serde_json::Value =
+            serde_json::from_str(&status_json(&[core_attempt(true)], &ProbeReport::Count(1))).unwrap();
+        let mut keys: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            ["attempts", "authorized", "base_url", "probes", "reachable", "schema_version", "success", "topology"]
+        );
+        assert_eq!(v["schema_version"], 1);
+        assert_eq!(JSON_SCHEMA_VERSION, 1, "bump the pinned shape tests with the constant");
+        assert_eq!(v["success"], true);
     }
 }
