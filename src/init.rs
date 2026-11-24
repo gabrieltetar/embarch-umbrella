@@ -18,9 +18,10 @@ const EXCLUDE_MARKER: &str = "# added by `embarch init`";
 const EXCLUDE_ENTRY: &str = "embarch/";
 const MCP_SERVER_NAME: &str = "embarch";
 
-/// The `embarch-hil` skill, pinned from `embarch-api/skills/embarch-hil/SKILL.md`
-/// (`embarch-umbrella` decision 59). A test compares the two byte for byte.
-const SKILL_TEXT: &str = include_str!("skills/embarch-hil/SKILL.md");
+/// The `embarch-hil` skill, read at build time from the one file
+/// `embarch-api/skills/embarch-hil/SKILL.md` through the sibling checkout the
+/// crate already needs (`embarch-umbrella` decision 59). There is no copy to drift.
+const SKILL_TEXT: &str = include_str!("../../embarch-api/skills/embarch-hil/SKILL.md");
 /// Where the agent CLI reads a project's skills, relative to the repo root.
 const SKILL_DIR_REL: &str = ".claude/skills/embarch-hil";
 const SKILL_EXCLUDE_ENTRY: &str = ".claude/skills/embarch-hil/";
@@ -1266,16 +1267,13 @@ mod tests {
     }
 
     #[test]
-    fn the_pinned_skill_matches_what_embarch_api_ships() {
+    fn the_installed_skill_is_what_embarch_api_ships() {
         let upstream = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../embarch-api/skills/embarch-hil/SKILL.md");
         let shipped = fs::read_to_string(&upstream).unwrap_or_else(|e| {
             panic!("could not read {} (sibling missing beside this checkout?): {e}", upstream.display())
         });
-        assert_eq!(
-            SKILL_TEXT, shipped,
-            "src/skills/embarch-hil/SKILL.md drifted from embarch-api's; copy it over (decision 59)"
-        );
+        assert_eq!(SKILL_TEXT, shipped, "the installed skill is not embarch-api's file (decision 59)");
     }
 
     #[test]
