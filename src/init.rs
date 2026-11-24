@@ -541,7 +541,7 @@ pub fn render_config(
          build_command = [{argv}]\n\
          artifact_path = {artifact_path:?}\n\
          # A probe-rs target name, NOT your Zephyr board name. Find it with:\n\
-         #   probe-rs chip list | grep -i <your soc>\n\
+         #   embarch-core chip-list <soc-substring>\n\
          chip = \"CHANGE-ME\"\n\
          flash_format = \"hex\"\n\
          build_timeout_secs = 900\n",

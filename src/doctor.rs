@@ -1409,7 +1409,7 @@ fn check_chip(projects: &[ProjectConfig], config_path: Option<&Path>, api: Optio
     if !problems.is_empty() {
         return with_fix(
             check(8, CHECK8_NAME, Status::Fail, problems.join("; ")),
-            "static: cargo install probe-rs-tools && probe-rs chip list | grep -i <your soc>, then set \
+            "static: run `embarch-core chip-list <soc-substring>`, then set \
              `chip` in embarch/embarch.toml. zephyr-west: run `embarch-api list-targets <project>` and \
              fix what it reports — boards/*/*.yml and app/*/CMakeLists.txt must declare at least one \
              real, file-backed target.",
