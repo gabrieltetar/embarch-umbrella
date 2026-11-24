@@ -4,17 +4,11 @@ Part of the [EmbArch](https://github.com/gabrieltetar/embarch-doc) suite — a s
 
 This is the binary you download first. `embarch` gets a firmware engineer from *nothing installed* to *`embarch-api build_and_flash my-project` works, from a terminal or from an LLM coding agent* — on whatever topology their machine happens to be: Core native on Windows with the API in WSL2, both native on a Mac, both native on Linux, or Core on a separate box.
 
-> **Status: active.** The command surface below is implemented; current design and status live in [spec.md](https://github.com/gabrieltetar/embarch-doc/blob/main/embarch-umbrella/spec.md).
+> **Status: active.** Current design and status live in [spec.md](https://github.com/gabrieltetar/embarch-doc/blob/main/embarch-umbrella/spec.md).
 
 ## What it does
 
-| Command | Scope | Behavior |
-|---|---|---|
-| `embarch setup` | once per machine | Detect the topology, install `embarch-core` as a service that starts at boot, ensure the shared token exists, put both binaries on `PATH` |
-| `embarch init` | once per firmware repo | Scaffold `embarch/embarch.toml` and a separate build directory, register the MCP server, exclude it all locally. `--uninstall` reverses it |
-| `embarch doctor` | anytime | Verify the whole chain — binaries, service, reachability, token, probe, config, build command, artifact paths, MCP registration — with a fix for every failure. `--json` |
-| `embarch status` | anytime, cheap | Is Core up, which topology, how many probes. `--json` |
-| `embarch up` / `down` | fallback | Start/stop Core when it isn't already a running service, including across the WSL2⟷Windows boundary |
+`embarch` installs, configures and checks the suite on one machine: it detects the topology, installs Core as a service, wires a firmware repo to it, and diagnoses the whole chain with a fix for every failure. It carries no list of commands or binaries here, because a list in a README goes stale. The commands and their flags are owned by [the interface docs](https://github.com/gabrieltetar/embarch-doc/tree/main/embarch-umbrella/interfaces) and described for users in [the user guide](https://github.com/gabrieltetar/embarch-doc/blob/main/suite/user-guide.md); `embarch --help` prints the current set.
 
 ## What it deliberately isn't
 
@@ -26,7 +20,7 @@ This is the binary you download first. `embarch` gets a firmware engineer from *
 The load-bearing design point: **Core is meant to be an installed, autostarting OS service**, so on every same-machine topology there is nothing for a human to start, ever. That's what makes "one button starts everything" a *setup* problem rather than a process-management problem — and it's why this is a setup-and-diagnostics tool rather than a launcher.
 
 ```
-                    setup / init / doctor / status / up / down
+                          embarch commands
                                     |
                                  embarch
                           /         |          \
