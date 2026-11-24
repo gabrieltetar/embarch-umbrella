@@ -4,6 +4,9 @@
 **/*.rs.bk
 *.pdb
 
+# Python (scripts/)
+__pycache__/
+
 # Editors
 .vscode/
 .idea/
