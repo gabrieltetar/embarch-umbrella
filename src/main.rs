@@ -12,6 +12,7 @@ mod doctor;
 mod env;
 mod init;
 mod install;
+mod install_core;
 mod locate;
 mod manifest;
 mod setup;
@@ -67,6 +68,34 @@ enum Command {
         /// Fetch the Sigstore trust root through TUF for this run only, and
         /// never cache it. For a release logged to a newer log shard than the
         /// embedded root knows. The only option that uses the network.
+        #[arg(long)]
+        refresh_trust_root: bool,
+    },
+    /// Verify a suite release in a staging folder only an administrator can
+    /// write, refuse an older suite than the installed one, and record what
+    /// was installed. Registering the service is a later step.
+    InstallCore {
+        /// The unpacked release folder, or its archive.
+        source: PathBuf,
+
+        /// Install a suite older than the installed one; the record says so.
+        #[arg(long)]
+        allow_downgrade: bool,
+
+        /// Print the plan and change nothing.
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Core's data folder, where `release-staging/` and
+        /// `installed-release.json` live. Defaults to this machine's.
+        #[arg(long, value_name = "DIR")]
+        data_dir: Option<PathBuf>,
+
+        /// Use this Sigstore trusted_root.json instead of the embedded one.
+        #[arg(long, value_name = "FILE", conflicts_with = "refresh_trust_root")]
+        trusted_root: Option<PathBuf>,
+
+        /// Fetch the Sigstore trust root through TUF for this run only.
         #[arg(long)]
         refresh_trust_root: bool,
     },
@@ -211,6 +240,17 @@ async fn main() {
         }
         Command::VerifyRelease { dir, trusted_root, refresh_trust_root } => {
             verify_release::run(dir, trusted_root, refresh_trust_root).await
+        }
+        Command::InstallCore {
+            source,
+            allow_downgrade,
+            dry_run,
+            data_dir,
+            trusted_root,
+            refresh_trust_root,
+        } => {
+            install_core::run(source, data_dir, allow_downgrade, dry_run, trusted_root, refresh_trust_root)
+                .await
         }
         Command::Init { uninstall, dry_run } => init::init(uninstall, dry_run),
         Command::Doctor { json } => doctor::doctor(json).await,
