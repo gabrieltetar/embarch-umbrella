@@ -439,6 +439,27 @@ pub fn windows_core_service_bind_address() -> Option<String> {
     parse_sc_qc_bind_address(&String::from_utf8_lossy(&output.stdout))
 }
 
+/// Whether the registered service was installed from a signed release
+/// (`run --service`, decision 61) rather than from source. `None` when
+/// there is no service or `sc.exe` cannot say.
+pub fn windows_core_service_is_release_install() -> Option<bool> {
+    let output = std::process::Command::new("sc.exe")
+        .args(["qc", WINDOWS_CORE_SERVICE_LABEL])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_sc_qc_has_service_flag(&String::from_utf8_lossy(&output.stdout))
+}
+
+/// `Some(true)` when the `BINARY_PATH_NAME` command line carries `--service`;
+/// `None` when the line is not there at all.
+fn parse_sc_qc_has_service_flag(stdout: &str) -> Option<bool> {
+    let line = stdout.lines().find(|l| l.contains("BINARY_PATH_NAME"))?;
+    Some(line.split_whitespace().any(|w| w == "--service"))
+}
+
 /// Pulls `--bind`'s value out of `sc.exe qc`'s `BINARY_PATH_NAME` command
 /// line.
 ///
@@ -531,6 +552,15 @@ mod tests {
     /// conventional install list — which is exactly why `deploy-core` reads
     /// the service's registration instead of guessing (decision 32), and why
     /// `locate_core` now reads it too (decision 38).
+    #[test]
+    fn the_service_flag_is_read_off_the_registered_command_line() {
+        let src = "        BINARY_PATH_NAME   : C:\\embarch\\embarch-core.exe run --bind 0.0.0.0\n";
+        let rel = "        BINARY_PATH_NAME   : C:\\embarch\\embarch-core.exe run --service --bind 0.0.0.0\n";
+        assert_eq!(parse_sc_qc_has_service_flag(src), Some(false));
+        assert_eq!(parse_sc_qc_has_service_flag(rel), Some(true));
+        assert_eq!(parse_sc_qc_has_service_flag("nothing"), None);
+    }
+
     #[test]
     fn the_services_own_binary_path_is_parsed_out_of_a_command_line() {
         let real = "[SC] QueryServiceConfig SUCCESS\n\n\

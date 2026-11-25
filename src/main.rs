@@ -10,6 +10,7 @@ mod agent_run;
 mod config;
 mod desk;
 mod deploy;
+mod deploy_dev;
 mod doctor;
 mod env;
 mod agent_init;
@@ -194,8 +195,10 @@ enum Command {
     /// Fallback: stop the running Core service, leaving it installed.
     Down,
 
-    /// Get a local `embarch-core` change onto the live Windows service:
-    /// sync, build natively, stop/copy/start under one elevation, verify.
+    /// Get a local `embarch-core` change running beside the Windows service:
+    /// sync, build natively, install a development Core in the engineer's
+    /// profile (the service is stopped, never overwritten), verify by hash.
+    /// `--restore-service` puts the service back.
     ///
     /// Replaces the hand-assembled procedure in
     /// `embarch-doc/embarch-dev-workflow.md` §4a — which that section itself
@@ -216,11 +219,6 @@ enum Command {
         #[arg(long)]
         cargo: Option<PathBuf>,
 
-        /// The exe to replace. Defaults to the service's own
-        /// `BINARY_PATH_NAME`, which is the authoritative answer.
-        #[arg(long)]
-        install_target: Option<PathBuf>,
-
         /// Windows service to restart.
         #[arg(long)]
         service: Option<String>,
@@ -234,6 +232,16 @@ enum Command {
         /// for when you would rather run the privileged half yourself.
         #[arg(long)]
         print_script: bool,
+
+        /// Cancel a study in flight before the deploy stops the Core running
+        /// it. Without this a study in flight refuses the deploy.
+        #[arg(long)]
+        cancel_run: bool,
+
+        /// Stop the development Core and start the service again; waits for
+        /// `/status` to read `service` with a key matching `core-fingerprint`.
+        #[arg(long)]
+        restore_service: bool,
     },
 }
 
@@ -316,19 +324,21 @@ async fn main() {
             source_root,
             windows_root,
             cargo,
-            install_target,
             service,
             dry_run,
             print_script,
+            cancel_run,
+            restore_service,
         } => {
             deploy::deploy_core(
                 source_root,
                 windows_root,
                 cargo,
-                install_target,
                 service,
                 dry_run,
                 print_script,
+                cancel_run,
+                restore_service,
             )
             .await
         }

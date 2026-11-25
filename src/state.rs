@@ -63,6 +63,11 @@ pub struct State {
     pub deploy_windows_root: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deploy_cargo_exe: Option<PathBuf>,
+    /// The PID of the development Core `deploy-core` started, so the next
+    /// deploy or `--restore-service` stops that process and never one found
+    /// by name (decision 68). Cleared when it is stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deploy_dev_core_pid: Option<u32>,
     /// Every firmware repo `embarch init` ran in, so the elevated install can
     /// later write `embarch/core-fingerprint` into each (decision 65). The
     /// field defaults: a file written before it existed loads with none.
@@ -211,6 +216,7 @@ mod tests {
             deploy_source_root: Some(PathBuf::from("/home/me/Github/embarch")),
             deploy_windows_root: None,
             deploy_cargo_exe: None,
+            deploy_dev_core_pid: Some(4242),
             registered_repos: vec![],
         };
         let text = toml::to_string_pretty(&state).unwrap();
