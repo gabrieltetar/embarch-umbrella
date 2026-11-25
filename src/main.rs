@@ -6,6 +6,7 @@
 //! and dogfooding the guide are what remains.
 
 mod agent;
+mod agent_run;
 mod config;
 mod desk;
 mod deploy;
@@ -150,6 +151,12 @@ enum Command {
         runtime: String,
     },
 
+    /// Start, stop, check and enter the agent's container (decision 67).
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
+
     /// Verify the whole chain, with a fix for every failed check.
     Doctor {
         /// Emit one JSON object instead of human-readable output.
@@ -230,6 +237,28 @@ enum Command {
     },
 }
 
+#[derive(Subcommand)]
+enum AgentAction {
+    /// Build the image when none carries the Containerfile's hash, then start
+    /// the container with the vector `init --container` recorded.
+    Up {
+        /// The agent's name; omit inside its repo, or when only one exists.
+        name: Option<String>,
+    },
+    /// Stop and remove the container. The work volume and the exchange folder stay.
+    Down { name: Option<String> },
+    /// Check the definition, the fingerprint copy, and from inside that Core
+    /// answers and an address off the allowlist does not. Exits 1 on any finding.
+    Status { name: Option<String> },
+    /// A shell in the agent's clone, as the agent user.
+    Shell {
+        name: Option<String>,
+        /// Run `claude` instead of `bash`.
+        #[arg(long)]
+        claude: bool,
+    },
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     // stderr, so stdout stays reserved for command results and `--json`
@@ -264,6 +293,21 @@ async fn main() {
         Command::Init { uninstall, dry_run, container, runtime } => {
             let runtime = container.then(|| if runtime == "podman" { agent::Runtime::Podman } else { agent::Runtime::Docker });
             init::init(uninstall, dry_run, runtime)
+        }
+        Command::Agent { action } => {
+            let ctx = agent_run::ctx_from_env();
+            match action {
+                AgentAction::Up { name } => agent_run::report(agent_run::up(&ctx, name.as_deref())),
+                AgentAction::Down { name } => agent_run::report(agent_run::down(&ctx, name.as_deref())),
+                AgentAction::Status { name } => agent_run::report_status(agent_run::status(&ctx, name.as_deref())),
+                AgentAction::Shell { name, claude } => match agent_run::shell(&ctx, name.as_deref(), claude) {
+                    Ok(code) => code,
+                    Err(e) => {
+                        eprintln!("{e:#}");
+                        1
+                    }
+                },
+            }
         }
         Command::Doctor { json } => doctor::doctor(json).await,
         Command::Up { foreground } => setup::up(foreground),

@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 const TARGET_TOKEN: &str = "/run/embarch/token";
 /// Where the development Core's agent token appears, when there is one.
 const TARGET_DEV_TOKEN: &str = "/run/embarch/dev-token";
-const TARGET_DEFINITION: &str = "/etc/embarch-agent";
+pub(crate) const TARGET_DEFINITION: &str = "/etc/embarch-agent";
 const TARGET_EXCHANGE: &str = "/exchange.git";
 const TARGET_OUTBOX: &str = "/outbox";
 const TARGET_CLAUDE_CONFIG: &str = "/home/agent/.claude";
@@ -43,11 +43,11 @@ const ALLOWED_CAPS: [&str; 5] = ["NET_ADMIN", "NET_RAW", "SETUID", "SETGID", "SE
 /// The agent user the root half drops to.
 const AGENT_UID: u32 = 1000;
 /// The one port an allowlisted model-API host is reached on.
-const MODEL_API_PORT: u16 = 443;
+pub(crate) const MODEL_API_PORT: u16 = 443;
 /// An address no allowlist holds (RFC 5737 TEST-NET-1), for the off-list check.
-const OFF_LIST_PROBE_ADDR: &str = "192.0.2.1";
+pub(crate) const OFF_LIST_PROBE_ADDR: &str = "192.0.2.1";
 /// Seconds a firewall self-check connection may take.
-const CHECK_TIMEOUT_SECS: u32 = 3;
+pub(crate) const CHECK_TIMEOUT_SECS: u32 = 3;
 /// Set in the agent's environment: no traffic beyond the model API. From the
 /// issue, unverified.
 const DISABLE_NONESSENTIAL_TRAFFIC: &str = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1";
@@ -423,7 +423,7 @@ fn check_mount(value: &str, out: &mut Vec<String>) {
 }
 
 /// SHA-256 of the vector, one element per line, as lower-case hex.
-fn hash_args(args: &[String]) -> String {
+pub(crate) fn hash_args(args: &[String]) -> String {
     let mut h = Sha256::new();
     for a in args {
         h.update(a.as_bytes());
@@ -553,7 +553,14 @@ pub fn render_entrypoint_root(plan: &AgentContainer, core_host: &str) -> String 
     l("set -eu".into());
     l("fail() { echo \"embarch-agent: $*\" >&2; exit 1; }".into());
     l("[ \"$#\" -gt 0 ] || fail 'no agent command given'".into());
-    l(format!("CORE_HOST={}", sh_quote(core_host)));
+    if core_host == CORE_ADDR_PLACEHOLDER {
+        // Core's address is re-resolved at every start (decision 6): `embarch agent up`
+        // writes it to the definition folder, which is mounted read-only (decision 67).
+        l(format!("CORE_HOST=$(cat {TARGET_DEFINITION}/{CORE_ADDR_START_FILE} 2>/dev/null) || fail 'no Core address in {TARGET_DEFINITION}/{CORE_ADDR_START_FILE}'"));
+        l("[ -n \"$CORE_HOST\" ] || fail 'the Core address file is empty'".into());
+    } else {
+        l(format!("CORE_HOST={}", sh_quote(core_host)));
+    }
     l(format!("CORE_PORT={}", plan.core_port));
     l("iptables -F OUTPUT".into());
     l("iptables -P OUTPUT DROP".into());
@@ -587,6 +594,9 @@ pub fn render_entrypoint_root(plan: &AgentContainer, core_host: &str) -> String 
     ));
     s
 }
+
+/// Where `embarch agent up` writes Core's address, under the definition folder.
+pub const CORE_ADDR_START_FILE: &str = "start/core-addr";
 
 /// The skill's file in the definition folder, which the agent half copies
 /// into the clone (decision 66).
@@ -805,7 +815,7 @@ pub fn parse_sdk_version(text: &str) -> Option<String> {
     (core_ok && suffix_ok).then(|| v.to_string())
 }
 
-fn sha256_hex(bytes: &[u8]) -> String {
+pub(crate) fn sha256_hex(bytes: &[u8]) -> String {
     Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
 }
 
