@@ -5,6 +5,7 @@
 //! detection, `setup`, `init`, `up`/`down`, `doctor`, and `status`. Release CI
 //! and dogfooding the guide are what remains.
 
+mod agent;
 mod config;
 mod desk;
 mod deploy;
