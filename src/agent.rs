@@ -149,6 +149,8 @@ pub struct AgentContainer {
     pub bin_dir: PathBuf,
     /// Extra `--env` variables; the only ones beyond the fixed set.
     pub env: Vec<(String, String)>,
+    /// What the image carries to build the person's repo (decision 64).
+    pub toolchain: Toolchain,
 }
 
 impl AgentContainer {
@@ -610,6 +612,221 @@ pub fn core_host_findings(script: &str, core_host: &str, core_port: u16) -> Vec<
     out
 }
 
+/// One bind mount the image's west workspace needs.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Mount {
+    /// The project's absolute path on the host.
+    pub source: PathBuf,
+    /// Where it appears in the container: `/work/<path>`.
+    pub target: String,
+    pub read_only: bool,
+}
+
+/// `west list -f "{path} {abspath}"`, **from memory**: the format fields
+/// `{path}` and `{abspath}` are to be checked against the installed west.
+pub const WEST_LIST_FORMAT: &str = "{path} {abspath}";
+
+fn clean_west_path(p: &str) -> String {
+    let p = p.trim().trim_end_matches('/');
+    p.strip_prefix("./").unwrap_or(p).to_string()
+}
+
+/// Parse `west list -f "{path} {abspath}"` as `init` runs it on the host.
+/// Every project but the manifest repo (`manifest_path`, as west prints its
+/// `path`) becomes a read-only `/work/<path>` bind; the manifest repo is the
+/// agent's own clone (EMB-451). A project whose path is absolute or climbs
+/// out with `..` is skipped, since its target would leave `/work`. A line
+/// with no second field is skipped. Pure.
+pub fn west_mounts(west_list: &str, manifest_path: &str) -> Vec<Mount> {
+    let manifest = clean_west_path(manifest_path);
+    let mut out = Vec::new();
+    for line in west_list.lines() {
+        let Some((path, abspath)) = line.trim().split_once(char::is_whitespace) else {
+            continue;
+        };
+        let path = clean_west_path(path);
+        let abspath = abspath.trim();
+        if path.is_empty()
+            || abspath.is_empty()
+            || path == manifest
+            || path.starts_with('/')
+            || path.split('/').any(|c| c == "..")
+        {
+            continue;
+        }
+        out.push(Mount { source: PathBuf::from(abspath), target: format!("{TARGET_WORK}/{path}"), read_only: true });
+    }
+    out
+}
+
+/// The plan's `west_workspace` form of [`west_mounts`]' result.
+pub fn west_projects(mounts: &[Mount]) -> Vec<WestProject> {
+    let prefix = format!("{TARGET_WORK}/");
+    mounts
+        .iter()
+        .filter_map(|m| Some(WestProject { name: m.target.strip_prefix(&prefix)?.to_string(), path: m.source.clone() }))
+        .collect()
+}
+
+/// What the image carries to build the person's repo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Toolchain {
+    /// A Zephyr and west repo (`looks_zephyr_west_shaped`).
+    ZephyrWest {
+        /// `zephyr/SDK_VERSION`, read on the host by `init`.
+        sdk_version: String,
+        /// SDK toolchains to install (`setup.sh -t`). **Assumed:** `init`
+        /// has no source for the person's SoC yet, so the caller names them.
+        sdk_toolchains: Vec<String>,
+        /// `zephyr/scripts/requirements*.txt`: file name and the SHA-256 of
+        /// its contents. The caller puts the files in the build context
+        /// under `requirements/`; the hash makes a changed file a new tag.
+        requirements: Vec<(String, String)>,
+    },
+    /// Anything else: no toolchain lines and no workspace mounts. That case
+    /// is otherwise out of decision 64's pass.
+    NotWest,
+}
+
+impl Toolchain {
+    /// Choose from what `init` found: `shaped` is `looks_zephyr_west_shaped`;
+    /// `sdk_version_text` is `zephyr/SDK_VERSION`. A shaped repo with no
+    /// readable SDK version is `NotWest`: the image must not guess one.
+    pub fn from_workspace(
+        shaped: bool,
+        sdk_version_text: Option<&str>,
+        sdk_toolchains: &[&str],
+        requirements: &[(&str, &str)],
+    ) -> Toolchain {
+        let version = sdk_version_text.and_then(parse_sdk_version);
+        match (shaped, version) {
+            (true, Some(sdk_version)) => Toolchain::ZephyrWest {
+                sdk_version,
+                sdk_toolchains: sdk_toolchains.iter().map(|s| s.to_string()).collect(),
+                requirements: requirements
+                    .iter()
+                    .map(|(name, text)| (name.to_string(), sha256_hex(text.as_bytes())))
+                    .collect(),
+            },
+            _ => Toolchain::NotWest,
+        }
+    }
+}
+
+/// The first line of `zephyr/SDK_VERSION`, when it is dotted digits with an
+/// optional `-suffix` (`0.16.8`, `0.17.0-rc1`): it goes into a download URL
+/// and a shell line, so anything else is refused.
+pub fn parse_sdk_version(text: &str) -> Option<String> {
+    let v = text.lines().next()?.trim();
+    let (core, suffix) = v.split_once('-').map_or((v, None), |(c, s)| (c, Some(s)));
+    let core_ok = !core.is_empty() && core.split('.').all(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    let suffix_ok = suffix.is_none_or(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric()));
+    (core_ok && suffix_ok).then(|| v.to_string())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    Sha256::digest(bytes).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Binary the root script calls, and the Debian package that provides it.
+/// Held as data so a test can hold the script to it.
+pub const FIREWALL_BINARIES: [(&str, &str); 9] = [
+    ("iptables", "iptables"),
+    ("ip6tables", "iptables"),
+    ("ipset", "ipset"),
+    ("nc", "netcat-openbsd"),
+    ("getent", "libc-bin"),
+    ("timeout", "coreutils"),
+    ("setpriv", "util-linux"),
+    ("awk", "gawk"),
+    ("sort", "coreutils"),
+];
+
+/// Packages the Zephyr build needs, **from memory** of Zephyr's Getting
+/// Started list: to be checked against the pinned Zephyr's documentation.
+const ZEPHYR_PACKAGES: [&str; 13] = [
+    "build-essential", "ca-certificates", "ccache", "cmake", "curl", "device-tree-compiler", "file", "git", "gperf",
+    "ninja-build", "python3", "python3-pip", "python3-venv",
+];
+
+const BASE_IMAGE: &str = "debian:bookworm-slim";
+const SDK_DIR: &str = "/opt/zephyr-sdk";
+const VENV_DIR: &str = "/opt/venv";
+
+/// The Containerfile for the plan, pure text (decision 64). Nothing builds
+/// it here. The tag is [`image_tag`] of this text.
+pub fn render_containerfile(plan: &AgentContainer) -> String {
+    let mut pkgs: Vec<&str> = FIREWALL_BINARIES.iter().map(|(_, p)| *p).collect();
+    pkgs.push("git");
+    pkgs.push("xz-utils");
+    pkgs.push("wget");
+    if matches!(plan.toolchain, Toolchain::ZephyrWest { .. }) {
+        pkgs.extend(ZEPHYR_PACKAGES);
+    }
+    // `curl` is how Claude Code is installed below, for every repo.
+    pkgs.push("curl");
+    pkgs.push("ca-certificates");
+    pkgs.sort_unstable();
+    pkgs.dedup();
+
+    let mut s = String::new();
+    let mut l = |line: &str| {
+        s.push_str(line);
+        s.push('\n');
+    };
+    l("# Written by embarch (umbrella decision 64). Nothing here is built by embarch-umbrella;");
+    l("# the tag is the SHA-256 of this text, so a changed file is a new image.");
+    l(&format!("FROM {BASE_IMAGE}"));
+    l("ENV DEBIAN_FRONTEND=noninteractive");
+    l("# The firewall script's binaries (decision 63), then git and the tools below. No sudo.");
+    l("RUN apt-get update \\");
+    l(" && apt-get install -y --no-install-recommends \\");
+    for p in &pkgs {
+        l(&format!("    {p} \\"));
+    }
+    l(" && rm -rf /var/lib/apt/lists/*");
+    match &plan.toolchain {
+        Toolchain::NotWest => {
+            l("# Toolchain: this repo is not a Zephyr and west repo. No SDK, west or Python requirements are");
+            l("# installed and no west workspace is mounted; a later pass owns that case.");
+        }
+        Toolchain::ZephyrWest { sdk_version, sdk_toolchains, requirements } => {
+            l("# Zephyr SDK at the version the workspace pins (zephyr/SDK_VERSION). URL and setup flags");
+            l("# are from memory of the SDK's release layout: check against the installed SDK.");
+            let v = sdk_version;
+            l(&format!("RUN wget -q https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v{v}/zephyr-sdk-{v}_linux-x86_64_minimal.tar.xz \\"));
+            l(&format!(" && mkdir -p {SDK_DIR} \\"));
+            l(&format!(" && tar -xJf zephyr-sdk-{v}_linux-x86_64_minimal.tar.xz --strip-components=1 -C {SDK_DIR} \\"));
+            l(&format!(" && rm zephyr-sdk-{v}_linux-x86_64_minimal.tar.xz \\"));
+            let targets: String = sdk_toolchains.iter().map(|t| format!(" -t {t}")).collect();
+            l(&format!(" && {SDK_DIR}/setup.sh{targets} -h -c"));
+            l(&format!("ENV ZEPHYR_SDK_INSTALL_DIR={SDK_DIR} ZEPHYR_TOOLCHAIN_VARIANT=zephyr"));
+            l("# west and the workspace's Python requirements, in a venv (Debian refuses a system-wide pip).");
+            l(&format!("RUN python3 -m venv {VENV_DIR} && {VENV_DIR}/bin/pip install --no-cache-dir west"));
+            l(&format!("ENV PATH={VENV_DIR}/bin:$PATH"));
+            for (name, sha) in requirements {
+                l(&format!("# {name} sha256 {sha}"));
+                l(&format!("COPY requirements/{name} /tmp/requirements/{name}"));
+                l(&format!("RUN pip install --no-cache-dir -r /tmp/requirements/{name}"));
+            }
+        }
+    }
+    l(&format!("RUN useradd --create-home --uid {AGENT_UID} --shell /bin/sh agent"));
+    l("# Claude Code, installed as its documentation says (native installer, from memory: check it).");
+    l("USER agent");
+    l("RUN curl -fsSL https://claude.ai/install.sh | bash");
+    l("ENV PATH=/home/agent/.local/bin:$PATH");
+    l("# The entrypoint is the root script (decision 63), which drops to the agent user itself.");
+    l("USER root");
+    s
+}
+
+/// The image tag: `embarch-agent:` and the SHA-256 of the Containerfile
+/// text. Equal text, equal tag; any change, a new one.
+pub fn image_tag(containerfile: &str) -> String {
+    format!("embarch-agent:{}", sha256_hex(containerfile.as_bytes()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -634,6 +851,7 @@ mod tests {
             exchange_dir: "/h/.local/share/embarch/agents/bench1".into(),
             bin_dir: "/opt/embarch/bin-host".into(),
             env: vec![("EMBARCH_LOG".into(), "info".into())],
+            toolchain: Toolchain::NotWest,
         }
     }
 
@@ -946,5 +1164,269 @@ exec setpriv --reuid=1000 --regid=1000 --clear-groups --inh-caps=-all --ambient-
         assert_eq!(rec.network.allow, ["<core-addr>:7010", "api.anthropic.com", "console.anthropic.com"]);
         assert_eq!(rec.allowed_hosts(), p.network_allow);
         assert!(!container_toml(&p).contains("10.0.0.1"));
+    }
+
+    // ---- decision 64: the image and the west mounts ----
+
+    struct Fixture(PathBuf);
+    impl Fixture {
+        fn new(tag: &str) -> Fixture {
+            static N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+            let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let d = std::env::temp_dir().join(format!("embarch-agent-114-{tag}-{}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&d);
+            std::fs::create_dir_all(&d).unwrap();
+            Fixture(d)
+        }
+        fn write(&self, rel: &str, text: &str) {
+            let p = self.0.join(rel);
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(p, text).unwrap();
+        }
+    }
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// A Zephyr and west workspace: `init`'s own shape check passes on it.
+    fn west_fixture() -> Fixture {
+        let f = Fixture::new("west");
+        f.write("fw/boards/acme/b1/board.yml", "board:\n  name: b1\n");
+        f.write("fw/app/main/CMakeLists.txt", "project(main)\n");
+        f.write("zephyr/SDK_VERSION", "0.16.8\n");
+        f.write("zephyr/scripts/requirements-base.txt", "pyyaml\n");
+        f.write("zephyr/scripts/requirements-run-test.txt", "pytest\n");
+        f
+    }
+
+    fn toolchain_of(f: &Fixture) -> Toolchain {
+        let sdk = std::fs::read_to_string(f.0.join("zephyr/SDK_VERSION")).ok();
+        let mut reqs: Vec<(String, String)> = Vec::new();
+        if let Ok(rd) = std::fs::read_dir(f.0.join("zephyr/scripts")) {
+            for e in rd.flatten() {
+                let name = e.file_name().to_string_lossy().into_owned();
+                if name.starts_with("requirements") && name.ends_with(".txt") {
+                    reqs.push((name, std::fs::read_to_string(e.path()).unwrap()));
+                }
+            }
+        }
+        reqs.sort();
+        let reqs: Vec<(&str, &str)> = reqs.iter().map(|(a, b)| (a.as_str(), b.as_str())).collect();
+        let shaped = crate::zephyr::looks_zephyr_west_shaped(&f.0.join("fw"));
+        Toolchain::from_workspace(shaped, sdk.as_deref(), &["arm-zephyr-eabi"], &reqs)
+    }
+
+    fn plan_with(t: Toolchain) -> AgentContainer {
+        let mut p = plan(Topology::Linux);
+        p.toolchain = t;
+        p
+    }
+
+    const GOLDEN_CONTAINERFILE_NOT_WEST_HEAD: &str = "# Written by embarch (umbrella decision 64). Nothing here is built by embarch-umbrella;\n# the tag is the SHA-256 of this text, so a changed file is a new image.\nFROM debian:bookworm-slim\nENV DEBIAN_FRONTEND=noninteractive\n";
+
+    #[test]
+    fn containerfile_is_golden_with_the_sdk_version_from_the_fixture() {
+        let f = west_fixture();
+        let t = toolchain_of(&f);
+        assert!(matches!(&t, Toolchain::ZephyrWest { sdk_version, .. } if sdk_version == "0.16.8"));
+        let got = render_containerfile(&plan_with(t));
+        let h_base = sha256_hex(b"pyyaml\n");
+        let h_run = sha256_hex(b"pytest\n");
+        let want = format!(
+            "# Written by embarch (umbrella decision 64). Nothing here is built by embarch-umbrella;
+# the tag is the SHA-256 of this text, so a changed file is a new image.
+FROM debian:bookworm-slim
+ENV DEBIAN_FRONTEND=noninteractive
+# The firewall script's binaries (decision 63), then git and the tools below. No sudo.
+RUN apt-get update \\
+ && apt-get install -y --no-install-recommends \\
+    build-essential \\
+    ca-certificates \\
+    ccache \\
+    cmake \\
+    coreutils \\
+    curl \\
+    device-tree-compiler \\
+    file \\
+    gawk \\
+    git \\
+    gperf \\
+    ipset \\
+    iptables \\
+    libc-bin \\
+    netcat-openbsd \\
+    ninja-build \\
+    python3 \\
+    python3-pip \\
+    python3-venv \\
+    util-linux \\
+    wget \\
+    xz-utils \\
+ && rm -rf /var/lib/apt/lists/*
+# Zephyr SDK at the version the workspace pins (zephyr/SDK_VERSION). URL and setup flags
+# are from memory of the SDK's release layout: check against the installed SDK.
+RUN wget -q https://github.com/zephyrproject-rtos/sdk-ng/releases/download/v0.16.8/zephyr-sdk-0.16.8_linux-x86_64_minimal.tar.xz \\
+ && mkdir -p /opt/zephyr-sdk \\
+ && tar -xJf zephyr-sdk-0.16.8_linux-x86_64_minimal.tar.xz --strip-components=1 -C /opt/zephyr-sdk \\
+ && rm zephyr-sdk-0.16.8_linux-x86_64_minimal.tar.xz \\
+ && /opt/zephyr-sdk/setup.sh -t arm-zephyr-eabi -h -c
+ENV ZEPHYR_SDK_INSTALL_DIR=/opt/zephyr-sdk ZEPHYR_TOOLCHAIN_VARIANT=zephyr
+# west and the workspace's Python requirements, in a venv (Debian refuses a system-wide pip).
+RUN python3 -m venv /opt/venv && /opt/venv/bin/pip install --no-cache-dir west
+ENV PATH=/opt/venv/bin:$PATH
+# requirements-base.txt sha256 {h_base}
+COPY requirements/requirements-base.txt /tmp/requirements/requirements-base.txt
+RUN pip install --no-cache-dir -r /tmp/requirements/requirements-base.txt
+# requirements-run-test.txt sha256 {h_run}
+COPY requirements/requirements-run-test.txt /tmp/requirements/requirements-run-test.txt
+RUN pip install --no-cache-dir -r /tmp/requirements/requirements-run-test.txt
+RUN useradd --create-home --uid 1000 --shell /bin/sh agent
+# Claude Code, installed as its documentation says (native installer, from memory: check it).
+USER agent
+RUN curl -fsSL https://claude.ai/install.sh | bash
+ENV PATH=/home/agent/.local/bin:$PATH
+# The entrypoint is the root script (decision 63), which drops to the agent user itself.
+USER root
+"
+        );
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    fn the_image_installs_every_binary_the_root_script_calls() {
+        let script = render_entrypoint_root(&plan(Topology::Linux), "10.0.0.1");
+        // Every command the script runs: the first word of each pipeline stage.
+        let known: Vec<&str> = FIREWALL_BINARIES.iter().map(|(b, _)| *b).collect();
+        let skip = [
+            "exit", "echo", "set", "exec", "fail", "check", "case", "esac", "[", "done", "fi", "do", "then", "continue", "for", "if",
+            "ok=1", "!",
+        ];
+        let mut called: Vec<String> = Vec::new();
+        for line in script.lines() {
+            if line.starts_with('#') {
+                continue;
+            }
+            let mut text = line.replace("$(", "|").replace("&&", "|").replace("||", "|").replace(';', "|");
+            for kw in ["then ", "do ", "if "] {
+                text = text.replace(kw, "|");
+            }
+            for stage in text.split('|') {
+                let w = stage.trim().trim_start_matches('!').trim();
+                let w = w.split_whitespace().next().unwrap_or("");
+                if w.is_empty() || w.contains('=') || w.starts_with('"') || w.starts_with('\'') || w.starts_with('$') {
+                    continue;
+                }
+                if w.starts_with("for") || w.starts_with("case") || w.starts_with("fail") || w.starts_with("check") {
+                    continue;
+                }
+                if skip.contains(&w) || w.ends_with(')') || w.ends_with('}') {
+                    continue;
+                }
+                called.push(w.to_string());
+            }
+        }
+        called.sort();
+        called.dedup();
+        for c in &called {
+            assert!(known.contains(&c.as_str()), "the script calls {c}, which FIREWALL_BINARIES does not name");
+        }
+        for b in known {
+            assert!(script.contains(b), "FIREWALL_BINARIES names {b}, which the script does not call");
+        }
+        for tc in [Toolchain::NotWest, toolchain_of(&west_fixture())] {
+            let cf = render_containerfile(&plan_with(tc));
+            for (b, pkg) in FIREWALL_BINARIES {
+                assert!(cf.contains(&format!("    {pkg} \\\n")), "{b}: package {pkg} missing");
+            }
+            assert!(!cf.contains("    sudo \\\n"));
+            assert!(cf.contains("useradd --create-home --uid 1000"));
+        }
+    }
+
+    const WEST_LIST: &str = "app /ws/app\nzephyr /ws/zephyr\nmodules/hal/nordic /ws/modules/hal/nordic\nbootloader/mcuboot /ws/bootloader/mcuboot\n";
+
+    #[test]
+    fn west_list_gives_read_only_mounts_without_the_manifest_repo() {
+        let m = west_mounts(WEST_LIST, "app");
+        let got: Vec<(String, String, bool)> =
+            m.iter().map(|m| (m.source.to_string_lossy().into_owned(), m.target.clone(), m.read_only)).collect();
+        assert_eq!(
+            got,
+            vec![
+                ("/ws/zephyr".into(), "/work/zephyr".into(), true),
+                ("/ws/modules/hal/nordic".into(), "/work/modules/hal/nordic".into(), true),
+                ("/ws/bootloader/mcuboot".into(), "/work/bootloader/mcuboot".into(), true),
+            ]
+        );
+        assert!(m.iter().all(|m| m.target != "/work/app"));
+        // `./app/` is the same repo.
+        assert_eq!(west_mounts(WEST_LIST, "./app/"), m);
+    }
+
+    #[test]
+    fn west_mounts_skip_paths_that_leave_work_and_malformed_lines() {
+        let m = west_mounts("../x /ws/x\n/abs /ws/abs\nlonely\n\nok /ws/ok\n", "none");
+        assert_eq!(m.len(), 1);
+        assert_eq!(m[0].target, "/work/ok");
+    }
+
+    #[test]
+    fn west_mounts_pass_the_run_args_scan() {
+        let mut p = plan(Topology::Linux);
+        p.west_workspace = west_projects(&west_mounts(WEST_LIST, "app"));
+        assert_eq!(p.west_workspace.len(), 3);
+        let a = try_run_args(&p, "10.0.0.1").unwrap();
+        assert!(a.contains(&"--mount=type=bind,source=/ws/modules/hal/nordic,target=/work/modules/hal/nordic,readonly".to_string()));
+    }
+
+    #[test]
+    fn a_non_west_repo_gets_no_mounts_and_the_toolchain_comment() {
+        let f = Fixture::new("plain");
+        f.write("src/main.c", "int main(void){return 0;}\n");
+        f.write("zephyr/SDK_VERSION", "0.16.8\n");
+        assert!(!crate::zephyr::looks_zephyr_west_shaped(&f.0));
+        let t = Toolchain::from_workspace(false, Some("0.16.8"), &["arm-zephyr-eabi"], &[]);
+        assert_eq!(t, Toolchain::NotWest);
+        assert!(west_mounts("", "").is_empty());
+        let cf = render_containerfile(&plan_with(t));
+        assert!(cf.starts_with(GOLDEN_CONTAINERFILE_NOT_WEST_HEAD));
+        assert!(cf.contains("# Toolchain: this repo is not a Zephyr and west repo."));
+        assert!(!cf.contains("zephyr-sdk") && !cf.contains("venv"));
+        assert!(!cf.contains("RUN wget") && !cf.contains("pip install"));
+    }
+
+    #[test]
+    fn a_shaped_repo_with_no_readable_sdk_version_is_not_given_a_guess() {
+        assert_eq!(Toolchain::from_workspace(true, None, &[], &[]), Toolchain::NotWest);
+        for bad in ["", "latest\n", "0.16.8; rm -rf /\n", "../x", "0..1"] {
+            assert_eq!(parse_sdk_version(bad), None, "{bad:?}");
+        }
+        assert_eq!(parse_sdk_version("0.17.0-rc1\nignored"), Some("0.17.0-rc1".into()));
+    }
+
+    #[test]
+    fn the_tag_changes_when_the_text_changes_and_only_then() {
+        let f = west_fixture();
+        let a = render_containerfile(&plan_with(toolchain_of(&f)));
+        let a2 = render_containerfile(&plan_with(toolchain_of(&f)));
+        assert_eq!(image_tag(&a), image_tag(&a2));
+        assert_eq!(image_tag(&a), format!("embarch-agent:{}", sha256_hex(a.as_bytes())));
+        // A new SDK pin.
+        f.write("zephyr/SDK_VERSION", "0.17.0\n");
+        assert_ne!(image_tag(&a), image_tag(&render_containerfile(&plan_with(toolchain_of(&f)))));
+        f.write("zephyr/SDK_VERSION", "0.16.8\n");
+        // A changed requirements file, with the same names.
+        f.write("zephyr/scripts/requirements-base.txt", "pyyaml\nextra\n");
+        assert_ne!(image_tag(&a), image_tag(&render_containerfile(&plan_with(toolchain_of(&f)))));
+        f.write("zephyr/scripts/requirements-base.txt", "pyyaml\n");
+        assert_eq!(image_tag(&a), image_tag(&render_containerfile(&plan_with(toolchain_of(&f)))));
+        // Things that are not in the text do not move it: the name, the Core port, the mounts.
+        let mut p = plan_with(toolchain_of(&f));
+        p.name = "other".into();
+        p.core_port = 1;
+        p.west_workspace.clear();
+        assert_eq!(image_tag(&render_containerfile(&p)), image_tag(&a));
     }
 }
