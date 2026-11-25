@@ -63,6 +63,30 @@ pub struct State {
     pub deploy_windows_root: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub deploy_cargo_exe: Option<PathBuf>,
+    /// Every firmware repo `embarch init` ran in, so the elevated install can
+    /// later write `embarch/core-fingerprint` into each (decision 65). The
+    /// field defaults: a file written before it existed loads with none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub registered_repos: Vec<RegisteredRepo>,
+}
+
+/// One repo `embarch init` registered.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisteredRepo {
+    pub path: PathBuf,
+    /// Set when `init --container` ran here; a repo without one is registered
+    /// too.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<RegisteredContainer>,
+}
+
+/// The agent's container for one repo: its name and the two folders `init`
+/// created for it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RegisteredContainer {
+    pub name: String,
+    pub definition_dir: PathBuf,
+    pub exchange_dir: PathBuf,
 }
 
 /// Resolve the config directory from environment values.
@@ -187,6 +211,7 @@ mod tests {
             deploy_source_root: Some(PathBuf::from("/home/me/Github/embarch")),
             deploy_windows_root: None,
             deploy_cargo_exe: None,
+            registered_repos: vec![],
         };
         let text = toml::to_string_pretty(&state).unwrap();
         // Match the key, not the substring — `topology = "wsl-host"` contains

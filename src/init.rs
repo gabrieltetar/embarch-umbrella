@@ -12,6 +12,8 @@ use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 
+use crate::agent::Runtime;
+use crate::agent_init;
 use crate::locate;
 
 const EXCLUDE_MARKER: &str = "# added by `embarch init`";
@@ -670,7 +672,70 @@ fn register_mcp(api: &Path, config: &Path) -> bool {
     }
 }
 
-pub fn init(uninstall: bool, dry_run: bool) -> i32 {
+/// `embarch init`: the in-repo steps, then what lives outside the repo —
+/// registering it and, with `--container`, the agent's container (decision 65).
+pub fn init(uninstall: bool, dry_run: bool, container: Option<Runtime>) -> i32 {
+    let code = init_repo(uninstall, dry_run);
+    if code != 0 {
+        return code;
+    }
+    let Some(repo) = std::env::current_dir().ok().and_then(|c| find_repo_root(&c)) else {
+        return code;
+    };
+    let state_path = match crate::state::state_path() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("{e:#}");
+            return 1;
+        }
+    };
+    let host = match agent_init::host_from_env(&repo, state_path) {
+        Ok(h) => h,
+        Err(e) => {
+            eprintln!("{e:#}");
+            return 1;
+        }
+    };
+    let print = |lines: Vec<String>| lines.iter().for_each(|l| println!("{l}"));
+    println!();
+    match (uninstall, dry_run) {
+        (true, true) => print(agent_init::plan_uninstall(&repo, &host)),
+        (true, false) => {
+            let mut confirm = |q: &str| {
+                use std::io::Write;
+                print!("{q}: ");
+                let _ = std::io::stdout().flush();
+                let mut answer = String::new();
+                std::io::stdin().read_line(&mut answer).is_ok() && answer.trim() == "yes"
+            };
+            match agent_init::uninstall_repo(&repo, &host, &mut confirm) {
+                Ok(lines) => print(lines),
+                Err(e) => {
+                    eprintln!("{e:#}");
+                    return 1;
+                }
+            }
+        }
+        (false, _) => {
+            let shaped = crate::zephyr::looks_zephyr_west_shaped(&repo);
+            let facts = agent_init::read_workspace_facts(&repo, shaped);
+            if dry_run {
+                print(agent_init::plan_repo(&repo, container, &host, &facts));
+            } else {
+                match agent_init::setup_repo(&repo, container, &host, &facts) {
+                    Ok(lines) => print(lines),
+                    Err(e) => {
+                        eprintln!("{e:#}");
+                        return 1;
+                    }
+                }
+            }
+        }
+    }
+    0
+}
+
+fn init_repo(uninstall: bool, dry_run: bool) -> i32 {
     let cwd = match std::env::current_dir() {
         Ok(d) => d,
         Err(e) => {

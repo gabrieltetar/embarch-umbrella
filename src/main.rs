@@ -11,6 +11,7 @@ mod desk;
 mod deploy;
 mod doctor;
 mod env;
+mod agent_init;
 mod init;
 mod install;
 mod install_core;
@@ -140,6 +141,13 @@ enum Command {
         /// Print what would be written (or, with `--uninstall`, removed) and change nothing.
         #[arg(long)]
         dry_run: bool,
+        /// Also set up the agent's container: its definition folder and
+        /// exchange folder outside the repo (decision 65). Nothing is built.
+        #[arg(long, conflicts_with = "uninstall")]
+        container: bool,
+        /// The container runtime the definition is rendered for.
+        #[arg(long, requires = "container", value_parser = ["docker", "podman"], default_value = "docker")]
+        runtime: String,
     },
 
     /// Verify the whole chain, with a fix for every failed check.
@@ -253,7 +261,10 @@ async fn main() {
             install_core::run(source, data_dir, allow_downgrade, dry_run, trusted_root, refresh_trust_root)
                 .await
         }
-        Command::Init { uninstall, dry_run } => init::init(uninstall, dry_run),
+        Command::Init { uninstall, dry_run, container, runtime } => {
+            let runtime = container.then(|| if runtime == "podman" { agent::Runtime::Podman } else { agent::Runtime::Docker });
+            init::init(uninstall, dry_run, runtime)
+        }
         Command::Doctor { json } => doctor::doctor(json).await,
         Command::Up { foreground } => setup::up(foreground),
         Command::Down => setup::down(),

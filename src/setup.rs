@@ -387,6 +387,9 @@ fn apply_plan(
         deploy_source_root: previously_saved.deploy_source_root,
         deploy_windows_root: previously_saved.deploy_windows_root,
         deploy_cargo_exe: previously_saved.deploy_cargo_exe,
+        // `init`'s registry is its own (decision 65); carried through for the
+        // same reason.
+        registered_repos: previously_saved.registered_repos,
     };
     match (&loc.state_path, dry_run) {
         (Some(p), true) => println!(
