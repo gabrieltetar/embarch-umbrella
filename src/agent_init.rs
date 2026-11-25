@@ -13,7 +13,7 @@ use std::process::Command;
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::agent::{
-    container_toml, image_tag, render_containerfile, render_entrypoint_root, west_mounts, west_projects,
+    container_toml, image_tag, render_containerfile, render_entrypoint_agent, render_entrypoint_root, DEFINITION_SKILL_FILE, west_mounts, west_projects,
     AgentContainer, Runtime, Toolchain, Topology, CORE_ADDR_PLACEHOLDER,
 };
 use crate::install;
@@ -192,8 +192,7 @@ pub fn build_plan(
 
 /// The clone's config template (decision 65): Core is found at first use
 /// (container mode overrides the address later), builds under `/work/build`,
-/// published files under the outbox. The clone's path is **assumed** to be
-/// `/work/<repo folder>`; EMB-451 owns where it really is.
+/// published files under the outbox. The clone sits at `/work/<repo folder>` (decision 66).
 pub fn render_clone_config(plan: &AgentContainer) -> String {
     let folder = plan.repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
     let project = if matches!(plan.toolchain, Toolchain::ZephyrWest { .. }) {
@@ -220,6 +219,9 @@ pub fn definition_files(plan: &AgentContainer) -> Vec<(&'static str, String)> {
         // script carries the placeholder and the start (EMB-448) substitutes it.
         ("entrypoint-root.sh", render_entrypoint_root(plan, CORE_ADDR_PLACEHOLDER)),
         (CLONE_CONFIG_FILE, render_clone_config(plan)),
+        // The agent half (decision 66) and the skill it copies into the clone.
+        ("entrypoint-agent.sh", render_entrypoint_agent(plan)),
+        (DEFINITION_SKILL_FILE, crate::init::SKILL_TEXT.to_string()),
     ]
 }
 
@@ -509,7 +511,7 @@ mod tests {
         setup_repo(&repo, Some(Runtime::Docker), &host, &zephyr_facts()).unwrap();
         let def = host.roots.definition_root.join("fw");
         let ex = host.roots.exchange_root.join("fw");
-        for f in ["Containerfile", "container.toml", "entrypoint-root.sh", CLONE_CONFIG_FILE] {
+        for f in ["Containerfile", "container.toml", "entrypoint-root.sh", "entrypoint-agent.sh", DEFINITION_SKILL_FILE, CLONE_CONFIG_FILE] {
             assert!(def.join(f).is_file(), "{f}");
         }
         assert!(ex.join("exchange.git/HEAD").is_file());

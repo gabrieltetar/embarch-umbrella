@@ -588,6 +588,87 @@ pub fn render_entrypoint_root(plan: &AgentContainer, core_host: &str) -> String 
     s
 }
 
+/// The skill's file in the definition folder, which the agent half copies
+/// into the clone (decision 66).
+pub const DEFINITION_SKILL_FILE: &str = "embarch-hil-SKILL.md";
+/// The clone's config template in the definition folder (decision 65).
+pub const DEFINITION_CONFIG_TEMPLATE: &str = "embarch.toml.template";
+/// The first-start marker, inside the `/work` volume.
+const SEEDED_MARKER: &str = "/work/.embarch-seeded";
+
+/// The folder name of the person's repo, which is the manifest path and the
+/// clone's name under `/work` (decisions 65 and 66).
+pub fn clone_folder(plan: &AgentContainer) -> String {
+    plan.repo.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// The agent half of the entrypoint (decision 66), run as uid 1000 by the
+/// root half's final `exec`. Pure text. See [`render_entrypoint_agent_at`].
+pub fn render_entrypoint_agent(plan: &AgentContainer) -> String {
+    render_entrypoint_agent_at(plan, "")
+}
+
+/// [`render_entrypoint_agent`] with every container path under `root`, so a
+/// shell test can run it against temp folders. `root` is empty in the real
+/// script.
+pub fn render_entrypoint_agent_at(plan: &AgentContainer, root: &str) -> String {
+    let folder = clone_folder(plan);
+    let mut s = String::new();
+    let mut l = |line: &str| {
+        s.push_str(line);
+        s.push('\n');
+    };
+    l("#!/bin/sh");
+    l("# Written by embarch (umbrella decision 66). The agent half, run as the agent user after");
+    l("# the root half. It runs nothing from the person's repo: no hook, no west update, no build.");
+    l("set -eu");
+    l("fail() { echo \"embarch-agent: $*\" >&2; exit 1; }");
+    l(&format!("SRC={}", sh_quote(&format!("{root}{TARGET_PERSON_REPO}"))));
+    l(&format!("CLONE={}", sh_quote(&format!("{root}{TARGET_WORK}/{folder}"))));
+    l(&format!("WORK={}", sh_quote(&format!("{root}{TARGET_WORK}"))));
+    l(&format!("MARKER={}", sh_quote(&format!("{root}{SEEDED_MARKER}"))));
+    l(&format!("OUTBOX={}", sh_quote(&format!("{root}{TARGET_OUTBOX}"))));
+    l(&format!("DEF={}", sh_quote(&format!("{root}{TARGET_DEFINITION}"))));
+    l(&format!("EXCHANGE={}", sh_quote(&format!("{root}{TARGET_EXCHANGE}"))));
+    l(&format!("API={}", sh_quote(&format!("{root}{TARGET_BIN}/embarch-api"))));
+    l(&format!("export CLAUDE_CONFIG_DIR={}", sh_quote(&format!("{root}{TARGET_CLAUDE_CONFIG}"))));
+    l("exclude() {");
+    l("  grep -qxF \"$1\" \"$CLONE/.git/info/exclude\" 2>/dev/null && return 0");
+    l("  mkdir -p \"$CLONE/.git/info\"");
+    l("  printf '%s\\n' \"$1\" >> \"$CLONE/.git/info/exclude\"");
+    l("}");
+    l("seed() {");
+    l("  [ ! -e \"$CLONE\" ] || fail \"$CLONE exists but the first start never finished: remove it and start again\"");
+    l("  git -c safe.directory=\"$SRC\" clone --no-local \"$SRC\" \"$CLONE\"");
+    l("  git -C \"$CLONE\" remote remove origin");
+    l("  git -C \"$CLONE\" remote add person \"$EXCHANGE\"");
+    l("  mkdir -p \"$WORK/.west\"");
+    l(&format!("  printf '[manifest]\\npath = %s\\n' {} > \"$WORK/.west/config\"", sh_quote(&folder)));
+    l("  [ ! -e \"$CLONE/embarch\" ] || fail \"$CLONE/embarch is already there: the repo tracks an embarch folder\"");
+    l("  mkdir -p \"$OUTBOX/embarch\"");
+    l(&format!("  cp \"$DEF/{DEFINITION_CONFIG_TEMPLATE}\" \"$OUTBOX/embarch/embarch.toml\""));
+    l("  ln -s \"$OUTBOX/embarch\" \"$CLONE/embarch\"");
+    l("  exclude embarch");
+    l("  mkdir -p \"$CLONE/.claude/skills/embarch-hil\"");
+    l(&format!("  cp \"$DEF/{DEFINITION_SKILL_FILE}\" \"$CLONE/.claude/skills/embarch-hil/SKILL.md\""));
+    l("  exclude .claude/skills/embarch-hil/");
+    l("  (cd \"$CLONE\" && claude mcp add embarch -- \"$API\" --config \"$CLONE/embarch/embarch.toml\")");
+    l("  touch \"$MARKER\"");
+    l("}");
+    l("sync_outbox() {");
+    l("  [ -d \"$SRC/embarch\" ] || return 0");
+    l("  (cd \"$SRC/embarch\" && find . \\( -path ./build -o -path ./embarch.toml \\) -prune -o -type f -print) | while IFS= read -r f; do");
+    l("    if [ -e \"$OUTBOX/embarch/$f\" ] || [ -L \"$OUTBOX/embarch/$f\" ]; then continue; fi");
+    l("    mkdir -p \"$(dirname \"$OUTBOX/embarch/$f\")\"");
+    l("    cp \"$SRC/embarch/$f\" \"$OUTBOX/embarch/$f\"");
+    l("  done");
+    l("}");
+    l("[ -e \"$MARKER\" ] || seed");
+    l("sync_outbox");
+    l("if [ \"$#\" -gt 0 ]; then exec \"$@\"; fi");
+    s
+}
+
 /// What a rendered script allows on Core's host beyond Core's own port: every
 /// rule that names Core's address and a port other than `core_port`, and any
 /// rule that names the host without a port. Empty means clean.
@@ -634,7 +715,7 @@ fn clean_west_path(p: &str) -> String {
 /// Parse `west list -f "{path} {abspath}"` as `init` runs it on the host.
 /// Every project but the manifest repo (`manifest_path`, as west prints its
 /// `path`) becomes a read-only `/work/<path>` bind; the manifest repo is the
-/// agent's own clone (EMB-451). A project whose path is absolute or climbs
+/// agent's own clone (decision 66). A project whose path is absolute or climbs
 /// out with `..` is skipped, since its target would leave `/work`. A line
 /// with no second field is skipped. Pure.
 pub fn west_mounts(west_list: &str, manifest_path: &str) -> Vec<Mount> {
@@ -1428,5 +1509,205 @@ USER root
         p.core_port = 1;
         p.west_workspace.clear();
         assert_eq!(image_tag(&render_containerfile(&p)), image_tag(&a));
+    }
+
+    // The agent half (decision 66).
+
+    #[test]
+    fn the_agent_half_is_golden() {
+        let want = r#"#!/bin/sh
+# Written by embarch (umbrella decision 66). The agent half, run as the agent user after
+# the root half. It runs nothing from the person's repo: no hook, no west update, no build.
+set -eu
+fail() { echo "embarch-agent: $*" >&2; exit 1; }
+SRC='/person/repo'
+CLONE='/work/fw'
+WORK='/work'
+MARKER='/work/.embarch-seeded'
+OUTBOX='/outbox'
+DEF='/etc/embarch-agent'
+EXCHANGE='/exchange.git'
+API='/opt/embarch/bin/embarch-api'
+export CLAUDE_CONFIG_DIR='/home/agent/.claude'
+exclude() {
+  grep -qxF "$1" "$CLONE/.git/info/exclude" 2>/dev/null && return 0
+  mkdir -p "$CLONE/.git/info"
+  printf '%s\n' "$1" >> "$CLONE/.git/info/exclude"
+}
+seed() {
+  [ ! -e "$CLONE" ] || fail "$CLONE exists but the first start never finished: remove it and start again"
+  git -c safe.directory="$SRC" clone --no-local "$SRC" "$CLONE"
+  git -C "$CLONE" remote remove origin
+  git -C "$CLONE" remote add person "$EXCHANGE"
+  mkdir -p "$WORK/.west"
+  printf '[manifest]\npath = %s\n' 'fw' > "$WORK/.west/config"
+  [ ! -e "$CLONE/embarch" ] || fail "$CLONE/embarch is already there: the repo tracks an embarch folder"
+  mkdir -p "$OUTBOX/embarch"
+  cp "$DEF/embarch.toml.template" "$OUTBOX/embarch/embarch.toml"
+  ln -s "$OUTBOX/embarch" "$CLONE/embarch"
+  exclude embarch
+  mkdir -p "$CLONE/.claude/skills/embarch-hil"
+  cp "$DEF/embarch-hil-SKILL.md" "$CLONE/.claude/skills/embarch-hil/SKILL.md"
+  exclude .claude/skills/embarch-hil/
+  (cd "$CLONE" && claude mcp add embarch -- "$API" --config "$CLONE/embarch/embarch.toml")
+  touch "$MARKER"
+}
+sync_outbox() {
+  [ -d "$SRC/embarch" ] || return 0
+  (cd "$SRC/embarch" && find . \( -path ./build -o -path ./embarch.toml \) -prune -o -type f -print) | while IFS= read -r f; do
+    if [ -e "$OUTBOX/embarch/$f" ] || [ -L "$OUTBOX/embarch/$f" ]; then continue; fi
+    mkdir -p "$(dirname "$OUTBOX/embarch/$f")"
+    cp "$SRC/embarch/$f" "$OUTBOX/embarch/$f"
+  done
+}
+[ -e "$MARKER" ] || seed
+sync_outbox
+if [ "$#" -gt 0 ]; then exec "$@"; fi
+"#;
+        assert_eq!(render_entrypoint_agent(&plan(Topology::Linux)), want);
+    }
+
+    struct Tmp(PathBuf);
+    impl Drop for Tmp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn write(p: &Path, text: &str) {
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, text).unwrap();
+    }
+
+    const STUB_GIT: &str = "#!/bin/sh\necho \"git $*\" >> \"$STUB_LOG\"\nwhile [ \"$#\" -gt 0 ]; do\n  case \"$1\" in clone) mkdir -p \"$4/.git/info\"; exit 0 ;; esac\n  shift\ndone\n";
+    const STUB_CLAUDE: &str = "#!/bin/sh\necho \"claude $* (cwd $(pwd) config $CLAUDE_CONFIG_DIR)\" >> \"$STUB_LOG\"\n";
+
+    /// A container's folders under a temp root, with stub `git` and `claude`.
+    struct Sandbox {
+        _t: Tmp,
+        root: PathBuf,
+        script: PathBuf,
+        stubs: PathBuf,
+        log: PathBuf,
+    }
+
+    fn container_box() -> Sandbox {
+        let root = std::env::temp_dir().join(format!(
+            "embarch-agent-half-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+        ));
+        let r = root.to_str().unwrap().to_string();
+        let script = root.join("entrypoint-agent.sh");
+        write(&script, &render_entrypoint_agent_at(&plan(Topology::Linux), &r));
+        let stubs = root.join("stubs");
+        write(&stubs.join("git"), STUB_GIT);
+        write(&stubs.join("claude"), STUB_CLAUDE);
+        for f in ["git", "claude"] {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(stubs.join(f), std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        write(&root.join("person/repo/embarch/a.txt"), "person a\n");
+        write(&root.join("person/repo/embarch/sub/b.txt"), "person b\n");
+        write(&root.join("person/repo/embarch/embarch.toml"), "PERSON CONFIG\n");
+        write(&root.join("person/repo/embarch/build/out.hex"), "hex\n");
+        write(&root.join("etc/embarch-agent/embarch.toml.template"), "TEMPLATE\n");
+        write(&root.join("etc/embarch-agent/embarch-hil-SKILL.md"), "SKILL\n");
+        std::fs::create_dir_all(root.join("work")).unwrap();
+        std::fs::create_dir_all(root.join("outbox")).unwrap();
+        let log = root.join("stub.log");
+        Sandbox { script, stubs, log, root: root.clone(), _t: Tmp(root) }
+    }
+
+    impl Sandbox {
+        fn start(&self) -> std::process::Output {
+            let path = format!("{}:{}", self.stubs.display(), std::env::var("PATH").unwrap());
+            std::process::Command::new("sh")
+                .arg(&self.script)
+                .env("PATH", path)
+                .env("STUB_LOG", &self.log)
+                .output()
+                .unwrap()
+        }
+        fn read(&self, rel: &str) -> String {
+            std::fs::read_to_string(self.root.join(rel)).unwrap_or_default()
+        }
+        fn log(&self) -> String {
+            std::fs::read_to_string(&self.log).unwrap_or_default()
+        }
+    }
+
+    #[test]
+    fn the_first_start_makes_the_clone_the_remote_the_west_config_the_link_and_the_seed() {
+        let b = container_box();
+        let out = b.start();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        let r = b.root.display().to_string();
+        let log = b.log();
+        assert!(
+            log.contains(&format!("git -c safe.directory={r}/person/repo clone --no-local {r}/person/repo {r}/work/fw")),
+            "{log}"
+        );
+        assert!(log.contains(&format!("git -C {r}/work/fw remote remove origin")), "{log}");
+        assert!(log.contains(&format!("git -C {r}/work/fw remote add person {r}/exchange.git")), "{log}");
+        assert_eq!(log.matches("remote add").count(), 1);
+        assert_eq!(b.read("work/.west/config"), "[manifest]\npath = fw\n");
+        let link = std::fs::read_link(b.root.join("work/fw/embarch")).unwrap();
+        assert_eq!(link, b.root.join("outbox/embarch"));
+        // The seed: the person's files, not their config and not build output; the template's config.
+        assert_eq!(b.read("outbox/embarch/a.txt"), "person a\n");
+        assert_eq!(b.read("outbox/embarch/sub/b.txt"), "person b\n");
+        assert_eq!(b.read("outbox/embarch/embarch.toml"), "TEMPLATE\n");
+        assert!(!b.root.join("outbox/embarch/build").exists());
+        assert_eq!(b.read("work/fw/.claude/skills/embarch-hil/SKILL.md"), "SKILL\n");
+        let exclude = b.read("work/fw/.git/info/exclude");
+        assert!(exclude.lines().any(|l| l == "embarch") && exclude.lines().any(|l| l == ".claude/skills/embarch-hil/"), "{exclude}");
+        assert!(
+            log.contains(&format!(
+                "claude mcp add embarch -- {r}/opt/embarch/bin/embarch-api --config {r}/work/fw/embarch/embarch.toml (cwd {r}/work/fw config {r}/home/agent/.claude)"
+            )),
+            "{log}"
+        );
+        assert!(b.root.join("work/.embarch-seeded").is_file());
+    }
+
+    #[test]
+    fn a_later_start_seeds_nothing_but_a_new_file_and_leaves_the_agents_edits_alone() {
+        let b = container_box();
+        assert!(b.start().status.success());
+        let first_log = b.log();
+        // The agent edits its copy; the person adds a file, changes one they had and changes their config.
+        write(&b.root.join("outbox/embarch/a.txt"), "agent a\n");
+        write(&b.root.join("person/repo/embarch/sub/b.txt"), "person b, changed\n");
+        write(&b.root.join("person/repo/embarch/c.txt"), "person c\n");
+        write(&b.root.join("person/repo/embarch/embarch.toml"), "PERSON CONFIG 2\n");
+        let out = b.start();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert_eq!(b.log(), first_log, "a later start ran git or claude again");
+        assert_eq!(b.read("outbox/embarch/c.txt"), "person c\n");
+        assert_eq!(b.read("outbox/embarch/a.txt"), "agent a\n");
+        assert_eq!(b.read("outbox/embarch/sub/b.txt"), "person b\n");
+        assert_eq!(b.read("outbox/embarch/embarch.toml"), "TEMPLATE\n");
+    }
+
+    #[test]
+    fn an_unfinished_first_start_is_refused_not_overwritten() {
+        let b = container_box();
+        write(&b.root.join("work/fw/leftover"), "x");
+        let out = b.start();
+        assert!(!out.status.success());
+        assert!(String::from_utf8_lossy(&out.stderr).contains("never finished"));
+        assert!(!b.root.join("work/.embarch-seeded").exists());
+        assert_eq!(b.read("work/fw/leftover"), "x");
+    }
+
+    #[test]
+    fn the_agent_half_runs_nothing_from_the_persons_repo() {
+        let script = render_entrypoint_agent(&plan(Topology::Linux));
+        let code: String = script.lines().filter(|l| !l.trim_start().starts_with('#')).collect::<Vec<_>>().join("\n");
+        for word in ["west update", "west build", "make ", "pre-commit", "npm", "cargo", "python", ".git/hooks"] {
+            assert!(!code.contains(word), "{word}");
+        }
+        assert!(script.ends_with("if [ \"$#\" -gt 0 ]; then exec \"$@\"; fi\n"));
     }
 }

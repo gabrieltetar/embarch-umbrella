@@ -23,7 +23,7 @@ const MCP_SERVER_NAME: &str = "embarch";
 /// The `embarch-hil` skill, read at build time from the one file
 /// `embarch-api/skills/embarch-hil/SKILL.md` through the sibling checkout the
 /// crate already needs (`embarch-umbrella` decision 59). There is no copy to drift.
-const SKILL_TEXT: &str = include_str!("../../embarch-api/skills/embarch-hil/SKILL.md");
+pub(crate) const SKILL_TEXT: &str = include_str!("../../embarch-api/skills/embarch-hil/SKILL.md");
 /// Where the agent CLI reads a project's skills, relative to the repo root.
 const SKILL_DIR_REL: &str = ".claude/skills/embarch-hil";
 const SKILL_EXCLUDE_ENTRY: &str = ".claude/skills/embarch-hil/";
