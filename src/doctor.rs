@@ -561,11 +561,12 @@ const LINK_HANDSHAKE_GET_TIMEOUT: Duration = Duration::from_secs(10);
 /// and there is still exactly one authenticated round trip.
 struct AuthedStatus {
     probes: Vec<serde_json::Value>,
-    /// `study_designer_schema_version` — `embarch-study-designer`'s
-    /// `HOST_TYPE_SCHEMA_VERSION` as compiled into the Core that answered.
-    /// `None` for a Core predating the field, which check 11 reports as a
-    /// missing number rather than as agreement.
-    study_designer_schema_version: Option<u32>,
+    /// `host_type_schema_version`, falling back to the older spelling
+    /// `study_designer_schema_version` (the new key wins when a body carries
+    /// both) — `HOST_TYPE_SCHEMA_VERSION` as compiled into the Core that
+    /// answered. `None` for a Core serving neither, which check 11 reports as
+    /// a missing number rather than as agreement.
+    host_type_schema_version: Option<u32>,
     /// `core_version` — the answering Core's own crate version
     /// (`embarch-core` decision 13, 2026-09-03). `None` for a Core predating
     /// it. Deliberately **not** one of check 11's schema numbers: check 15
@@ -747,11 +748,12 @@ fn judge_token(attempt: TokenAttempt) -> (Check, Option<AuthedStatus>) {
                 .and_then(|v| v.get("probes"))
                 .and_then(|v| v.as_array().cloned())
                 .unwrap_or_default();
-            let study_designer_schema_version = parsed
-                .as_ref()
-                .and_then(|v| v.get("study_designer_schema_version"))
-                .and_then(|v| v.as_u64())
-                .and_then(|n| u32::try_from(n).ok());
+            let host_type_schema_version = parsed.as_ref().and_then(|v| {
+                v.get("host_type_schema_version")
+                    .or_else(|| v.get("study_designer_schema_version"))
+                    .and_then(|v| v.as_u64())
+                    .and_then(|n| u32::try_from(n).ok())
+            });
             let core_version = parsed
                 .as_ref()
                 .and_then(|v| v.get("core_version"))
@@ -764,7 +766,7 @@ fn judge_token(attempt: TokenAttempt) -> (Check, Option<AuthedStatus>) {
                 .map(str::to_string);
             (
                 check(4, CHECK_4_NAME, Status::Pass, "authenticated (200)"),
-                Some(AuthedStatus { probes, study_designer_schema_version, core_version, binary_sha256 }),
+                Some(AuthedStatus { probes, host_type_schema_version, core_version, binary_sha256 }),
             )
         }
         TokenAttempt::Unauthorized => (
@@ -2036,7 +2038,8 @@ fn parse_hello_ack(body: String) -> HelloAck {
 /// the numbers injected, without a live Core, a bench, or an `embarch-api` on
 /// disk (decisions 33, 35).
 struct SchemaVersions<'a> {
-    /// `/status`'s `study_designer_schema_version`: the host-type constant
+    /// `/status`'s `host_type_schema_version` (or the older
+    /// `study_designer_schema_version`): the host-type constant
     /// **the deployed Core** was built against.
     core_host: Result<u32, &'a str>,
     /// `host_type_schema_version` off the **located `embarch-api`**'s
@@ -2280,9 +2283,9 @@ fn check_schema_versions(
 ) -> Check {
     let core_host = match authed {
         None => Err("no authenticated /status (see checks 3 and 4)"),
-        Some(a) => a.study_designer_schema_version.ok_or(
-            "the Core that answered serves no `study_designer_schema_version` — it predates \
-             2026-08-25",
+        Some(a) => a.host_type_schema_version.ok_or(
+            "the Core that answered serves neither `host_type_schema_version` nor the older \
+             `study_designer_schema_version` — it predates 2026-08-25",
         ),
     };
 
@@ -4227,10 +4230,25 @@ mod tests {
         }
     }
 
+    fn status_host_version(body: &str) -> Option<u32> {
+        judge_token(TokenAttempt::Ok200(body.to_string())).1.unwrap().host_type_schema_version
+    }
+
+    #[test]
+    fn status_schema_version_reads_new_key_old_key_and_prefers_new() {
+        assert_eq!(status_host_version(r#"{"probes":[],"study_designer_schema_version":16}"#), Some(16));
+        assert_eq!(status_host_version(r#"{"probes":[],"host_type_schema_version":17}"#), Some(17));
+        assert_eq!(
+            status_host_version(r#"{"probes":[],"host_type_schema_version":17,"study_designer_schema_version":16}"#),
+            Some(17)
+        );
+        assert_eq!(status_host_version(r#"{"probes":[]}"#), None);
+    }
+
     fn no_probes() -> AuthedStatus {
         AuthedStatus {
             probes: Vec::new(),
-            study_designer_schema_version: None,
+            host_type_schema_version: None,
             core_version: None,
             binary_sha256: None,
         }
@@ -4363,7 +4381,7 @@ mod tests {
     fn check_5_verdict_ignores_the_usb_scan_when_core_reports_a_probe() {
         let authed = AuthedStatus {
             probes: vec![serde_json::json!({"identifier": "whatever"})],
-            study_designer_schema_version: None,
+            host_type_schema_version: None,
             core_version: None,
             binary_sha256: None,
         };
@@ -6366,7 +6384,7 @@ mod tests {
         let none_authed = no_probes();
         let one_probe = AuthedStatus {
             probes: vec![serde_json::json!({"id": "probe-1", "kind": "jlink"})],
-            study_designer_schema_version: Some(17),
+            host_type_schema_version: Some(17),
             core_version: Some("0.1.0".to_string()),
             binary_sha256: None,
         };
