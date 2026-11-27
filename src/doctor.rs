@@ -3424,7 +3424,7 @@ fn bind_registration_can_change_the_verdict(
 
 // ---- driver ------------------------------------------------------------------
 
-pub async fn doctor(json: bool) -> i32 {
+pub async fn doctor(json: bool, config_flag: Option<&Path>) -> i32 {
     let under_wsl2 = env::under_wsl2();
     let saved = state::load();
     let core = locate::locate_core(saved.core_exe.as_deref(), under_wsl2);
@@ -3433,8 +3433,21 @@ pub async fn doctor(json: bool) -> i32 {
     let mcp_reg = mcp_registration_for_cwd();
     let api = locate::locate_api(registered_api_command(&mcp_reg).as_deref());
 
-    let config_path = config::find_config_path();
-    let (check6, config) = check_config(config_path.as_deref(), api.as_ref());
+    let discovered = config::discover_config_path(config_flag);
+    let config_path = discovered.as_ref().ok().cloned().flatten();
+    let (check6, config) = match &discovered {
+        Ok(_) => check_config(config_path.as_deref(), api.as_ref()),
+        // A named path (--config or EMBARCH_API_CONFIG) that is not a file:
+        // the same error the API would exit with, not a fall-through to
+        // another file.
+        Err(e) => (
+            with_fix(
+                check(6, "embarch-api config loads", Status::Fail, format!("{e:#}")),
+                "point --config / EMBARCH_API_CONFIG at an existing embarch.toml, or unset them",
+            ),
+            None,
+        ),
+    };
 
     // Kept apart rather than merged: check 2 wants to say which one it read
     // when it fails, and `infer_class` below is content with `host`, their

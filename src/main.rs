@@ -172,6 +172,12 @@ enum Command {
         /// Emit one JSON object instead of human-readable output.
         #[arg(long)]
         json: bool,
+
+        /// The `embarch.toml` to inspect, as `embarch-api --config` takes it.
+        /// Without it: `EMBARCH_API_CONFIG`, then the nearest
+        /// `embarch/embarch.toml` above the current directory.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 
     /// Cheap liveness check: is Core up, and where.
@@ -191,6 +197,12 @@ enum Command {
         /// Core's port.
         #[arg(long, default_value_t = DEFAULT_CORE_PORT)]
         port: u16,
+
+        /// The `embarch.toml` whose `[core]` token settings `status` reads, as
+        /// `embarch-api --config` takes it. Without it: `EMBARCH_API_CONFIG`,
+        /// then the nearest `embarch/embarch.toml` above the current directory.
+        #[arg(long)]
+        config: Option<PathBuf>,
     },
 
     /// Fallback: start Core when it isn't already a running service.
@@ -290,7 +302,7 @@ async fn main() {
     let cli = Cli::parse();
 
     let code = match cli.command {
-        Command::Status { json, host, port } => status(json, host.as_deref(), port).await,
+        Command::Status { json, host, port, config } => status(json, host.as_deref(), port, config.as_deref()).await,
         Command::Setup { host, port, uninstall, dev_bench_repo, dry_run } => {
             if uninstall {
                 setup::uninstall()
@@ -340,7 +352,7 @@ async fn main() {
                 },
             }
         }
-        Command::Doctor { json } => doctor::doctor(json).await,
+        Command::Doctor { json, config } => doctor::doctor(json, config.as_deref()).await,
         Command::Up { foreground } => setup::up(foreground),
         Command::Down { cancel_run } => setup::down(cancel_run).await,
         Command::DeployCore {
@@ -422,16 +434,16 @@ impl ProbeReport {
 
 /// Ask the winning candidate for its probe count, the same way `doctor`
 /// check 5 does: resolve a token, one authenticated `GET /status`, read the
-/// `probes` array's length (decision 46). `status` has no `--config`, so
-/// unlike `doctor` this always resolves with no config override — the token
-/// env var or file discovery `embarch_core_client::token_discovery::resolve_token`
-/// falls back to on its own.
-async fn probe_report(base_url: Option<&str>) -> ProbeReport {
+/// `probes` array's length (decision 46). The token resolves through the
+/// config `status` found (`--config`, `EMBARCH_API_CONFIG`, or the walk; decision
+/// 73), so a `token_env` there is honoured as `embarch-api` honours it; with
+/// no config it is the env var or file discovery `resolve_token` falls back to.
+async fn probe_report(base_url: Option<&str>, config: Option<&crate::config::Config>) -> ProbeReport {
     let Some(base_url) = base_url else {
         return ProbeReport::Unreachable;
     };
 
-    let token = match embarch_core_client::token_discovery::resolve_token(None, None) {
+    let token = match status_token(config) {
         Ok(t) => t,
         Err(e) => return ProbeReport::NoToken(format!("{e:#}")),
     };
@@ -463,12 +475,15 @@ fn interpret_probe_response(status: u16, body: &str) -> ProbeReport {
 }
 
 /// Find Core and report where it is. Returns the process exit code.
-async fn status(json: bool, host: Option<&str>, port: u16) -> i32 {
+async fn status(json: bool, host: Option<&str>, port: u16, config_flag: Option<&std::path::Path>) -> i32 {
     // embarch-topology decisions 2, 3: live, in-process, every call — this
     // crate no longer owns any of the WSL2/gateway/probe I/O itself (formerly
     // this file's own use of `env.rs`/`probe.rs`/`topology.rs`).
     let resolved = embarch_topology::software::resolve_software_topology(port, host, None).await;
-    let probes = probe_report(resolved.base_url()).await;
+    let probes = match load_status_config(config_flag) {
+        Ok(config) => probe_report(resolved.base_url(), config.as_ref()).await,
+        Err(e) => ProbeReport::NoToken(e),
+    };
 
     if json {
         println!("{}", status_json(&resolved.attempts, &probes));
@@ -481,6 +496,24 @@ async fn status(json: bool, host: Option<&str>, port: u16) -> i32 {
     } else {
         EXIT_FAILURE
     }
+}
+
+/// Resolve `status`'s token the way `embarch-api` does: the config's `token`
+/// and `token_env` first, then the env var and file discovery.
+fn status_token(config: Option<&crate::config::Config>) -> anyhow::Result<String> {
+    let (token_cfg, token_env) = config
+        .map(|c| (c.core.token.clone(), c.core.token_env.clone()))
+        .unwrap_or((None, None));
+    embarch_core_client::token_discovery::resolve_token(token_cfg, token_env)
+}
+
+/// The config `status` reads its token settings from. A named path (flag or
+/// variable) that is not a file is a reported error; a config the walk found
+/// but this mirror cannot parse, or none found, is `None` — `status` stays a
+/// cheap liveness check and `doctor` check 6 is where a bad file is judged.
+fn load_status_config(config_flag: Option<&std::path::Path>) -> Result<Option<crate::config::Config>, String> {
+    let path = crate::config::discover_config_path(config_flag).map_err(|e| format!("{e:#}"))?;
+    Ok(path.and_then(|p| crate::config::Config::load_from_path(&p).ok()))
 }
 
 fn outcome_str(outcome: ProbeOutcome) -> String {
@@ -656,7 +689,7 @@ mod tests {
     /// it must short-circuit to `Unreachable` before making a request.
     #[tokio::test]
     async fn probe_report_is_unreachable_with_no_base_url() {
-        let report = probe_report(None).await;
+        let report = probe_report(None, None).await;
         assert_eq!(report.state_str(), "unreachable");
     }
 
@@ -702,5 +735,45 @@ mod tests {
         assert_eq!(v["schema_version"], 1);
         assert_eq!(JSON_SCHEMA_VERSION, 1, "bump the pinned shape tests with the constant");
         assert_eq!(v["success"], true);
+    }
+
+    fn write_config(name: &str, core: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("embarch-status-cfg-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let p = d.join("embarch.toml");
+        std::fs::write(
+            &p,
+            format!(
+                "[core]\nbase_url = \"auto\"\n{core}\n[[projects]]\nname = \"fw\"\nsource_path = \"/repo\"\nbuild_command = [\"west\", \"build\"]\nartifact_path = \"build/zephyr/zephyr.hex\"\nchip = \"c\"\nflash_format = \"hex\"\n"
+            ),
+        )
+        .unwrap();
+        p
+    }
+
+    #[test]
+    fn status_finds_a_token_through_the_config_flags_token_env() {
+        let var = format!("EMBARCH_TEST_STATUS_TOKEN_{}", std::process::id());
+        let path = write_config("token-env", &format!("token_env = \"{var}\"\n"));
+        std::env::set_var(&var, "tok-from-env");
+        let config = load_status_config(Some(&path)).unwrap();
+        assert!(config.is_some());
+        assert_eq!(status_token(config.as_ref()).unwrap(), "tok-from-env");
+        std::env::remove_var(&var);
+    }
+
+    #[test]
+    fn status_finds_a_token_written_in_the_config() {
+        let path = write_config("token-inline", "token = \"inline-tok\"\n");
+        let config = load_status_config(Some(&path)).unwrap();
+        assert_eq!(status_token(config.as_ref()).unwrap(), "inline-tok");
+    }
+
+    #[test]
+    fn status_reports_a_named_config_that_is_not_a_file() {
+        let missing = std::env::temp_dir().join("embarch-status-no-such-config.toml");
+        let err = load_status_config(Some(&missing)).unwrap_err();
+        assert!(err.contains("--config"), "{err}");
     }
 }

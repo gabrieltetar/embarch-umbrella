@@ -206,14 +206,27 @@ impl Config {
     }
 }
 
-/// Walk up from the current directory looking for `embarch/embarch.toml`,
-/// the same layout `init` writes (`init.rs::find_repo_root` plus the fixed
-/// `embarch/embarch.toml` suffix).
-pub fn find_config_path() -> Option<PathBuf> {
-    let cwd = std::env::current_dir().ok()?;
-    let repo = crate::init::find_repo_root(&cwd)?;
-    let path = repo.join("embarch").join("embarch.toml");
-    path.exists().then_some(path)
+/// Which `embarch.toml` `doctor` and `status` read: `--config`, then
+/// `EMBARCH_API_CONFIG`, then the walk up from the current directory, through
+/// `embarch_core_client::config_discovery` so it is the file `embarch-api`
+/// loads (`embarch-api` decision 152; umbrella decision 73).
+///
+/// `Ok(None)` is only "nothing named and the walk found none". A path that
+/// was named (flag or variable) and is not a file is an `Err` naming it, never
+/// a fall-through to another file. `init` does not call this: it scaffolds a
+/// config at the repo root and takes no `--config`.
+pub fn discover_config_path(explicit: Option<&Path>) -> Result<Option<PathBuf>> {
+    let cwd = std::env::current_dir().context("cannot read the current directory")?;
+    discover_with(explicit, std::env::var_os(embarch_core_client::config_discovery::CONFIG_ENV_VAR).as_deref(), &cwd)
+}
+
+fn discover_with(explicit: Option<&Path>, env_value: Option<&std::ffi::OsStr>, start: &Path) -> Result<Option<PathBuf>> {
+    let named = explicit.is_some() || env_value.is_some_and(|v| !v.is_empty());
+    match embarch_core_client::config_discovery::find_config_path_with(explicit, env_value, start) {
+        Ok(p) => Ok(Some(p)),
+        Err(e) if named => Err(e),
+        Err(_) => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -425,5 +438,54 @@ mod tests {
             )
         });
         assert_eq!(mirrored.projects.len(), upstream.projects.len());
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("embarch-umbrella-discover-{}-{name}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    #[test]
+    fn discover_flag_beats_variable_and_walk() {
+        let d = scratch("flag");
+        std::fs::create_dir_all(d.join("embarch")).unwrap();
+        std::fs::write(d.join("embarch/embarch.toml"), "").unwrap();
+        let flag = d.join("flag.toml");
+        let var = d.join("var.toml");
+        std::fs::write(&flag, "").unwrap();
+        std::fs::write(&var, "").unwrap();
+        let got = discover_with(Some(&flag), Some(var.as_os_str()), &d).unwrap();
+        assert_eq!(got, Some(flag));
+    }
+
+    #[test]
+    fn discover_variable_beats_walk() {
+        let d = scratch("var");
+        std::fs::create_dir_all(d.join("embarch")).unwrap();
+        std::fs::write(d.join("embarch/embarch.toml"), "").unwrap();
+        let var = d.join("var.toml");
+        std::fs::write(&var, "").unwrap();
+        assert_eq!(discover_with(None, Some(var.as_os_str()), &d).unwrap(), Some(var));
+    }
+
+    #[test]
+    fn discover_walks_up_from_a_subdirectory() {
+        let d = scratch("walk");
+        std::fs::create_dir_all(d.join("embarch")).unwrap();
+        std::fs::write(d.join("embarch/embarch.toml"), "").unwrap();
+        let sub = d.join("a/b");
+        std::fs::create_dir_all(&sub).unwrap();
+        assert_eq!(discover_with(None, None, &sub).unwrap(), Some(d.join("embarch/embarch.toml")));
+    }
+
+    #[test]
+    fn discover_finds_nothing_is_none_but_a_named_missing_file_is_an_error() {
+        let d = scratch("none");
+        assert_eq!(discover_with(None, None, &d).unwrap(), None);
+        let missing = d.join("nope.toml");
+        assert!(discover_with(Some(&missing), None, &d).is_err());
+        assert!(discover_with(None, Some(missing.as_os_str()), &d).is_err());
     }
 }
