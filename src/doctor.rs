@@ -457,14 +457,17 @@ fn check_service(
     let fix = match (class, core) {
         (TopologyClass::Remote, _) => {
             format!(
-                "Core runs on another machine. On that machine: `embarch-core install --bind {bind}` (elevated).",
-                bind = embarch_topology::software::recommended_bind_address(class)
+                "Core runs on another machine, and registering it is that machine's step. There, \
+                 elevated: `embarch install-core <release>` (Windows and Linux), then, since that \
+                 binds loopback, {}.",
+                setup::rebind_route(embarch_topology::software::recommended_bind_address(class))
             )
         }
-        (TopologyClass::WslHost, Some(c)) => format!(
-            "Core belongs on the Windows side. In an **elevated Windows** shell: \"{}\" install --bind {}",
-            setup::windows_display_path(&c.path),
-            embarch_topology::software::recommended_bind_address(class)
+        (TopologyClass::WslHost, Some(_)) => format!(
+            "Core belongs on the Windows side. Register it with {}, then, since that binds \
+             loopback, {}.",
+            setup::registration_route(true),
+            setup::rebind_route(embarch_topology::software::recommended_bind_address(class))
         ),
         (TopologyClass::Local, Some(c)) => {
             // One space before the parenthesis, not three: the module-wide
@@ -472,7 +475,12 @@ fn check_service(
             // reads any multi-space run as a wrapped literal, and a hand-set
             // gap that has to be spelled out as an exception is worth less
             // than the guard.
-            format!("sudo \"{}\" install (or, if already installed: sudo \"{}\" start)", c.path.display(), c.path.display())
+            format!(
+                "Register it with {} (a plain `install` registers nothing); if already \
+                 registered: sudo \"{}\" start",
+                setup::registration_route(false),
+                c.path.display()
+            )
         }
         (_, None) => "embarch-core not found — run `embarch setup` first.".to_string(),
     };
@@ -3049,10 +3057,16 @@ struct BindEvidence<'a> {
 const REINSTALL_NOTE: &str = "Core 106 or newer rewrites the registered service in place; an older \
      Core refuses with 1073, so `embarch-core uninstall` first";
 
+/// The step that changes a registered service's address (decision 71): not a
+/// plain `install --bind`, which registers nothing since core decision 157.
+fn rebind_fix(needed: &str) -> String {
+    format!("{} on the machine running Core ({REINSTALL_NOTE})", setup::rebind_route(needed))
+}
+
 /// Is this bind address one that only the same machine can reach?
 ///
 /// Deliberately a small explicit set rather than a parse: these are the
-/// values `embarch-core install --bind` is ever given, and a hostname this
+/// values `install --service --bind` is ever given, and a hostname this
 /// does not recognise falls through to "not loopback", which downgrades a
 /// Fail to a Warn. That direction is the safe one — a wrong Fail on a working
 /// machine costs more than a missed diagnosis on a hand-edited registration.
@@ -3207,11 +3221,11 @@ fn judge_bind_address(e: &BindEvidence<'_>) -> Check {
                     // with the bind untouched and the only independent
                     // evidence destroyed.
                     format!(
-                        "reinstall the service with the wide bind, in an elevated shell on the \
-                         machine running Core: `embarch-core install --bind {needed}` ({REINSTALL_NOTE}). Do not \
+                        "rewrite the registered service with the wide bind: {}. Do not \
                          re-run `embarch setup` for this: Core answered, so `setup` installs \
                          nothing and overwrites the recorded class, which greens this check \
-                         without widening the bind."
+                         without widening the bind.",
+                        rebind_fix(needed)
                     ),
                 ),
                 Some(addr) => with_code(
@@ -3250,9 +3264,10 @@ fn judge_bind_address(e: &BindEvidence<'_>) -> Check {
                     format!(
                         "ask from the side that matters: run `embarch doctor` in the WSL2 guest, \
                          or `curl http://$(ip route show default | awk '{{print $3}}'):4884/status` \
-                         there. If that cannot reach Core, reinstall the service with \
-                         `embarch-core install --bind {needed}` in an elevated shell on the \
-                         machine running Core ({REINSTALL_NOTE})."
+                         there. If that cannot reach Core, rewrite the registered service: {}. If nothing is \
+                         registered, `{}` first.",
+                        rebind_fix(needed),
+                        setup::registration_route(true)
                     ),
                 ),
             };
@@ -3309,25 +3324,25 @@ fn judge_bind_address(e: &BindEvidence<'_>) -> Check {
             // that run would really do.
             match e.setup_would_infer {
                 TopologyClass::WslHost => format!(
-                    "reinstall the service with the wide bind, in an elevated shell on the machine \
-                     running Core: `embarch-core install --bind {needed}` ({REINSTALL_NOTE}) — or \
-                     re-run `embarch setup` from here, which infers wsl-host and passes it for you."
+                    "rewrite the registered service with the wide bind: {}. `embarch setup` from \
+                     here does not do it: it registers nothing and widens nothing, and it \
+                     infers wsl-host.",
+                    rebind_fix(needed)
                 ),
                 TopologyClass::Local => format!(
-                    "reinstall the service with the wide bind, in an elevated shell on the machine \
-                     running Core: `embarch-core install --bind {needed}` ({REINSTALL_NOTE}). Do not re-run `embarch \
-                     setup` from here: run on this side it infers local, which needs {}, so it \
-                     installs the narrow bind again and then rewrites the recorded class — after \
-                     which this check passes `bind-matches` with the bind untouched. Run it from \
-                     the WSL2 guest, or reinstall.",
+                    "rewrite the registered service with the wide bind: {}. Do not re-run `embarch \
+                     setup` from here: run on this side it infers local, which needs {}, and it \
+                     registers nothing — it only rewrites the recorded class, after which this \
+                     check passes `bind-matches` with the bind untouched.",
+                    rebind_fix(needed),
                     topology::recommended_bind_address(TopologyClass::Local)
                 ),
                 TopologyClass::Remote => format!(
-                    "reinstall the service with the wide bind, in an elevated shell on the machine \
-                     running Core: `embarch-core install --bind {needed}` ({REINSTALL_NOTE}). Do not re-run `embarch \
+                    "rewrite the registered service with the wide bind: {}. Do not re-run `embarch \
                      setup` from here: run on this side it infers remote, and a remote setup \
-                     installs nothing at all — it records where Core lives and leaves the bind \
-                     exactly as narrow as it is. Run it from the WSL2 guest, or reinstall."
+                     registers nothing at all — it records where Core lives and leaves the bind \
+                     exactly as narrow as it is.",
+                    rebind_fix(needed)
                 ),
             },
         ),
@@ -4128,7 +4143,7 @@ mod tests {
             "{}",
             c.detail
         );
-        assert!(c.fix.as_deref().unwrap().contains("On that machine"));
+        assert!(c.fix.as_deref().unwrap().contains("that machine's step"));
     }
 
     /// The bug this task exists for: a `saved.host` left over from an
@@ -4151,7 +4166,7 @@ mod tests {
         );
         // Unchanged: the fix line still names "another machine", the same
         // sentence check 2 has always printed for `remote`.
-        assert!(c.fix.as_deref().unwrap().contains("On that machine"));
+        assert!(c.fix.as_deref().unwrap().contains("that machine's step"));
     }
 
     /// `config.core.host` wins the naming when both are present — it is what
@@ -4633,10 +4648,10 @@ mod tests {
         let win_core = a_located("/mnt/c/Program Files/embarch/embarch-core.exe", true);
         let c = check_service(&nothing_answered_probe(), None, None, Some(&win_core));
         let bind = embarch_topology::software::recommended_bind_address(TopologyClass::WslHost);
-        assert!(c.fix.unwrap().contains(&format!("install --bind {bind}")));
+        assert!(c.fix.unwrap().contains(&format!("install --service --bind {bind}")));
         let c = check_service(&nothing_answered_probe(), Some("bench.local"), None, None);
         let bind = embarch_topology::software::recommended_bind_address(TopologyClass::Remote);
-        assert!(c.fix.unwrap().contains(&format!("install --bind {bind}")));
+        assert!(c.fix.unwrap().contains(&format!("install --service --bind {bind}")));
     }
 
     // The three UNC round-trip tests that lived here went with check 9's
@@ -6027,11 +6042,11 @@ mod tests {
         assert_eq!(c.status, Status::Fail);
         assert_eq!(c.code, Some("bound-narrow"));
         assert!(c.detail.contains("not a stopped service"), "{}", c.detail);
-        // Nothing answered, so `setup` really would install — and from the
-        // guest it infers `wsl-host` and passes the wide bind. Here, and only
-        // here, the one-command remedy is honest.
+        // Decision 71: `setup` registers nothing and widens nothing, so no
+        // arm offers it as the remedy any more.
         let fix = c.fix.as_deref().unwrap();
-        assert!(fix.contains("re-run `embarch setup` from here"), "{fix}");
+        assert!(fix.contains("install --service --bind 0.0.0.0"), "{fix}");
+        assert!(fix.contains("registers nothing and widens nothing"), "{fix}");
     }
 
     /// **The same hole `018` closed one arm over.** `bound-narrow`'s fix
@@ -6084,7 +6099,7 @@ mod tests {
         let fix = c.fix.as_deref().unwrap();
         assert!(fix.contains("Do not re-run `embarch setup` from here"), "{fix}");
         assert!(fix.contains("remote"), "{fix}");
-        assert!(fix.contains("installs nothing at all"), "{fix}");
+        assert!(fix.contains("registers nothing at all"), "{fix}");
         assert!(fix.contains("--bind 0.0.0.0"), "{fix}");
         // The `local` arm's reason would be a false statement here.
         assert!(!fix.contains("installs the narrow bind again"), "{fix}");

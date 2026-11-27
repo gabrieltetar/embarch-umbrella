@@ -267,8 +267,8 @@ pub async fn deploy_core(
         eprintln!(
             "deploy-core is a WSL2 -> Windows-service operation: it syncs Linux checkouts to \
              Windows source copies, builds with Windows `cargo.exe`, and replaces the binary a \
-             Windows service runs. On a machine where Core is native, `embarch-core install` / \
-             `embarch-core update` already do this directly."
+             Windows service runs. On a machine where Core is native, `embarch install-core` \
+             installs and registers it directly."
         );
         return EXIT_FAILURE;
     }

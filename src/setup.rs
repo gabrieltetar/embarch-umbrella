@@ -113,6 +113,42 @@ pub fn infer_class(host: Option<&str>, core: Option<&Located>) -> TopologyClass 
     }
 }
 
+/// What `setup` says on a `local` machine where Core is not running: it
+/// registers nothing (decision 71), in a dry run and a real one alike.
+fn local_registration_note(dry_run: bool) -> String {
+    format!(
+        "{}embarch-core is not registered as a service by `setup`; nothing was registered. \
+         Register it with {}.",
+        if dry_run { "Would not register: " } else { "" },
+        registration_route(false)
+    )
+}
+
+/// Where a first registration of Core's service comes from (decision 71):
+/// `embarch install-core <release>`, elevated, on the machine that will run
+/// Core. `core_on_windows` is that machine, not the one this binary runs on:
+/// a `wsl-host` setup names the Windows-side command. macOS has no such half.
+pub(crate) fn registration_route(core_on_windows: bool) -> String {
+    if core_on_windows {
+        "`embarch install-core <release>` in an elevated Windows shell".to_string()
+    } else if cfg!(target_os = "linux") {
+        "`sudo embarch install-core <release>`".to_string()
+    } else {
+        "not built on this platform: `embarch install-core` registers Core on Windows and Linux only"
+            .to_string()
+    }
+}
+
+/// How to change the address of a registration that exists (decision 71):
+/// the *installed* binary, because `install --service` refuses any binary the
+/// release record does not list by SHA-256 — the copy beside `embarch` is not.
+pub(crate) fn rebind_route(addr: &str) -> String {
+    format!(
+        "`install --service --bind {addr}` from the installed binary (`%ProgramFiles%\\EmbArch\\core\\<version>\\embarch-core.exe` \
+         on Windows, `/opt/embarch/core/<version>/embarch-core` on Linux), elevated"
+    )
+}
+
 /// Run a command, inheriting stdio so the user sees whatever it prints.
 fn run(program: &std::path::Path, args: &[&str]) -> Result<bool> {
     let status = Command::new(program)
@@ -274,45 +310,35 @@ fn apply_plan(
         match (plan.class, &plan.core) {
             (TopologyClass::Remote, _) => {
                 println!(
-                    "\nCore is on another machine. Start it there yourself:\n  \
-                     embarch-core install --bind {bind_addr}    (elevated, on that machine)\n\
+                    "\nCore is on another machine, and `setup` registers nothing there. On that \
+                     machine, elevated: `embarch install-core <release>` (Windows and Linux; macOS \
+                     has no such route yet). It binds loopback, so then widen it with\n  {}\n\
                      Then copy its token file's contents to this machine:\n  \
-                     export EMBARCH_TOKEN=<contents of /var/lib/embarch/token on that machine>"
+                     export EMBARCH_TOKEN=<contents of /var/lib/embarch/token on that machine>",
+                    rebind_route(bind_addr)
                 );
             }
-            (TopologyClass::WslHost, Some(c)) => {
+            (TopologyClass::WslHost, Some(_)) => {
                 // Cannot be done from here: controlling a Windows service
                 // needs an elevated Windows shell, and umbrella never tries
                 // to obtain one (decision 7). Identical in both
                 // modes — it was already only ever a printed instruction.
                 println!(
-                    "\nCore belongs on the Windows side. In an **elevated Windows** shell, run:\n  \
-                     \"{}\" install --bind {bind_addr}",
-                    windows_display_path(&c.path)
+                    "\nCore belongs on the Windows side, and `setup` registers nothing there. \
+                     Register it with {}. That binds loopback, which the WSL2 guest cannot \
+                     reach, so then widen it with\n  {}",
+                    registration_route(true),
+                    rebind_route(bind_addr)
                 );
             }
-            (TopologyClass::Local, Some(c)) if dry_run => {
-                println!(
-                    "\nWould register embarch-core as a service that starts at boot. Needs \
-                     elevation unless this is already root:\n  \"{}\" install --bind {bind_addr}",
-                    c.path.display()
-                );
-            }
-            (TopologyClass::Local, Some(c)) => {
-                println!("\nInstalling embarch-core as a service that starts at boot...");
-                match run(&c.path, &["install", "--bind", bind_addr]) {
-                    Ok(true) => println!("Installed and started."),
-                    // Almost always a privilege failure. Trying first is
-                    // still right: someone who ran `sudo embarch setup` gets
-                    // it done in one step.
-                    Ok(false) | Err(_) => {
-                        install_failed = true;
-                        println!(
-                            "Could not install the service — this needs elevation. Run:\n  \
-                             sudo \"{}\" install --bind {bind_addr}",
-                            c.path.display()
-                        );
-                    }
+            // Decision 71: a plain `embarch-core install` registers nothing
+            // (core decision 157), so `setup` neither runs it nor reports a
+            // registration. The route that makes one needs a signed release,
+            // which `setup` does not hold.
+            (TopologyClass::Local, Some(_)) => {
+                println!("\n{}", local_registration_note(dry_run));
+                if !dry_run {
+                    install_failed = true;
                 }
             }
             (_, None) => {
@@ -669,10 +695,10 @@ pub fn up(foreground: bool) -> i32 {
             // than a clear message (decision 4).
             eprintln!(
                 "Could not start the service. Either it isn't installed yet:\n  \
-                 sudo \"{}\" install\n\
+                 {}\n\
                  or start it with elevation:\n  sudo \"{}\" start\n\
                  or run Core in this terminal instead:\n  embarch up --foreground",
-                core.path.display(),
+                registration_route(false),
                 core.path.display()
             );
             1
@@ -734,6 +760,33 @@ pub fn down() -> i32 {
 
 #[cfg(test)]
 mod tests {
+    /// Decision 71: a plain `install` registers nothing, so `setup`'s `local`
+    /// arm never says it installed or started anything, and never names
+    /// `install --bind` as a step.
+    #[test]
+    fn local_setup_does_not_claim_or_name_a_registration_it_does_not_make() {
+        for dry in [true, false] {
+            let note = local_registration_note(dry);
+            assert!(!note.contains("Installed and started"), "{note}");
+            assert!(!note.contains("install --bind"), "{note}");
+            assert!(note.contains("nothing was registered"), "{note}");
+            assert!(note.contains("install-core"), "{note}");
+        }
+    }
+
+    #[test]
+    fn rebind_route_names_the_service_flag_and_the_installed_binary() {
+        let r = rebind_route("0.0.0.0");
+        assert!(r.contains("install --service --bind 0.0.0.0"), "{r}");
+        assert!(r.contains("installed binary"), "{r}");
+    }
+
+    #[test]
+    fn windows_registration_route_is_elevated_install_core() {
+        assert!(registration_route(true).contains("install-core <release>"));
+        assert!(registration_route(true).contains("elevated Windows"));
+    }
+
     #[test]
     fn uninstall_exit_is_zero_with_nothing_failed_and_one_naming_each_failure() {
         assert_eq!(uninstall_exit(&[]), 0);
