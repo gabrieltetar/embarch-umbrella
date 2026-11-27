@@ -46,6 +46,12 @@ pub struct InstalledRelease {
     pub log_time: Option<String>,
     /// Each suite binary found in the staged release, name to SHA-256.
     pub binaries: std::collections::BTreeMap<String, String>,
+    /// SHA-256 of every `embarch-core` binary this release installed, lowercase
+    /// hex: the shape Core's `install --service` reads
+    /// (`embarch-core/interfaces/installed-release.md`). Added beside
+    /// `binaries`, which stays; absent in a record written before decision 69.
+    #[serde(default)]
+    pub binary_sha256: Vec<String>,
     /// `--allow-downgrade` was passed.
     pub allow_downgrade: bool,
     /// This install was older than the one it replaced.
@@ -146,7 +152,6 @@ impl Plan {
             None => "  4. no installed-release.json: nothing to compare with\n".to_string(),
         };
         s += &format!("  5. write {}\n", self.data_dir.join(RECORD_FILE).display());
-        s += "  Not done here: registering the service under its own account.\n";
         s
     }
 }
@@ -246,6 +251,12 @@ fn stage_and_record(
         }
     }
 
+    let binary_sha256 = binaries
+        .get(&locate::native_name("embarch-core"))
+        .cloned()
+        .into_iter()
+        .collect();
+
     let record = InstalledRelease {
         schema_version: RECORD_SCHEMA_VERSION,
         suite_version: verified.suite_version,
@@ -254,6 +265,7 @@ fn stage_and_record(
         issuer: verified.issuer,
         log_time: verified.log_time,
         binaries,
+        binary_sha256,
         allow_downgrade,
         downgraded,
         previous_suite_version: previous.map(|p| p.suite_version.clone()),
@@ -340,7 +352,7 @@ fn unpack_archive(archive: &Path, stage: &Path) -> Result<(), InstallCoreError> 
 
 /// The folder holding the manifest: the staging folder itself, or its only
 /// subfolder (an archive's top-level directory).
-fn release_root(stage: &Path) -> Result<PathBuf, InstallCoreError> {
+pub(crate) fn release_root(stage: &Path) -> Result<PathBuf, InstallCoreError> {
     if stage.join(MANIFEST_FILE).is_file() {
         return Ok(stage.to_path_buf());
     }
@@ -474,6 +486,8 @@ pub async fn run(
         }
     };
     print!("{}", plan.render());
+    let bind = embarch_topology::software::recommended_bind_address(embarch_topology::software::TopologyClass::Local);
+    print!("{}", windows_plan(&data_dir, bind));
     if dry_run {
         println!("Dry run: nothing was changed.");
         return 0;
@@ -501,13 +515,101 @@ pub async fn run(
                 println!("  note:      older than the previous {}; recorded as a downgrade",
                     r.previous_suite_version.as_deref().unwrap_or("?"));
             }
-            0
+            windows_half(&data_dir, &r, bind)
         }
         Err(e) => {
             eprintln!("install-core: {e}");
             1
         }
     }
+}
+
+/// The Windows half's plan, for the default data dir on Windows; the other
+/// cases say why nothing follows the record.
+fn windows_plan(data_dir: &Path, bind: &str) -> String {
+    if !cfg!(windows) {
+        return "  Not done here: installing and registering Core. The Windows half runs only on Windows; \
+                the Linux half is a later unit.\n"
+            .to_string();
+    }
+    match windows_dirs(data_dir) {
+        Some((pf, dd)) => crate::install_core_win::render_plan(&pf, &dd, bind, None),
+        None => "  Not done here: installing and registering Core, because --data-dir is not the \
+                 default %ProgramData%\\embarch (Core reads its record from the default only).\n"
+            .to_string(),
+    }
+}
+
+/// `(%ProgramFiles%, data dir)` when `data_dir` is the default one.
+fn windows_dirs(data_dir: &Path) -> Option<(String, String)> {
+    let default = crate::setup::data_dir_for(embarch_topology::software::TopologyClass::Local, cfg!(windows))?;
+    let pf = std::env::var("ProgramFiles").ok()?;
+    (default == data_dir).then(|| (pf, data_dir.to_string_lossy().into_owned()))
+}
+
+/// After the record is written: on Windows with the default data dir, run the
+/// generated elevated script. Returns the exit code.
+#[cfg(windows)]
+fn windows_half(data_dir: &Path, r: &InstalledRelease, bind: &str) -> i32 {
+    use crate::install_core_win as win;
+    let Some((program_files, dd)) = windows_dirs(data_dir) else {
+        println!("  Core was not installed or registered: --data-dir is not the default %ProgramData%\\embarch.");
+        return 0;
+    };
+    let core_name = locate::native_name("embarch-core");
+    let Some(sha) = r.binary_sha256.first() else {
+        eprintln!("install-core: the release holds no {core_name}; nothing to register");
+        return 1;
+    };
+    let root = match release_root(&data_dir.join(&r.staging)) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("install-core: {e}");
+            return 1;
+        }
+    };
+    let sid = std::process::Command::new("whoami")
+        .args(["/user", "/fo", "csv", "/nh"])
+        .output()
+        .ok()
+        .and_then(|o| win::parse_whoami_sid(&String::from_utf8_lossy(&o.stdout)));
+    let Some(engineer_sid) = sid else {
+        eprintln!("install-core: cannot read your SID from `whoami /user`");
+        return 1;
+    };
+    let tmp = std::env::temp_dir();
+    let inputs = win::WinInputs {
+        program_files,
+        data_dir: dd,
+        version: r.suite_version.clone(),
+        staged_exe: root.join(&core_name).to_string_lossy().into_owned(),
+        binary_sha256: sha.clone(),
+        engineer_sid,
+        bind: bind.to_string(),
+        log: tmp.join("embarch-install-core.log").to_string_lossy().into_owned(),
+    };
+    let host = win::RealHost {
+        script_path: tmp.join("embarch-install-core-elevated.ps1"),
+        log_path: tmp.join("embarch-install-core.log"),
+    };
+    match win::run_windows_half(&host, &inputs) {
+        Ok(fp) => {
+            println!("CORE INSTALLED under {} (service {})", win::SERVICE_ACCOUNT, win::SERVICE);
+            println!("  fingerprint: {fp}");
+            0
+        }
+        Err(problems) => {
+            for p in problems {
+                eprintln!("install-core: {p}");
+            }
+            1
+        }
+    }
+}
+
+#[cfg(not(windows))]
+fn windows_half(_data_dir: &Path, _r: &InstalledRelease, _bind: &str) -> i32 {
+    0
 }
 
 #[cfg(test)]
@@ -572,6 +674,42 @@ mod tests {
         assert_eq!(r.installed_at, "2001-09-09T01:46:40Z");
         assert!(data.join(STAGING_DIR).join("1").join(MANIFEST_FILE).is_file());
         assert_eq!(read_record(&data).unwrap().unwrap(), r);
+    }
+
+    #[test]
+    fn the_record_carries_binary_sha256_in_cores_shape() {
+        let (rel, data) = (release("1.2.0"), tmp("data"));
+        install_core_elevated(&rel, &data, false, &ok("1.2.0"), at(1)).unwrap();
+        // What `embarch-core install --service` reads: an array of lowercase hex.
+        #[derive(Deserialize)]
+        struct CoreView {
+            binary_sha256: Vec<String>,
+        }
+        let json = fs::read_to_string(data.join(RECORD_FILE)).unwrap();
+        let v: CoreView = serde_json::from_str(&json).unwrap();
+        let core = sha256_file(&rel.join(locate::native_name("embarch-core"))).unwrap();
+        assert_eq!(v.binary_sha256, vec![core]);
+        assert!(v.binary_sha256.iter().all(|h| h.len() == 64 && h.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f'))));
+        // `binaries` stays, additively.
+        assert!(json.contains("\"binaries\""));
+    }
+
+    #[test]
+    fn a_record_from_before_binary_sha256_still_reads() {
+        let data = tmp("old");
+        let old = r#"{"schema_version":1,"suite_version":"1.0.0","manifest_sha256":"x","identity":"i","issuer":"s",
+            "log_time":null,"binaries":{},"allow_downgrade":false,"downgraded":false,
+            "previous_suite_version":null,"staging":"release-staging/1","installed_at":"2026-11-25T00:00:00Z"}"#;
+        fs::write(data.join(RECORD_FILE), old).unwrap();
+        assert!(read_record(&data).unwrap().unwrap().binary_sha256.is_empty());
+    }
+
+    #[test]
+    fn a_release_without_core_records_an_empty_binary_sha256() {
+        let (rel, data) = (release("1.2.0"), tmp("data"));
+        fs::remove_file(rel.join(locate::native_name("embarch-core"))).unwrap();
+        let r = install_core_elevated(&rel, &data, false, &ok("1.2.0"), at(1)).unwrap();
+        assert!(r.binary_sha256.is_empty());
     }
 
     #[test]
