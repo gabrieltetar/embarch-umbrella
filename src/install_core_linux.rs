@@ -54,6 +54,7 @@ pub struct LinPaths {
     pub public_key: String,
     pub firmware_staging: String,
     pub results: String,
+    pub logs: String,
     pub token: String,
     pub person_token: String,
     pub fingerprint: String,
@@ -69,6 +70,7 @@ pub fn paths(version: &str) -> LinPaths {
         public_key: format!("{DATA_DIR}/store/public-key"),
         firmware_staging: format!("{DATA_DIR}/staging"),
         results: format!("{DATA_DIR}/study_results"),
+        logs: format!("{DATA_DIR}/logs"),
         token: format!("{DATA_DIR}/token"),
         person_token: format!("{DATA_DIR}/person-token"),
         fingerprint: format!("{DATA_DIR}/core-fingerprint"),
@@ -179,8 +181,9 @@ pub fn step_binary(i: &LinInputs) -> String {
 /// Step 2: the accounts and the protected store. The `embarch` user (no
 /// login, no home) and the `embarch-users` group are made when absent; the
 /// store starts empty, `embarch`'s alone, and is never emptied here.
-/// `study_results/` is the service's to write (Core puts run directories in
-/// the data dir beside the tokens, which is root-owned).
+/// `study_results/` and `logs/` are the service's to write (Core puts run
+/// directories and its daily log files in the data dir beside the tokens,
+/// which is root-owned); `logs/` is `embarch-users`-readable (decision 70).
 pub fn step_store(i: &LinInputs) -> String {
     let p = i.paths();
     let mut s = format!(
@@ -204,6 +207,7 @@ pub fn step_store(i: &LinInputs) -> String {
          install -d -m 0755 -o root -g root '{data}'\n\
          install -d -m 0700 -o '{user}' -g '{user}' '{store}'\n\
          install -d -m 0750 -o '{user}' -g '{users}' '{results}'\n\
+         install -d -m 0750 -o '{user}' -g '{users}' '{logs}'\n\
          echo 'STEP 2 OK store {store}'\n",
         user = SERVICE_USER,
         users = USERS_GROUP,
@@ -211,6 +215,7 @@ pub fn step_store(i: &LinInputs) -> String {
         data = p.data_dir,
         store = p.store,
         results = p.results,
+        logs = p.logs,
     );
     s
 }
@@ -330,7 +335,7 @@ pub fn render_plan(bind: &str, engineer: Option<&str>) -> String {
     let mut s = String::from("  Linux half (one POSIX shell script run as root, its stdout read as the transcript):\n");
     let _ = writeln!(s, "    0. preflight: root, systemctl, your account; refuse a {} that exists and is not a plain directory owned by {SERVICE_USER}; nothing is written before this", p.store);
     let _ = writeln!(s, "    1. {}: root, 0755; the verified embarch-core copied in and hashed again", p.bin_dir);
-    let _ = writeln!(s, "    2. user {SERVICE_USER} (no login) and group {USERS_GROUP} when absent, {SERVICE_USER} joins {}, {placeholder_eng} joins {USERS_GROUP}; {}: {SERVICE_USER} 0700, starts empty; {}: {SERVICE_USER}, 0750", DEVICE_GROUPS.join("/"), p.store, p.results, placeholder_eng = placeholder.engineer);
+    let _ = writeln!(s, "    2. user {SERVICE_USER} (no login) and group {USERS_GROUP} when absent, {SERVICE_USER} joins {}, {placeholder_eng} joins {USERS_GROUP}; {}: {SERVICE_USER} 0700, starts empty; {}, {}: {SERVICE_USER}:{USERS_GROUP} 0750", DEVICE_GROUPS.join("/"), p.store, p.results, p.logs, placeholder_eng = placeholder.engineer);
     let _ = writeln!(s, "    3. {}: root:{USERS_GROUP} 0770", p.firmware_staging);
     let _ = writeln!(s, "    4. {} and {}: written when absent; {SERVICE_USER}:{USERS_GROUP} 0640", p.token, p.person_token);
     let _ = writeln!(s, "    5. {} install --service --bind {bind}: writes the unit with User={SERVICE_USER}", p.bin);
@@ -442,6 +447,7 @@ mod tests {
         assert!(s.contains("install -d -m 0755 -o root -g root '/var/lib/embarch'"));
         assert!(s.contains("install -d -m 0700 -o 'embarch' -g 'embarch' '/var/lib/embarch/store'"));
         assert!(s.contains("install -d -m 0750 -o 'embarch' -g 'embarch-users' '/var/lib/embarch/study_results'"));
+        assert!(s.contains("install -d -m 0750 -o 'embarch' -g 'embarch-users' '/var/lib/embarch/logs'"));
         assert!(!s.contains("rm "), "the store is never emptied");
     }
 
