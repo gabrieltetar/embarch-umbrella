@@ -523,11 +523,11 @@ async fn restore_service_cmd(service: Option<String>) -> i32 {
     }
 }
 
-const DEPLOY_WAITS: deploy_dev::Waits = deploy_dev::Waits { attempts: 40, interval: std::time::Duration::from_millis(500) };
+pub(crate) const DEPLOY_WAITS: deploy_dev::Waits = deploy_dev::Waits { attempts: 40, interval: std::time::Duration::from_millis(500) };
 
 /// Core's HTTP face, resolved fresh each call: the process on the port changes
 /// during a deploy, and so can its token.
-struct RealCore;
+pub(crate) struct RealCore;
 
 impl RealCore {
     async fn target(&self) -> Result<(String, String), String> {

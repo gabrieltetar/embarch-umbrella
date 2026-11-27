@@ -62,6 +62,15 @@ pub struct InstalledRelease {
     pub staging: String,
     /// UTC, RFC 3339.
     pub installed_at: String,
+    /// The engineer said the agent runs in a container, and an elevated
+    /// install wrote the start-and-stop grant (decision 72). Sticky: a later
+    /// install without the flag keeps it, since nothing here removes a grant.
+    /// Absent in a record written before decision 72.
+    #[serde(default)]
+    pub agent_in_container: bool,
+    /// UTC, RFC 3339: the install that last made the statement.
+    #[serde(default)]
+    pub agent_in_container_at: Option<String>,
 }
 
 /// Why an install stopped. Nothing was recorded for any of them.
@@ -115,11 +124,17 @@ pub struct Plan {
     pub data_dir: PathBuf,
     pub allow_downgrade: bool,
     pub installed: Option<String>,
+    pub agent_in_container: bool,
 }
 
 impl Plan {
     /// Reads the existing record, if any; writes nothing.
-    pub fn build(source: &Path, data_dir: &Path, allow_downgrade: bool) -> Result<Plan, InstallCoreError> {
+    pub fn build(
+        source: &Path,
+        data_dir: &Path,
+        allow_downgrade: bool,
+        agent_in_container: bool,
+    ) -> Result<Plan, InstallCoreError> {
         let installed = read_record(data_dir)?.map(|r| r.suite_version);
         Ok(Plan {
             source: source.to_path_buf(),
@@ -127,6 +142,7 @@ impl Plan {
             data_dir: data_dir.to_path_buf(),
             allow_downgrade,
             installed,
+            agent_in_container,
         })
     }
 
@@ -152,6 +168,11 @@ impl Plan {
             None => "  4. no installed-release.json: nothing to compare with\n".to_string(),
         };
         s += &format!("  5. write {}\n", self.data_dir.join(RECORD_FILE).display());
+        if self.agent_in_container {
+            s += "  --agent-in-container: the engineer's account will be allowed to start and stop the Core service, and nothing else about it (record the statement; see the platform half below)\n";
+        } else {
+            s += "  no --agent-in-container: no start or stop right is granted; stopping and starting the service need elevation\n";
+        }
         s
     }
 }
@@ -164,6 +185,7 @@ pub fn install_core_elevated(
     source: &Path,
     data_dir: &Path,
     allow_downgrade: bool,
+    agent_in_container: bool,
     verifier: &dyn Fn(&Path) -> Result<Verified, VerifyError>,
     now: SystemTime,
 ) -> Result<InstalledRelease, InstallCoreError> {
@@ -183,6 +205,7 @@ pub fn install_core_elevated(
         n,
         previous.as_ref(),
         allow_downgrade,
+        agent_in_container,
         verifier,
         now,
     );
@@ -200,6 +223,7 @@ fn stage_and_record(
     n: u64,
     previous: Option<&InstalledRelease>,
     allow_downgrade: bool,
+    agent_in_container: bool,
     verifier: &dyn Fn(&Path) -> Result<Verified, VerifyError>,
     now: SystemTime,
 ) -> Result<InstalledRelease, InstallCoreError> {
@@ -257,6 +281,17 @@ fn stage_and_record(
         .into_iter()
         .collect();
 
+    // The statement is sticky: nothing here removes a grant, so a record
+    // that forgot one would understate what the machine allows.
+    let (statement, statement_at) = if agent_in_container {
+        (true, Some(rfc3339_utc(now)))
+    } else {
+        match previous {
+            Some(p) if p.agent_in_container => (true, p.agent_in_container_at.clone()),
+            _ => (false, None),
+        }
+    };
+
     let record = InstalledRelease {
         schema_version: RECORD_SCHEMA_VERSION,
         suite_version: verified.suite_version,
@@ -271,6 +306,8 @@ fn stage_and_record(
         previous_suite_version: previous.map(|p| p.suite_version.clone()),
         staging: format!("{STAGING_DIR}/{n}"),
         installed_at: rfc3339_utc(now),
+        agent_in_container: statement,
+        agent_in_container_at: statement_at,
     };
     write_record(data_dir, &record)?;
     Ok(record)
@@ -468,6 +505,7 @@ pub async fn run(
     dry_run: bool,
     trusted_root: Option<PathBuf>,
     refresh: bool,
+    agent_in_container: bool,
 ) -> i32 {
     let data_dir = match data_dir
         .or_else(|| crate::setup::data_dir_for(embarch_topology::software::TopologyClass::Local, cfg!(windows)))
@@ -478,7 +516,7 @@ pub async fn run(
             return 1;
         }
     };
-    let plan = match Plan::build(&source, &data_dir, allow_downgrade) {
+    let plan = match Plan::build(&source, &data_dir, allow_downgrade, agent_in_container) {
         Ok(p) => p,
         Err(e) => {
             eprintln!("install-core: {e}");
@@ -487,7 +525,7 @@ pub async fn run(
     };
     print!("{}", plan.render());
     let bind = embarch_topology::software::recommended_bind_address(embarch_topology::software::TopologyClass::Local);
-    print!("{}", platform_plan(&data_dir, bind));
+    print!("{}", platform_plan(&data_dir, bind, agent_in_container));
     if dry_run {
         println!("Dry run: nothing was changed.");
         return 0;
@@ -506,7 +544,7 @@ pub async fn run(
     };
     let label = trust.describe();
     let verifier = |dir: &Path| verify_release_with_root(dir, &root, &label);
-    match install_core_elevated(&source, &data_dir, allow_downgrade, &verifier, SystemTime::now()) {
+    match install_core_elevated(&source, &data_dir, allow_downgrade, agent_in_container, &verifier, SystemTime::now()) {
         Ok(r) => {
             println!("INSTALLED suite {} (verified in {})", r.suite_version, r.staging);
             println!("  signed by: {}", r.identity);
@@ -515,7 +553,7 @@ pub async fn run(
                 println!("  note:      older than the previous {}; recorded as a downgrade",
                     r.previous_suite_version.as_deref().unwrap_or("?"));
             }
-            windows_half(&data_dir, &r, bind)
+            windows_half(&data_dir, &r, bind, agent_in_container)
         }
         Err(e) => {
             eprintln!("install-core: {e}");
@@ -526,10 +564,10 @@ pub async fn run(
 
 /// The platform half's plan, for the default data dir; the other cases say
 /// why nothing follows the record.
-fn platform_plan(data_dir: &Path, bind: &str) -> String {
+fn platform_plan(data_dir: &Path, bind: &str, agent_in_container: bool) -> String {
     if cfg!(windows) {
         return match windows_dirs(data_dir) {
-            Some((pf, dd)) => crate::install_core_win::render_plan(&pf, &dd, bind, None),
+            Some((pf, dd)) => crate::install_core_win::render_plan(&pf, &dd, bind, None, agent_in_container),
             None => "  Not done here: installing and registering Core, because --data-dir is not the \
                      default %ProgramData%\\embarch (Core reads its record from the default only).\n"
                 .to_string(),
@@ -545,7 +583,7 @@ fn platform_plan(data_dir: &Path, bind: &str) -> String {
             crate::install_core_linux::DATA_DIR
         );
     }
-    crate::install_core_linux::render_plan(bind, std::env::var("SUDO_USER").ok().as_deref())
+    crate::install_core_linux::render_plan(bind, std::env::var("SUDO_USER").ok().as_deref(), agent_in_container)
 }
 
 /// `(%ProgramFiles%, data dir)` when `data_dir` is the default one.
@@ -558,7 +596,7 @@ fn windows_dirs(data_dir: &Path) -> Option<(String, String)> {
 /// After the record is written: on Windows with the default data dir, run the
 /// generated elevated script. Returns the exit code.
 #[cfg(windows)]
-fn windows_half(data_dir: &Path, r: &InstalledRelease, bind: &str) -> i32 {
+fn windows_half(data_dir: &Path, r: &InstalledRelease, bind: &str, agent_in_container: bool) -> i32 {
     use crate::install_core_win as win;
     let Some((program_files, dd)) = windows_dirs(data_dir) else {
         println!("  Core was not installed or registered: --data-dir is not the default %ProgramData%\\embarch.");
@@ -595,6 +633,7 @@ fn windows_half(data_dir: &Path, r: &InstalledRelease, bind: &str) -> i32 {
         engineer_sid,
         bind: bind.to_string(),
         log: tmp.join("embarch-install-core.log").to_string_lossy().into_owned(),
+        agent_in_container,
     };
     let host = win::RealHost {
         script_path: tmp.join("embarch-install-core-elevated.ps1"),
@@ -603,6 +642,9 @@ fn windows_half(data_dir: &Path, r: &InstalledRelease, bind: &str) -> i32 {
     match win::run_windows_half(&host, &inputs) {
         Ok(fp) => {
             println!("CORE INSTALLED under {} (service {})", win::SERVICE_ACCOUNT, win::SERVICE);
+            if agent_in_container {
+                println!("  granted: your account may start, stop and query {} (not change it)", win::SERVICE);
+            }
             println!("  fingerprint: {fp}");
             0
         }
@@ -618,7 +660,7 @@ fn windows_half(data_dir: &Path, r: &InstalledRelease, bind: &str) -> i32 {
 /// After the record is written, on Linux with the default data dir: run the
 /// generated script as this (root) process. Returns the exit code.
 #[cfg(target_os = "linux")]
-fn windows_half(data_dir: &Path, r: &InstalledRelease, bind: &str) -> i32 {
+fn windows_half(data_dir: &Path, r: &InstalledRelease, bind: &str, agent_in_container: bool) -> i32 {
     use crate::install_core_linux as lin;
     if data_dir != Path::new(lin::DATA_DIR) {
         println!("  Core was not installed or registered: --data-dir is not the default {}.", lin::DATA_DIR);
@@ -646,10 +688,14 @@ fn windows_half(data_dir: &Path, r: &InstalledRelease, bind: &str) -> i32 {
         binary_sha256: sha.clone(),
         engineer,
         bind: bind.to_string(),
+        agent_in_container,
     };
     match lin::run_linux_half(&lin::RealHost, &inputs) {
         Ok(fp) => {
             println!("CORE INSTALLED as user {} (service {})", lin::SERVICE_USER, lin::SERVICE);
+            if agent_in_container {
+                println!("  granted: polkit lets {} start and stop {} (nothing else)", inputs.engineer, lin::UNIT);
+            }
             println!("  fingerprint: {fp}");
             println!("  log out and in (or `newgrp {}`) before reading the token file: your group membership is new", lin::USERS_GROUP);
             0
@@ -664,7 +710,7 @@ fn windows_half(data_dir: &Path, r: &InstalledRelease, bind: &str) -> i32 {
 }
 
 #[cfg(not(any(windows, target_os = "linux")))]
-fn windows_half(_data_dir: &Path, _r: &InstalledRelease, _bind: &str) -> i32 {
+fn windows_half(_data_dir: &Path, _r: &InstalledRelease, _bind: &str, _agent_in_container: bool) -> i32 {
     0
 }
 
@@ -717,7 +763,7 @@ mod tests {
     #[test]
     fn a_passing_release_writes_every_field() {
         let (rel, data) = (release("1.2.0"), tmp("data"));
-        let r = install_core_elevated(&rel, &data, false, &ok("1.2.0"), at(1_000_000_000)).unwrap();
+        let r = install_core_elevated(&rel, &data, false, false, &ok("1.2.0"), at(1_000_000_000)).unwrap();
         assert_eq!(r.suite_version, "1.2.0");
         assert_eq!(r.identity, "the-identity");
         assert_eq!(r.issuer, "the-issuer");
@@ -735,7 +781,7 @@ mod tests {
     #[test]
     fn the_record_carries_binary_sha256_in_cores_shape() {
         let (rel, data) = (release("1.2.0"), tmp("data"));
-        install_core_elevated(&rel, &data, false, &ok("1.2.0"), at(1)).unwrap();
+        install_core_elevated(&rel, &data, false, false, &ok("1.2.0"), at(1)).unwrap();
         // What `embarch-core install --service` reads: an array of lowercase hex.
         #[derive(Deserialize)]
         struct CoreView {
@@ -761,10 +807,65 @@ mod tests {
     }
 
     #[test]
+    fn the_container_statement_is_recorded_with_its_date() {
+        let data = tmp("data");
+        let rel = release("1.2.0");
+        let r = install_core_elevated(&rel, &data, false, true, &ok("1.2.0"), at(1_000_000_000)).unwrap();
+        assert!(r.agent_in_container);
+        assert_eq!(r.agent_in_container_at.as_deref(), Some("2001-09-09T01:46:40Z"));
+        let read = read_record(&data).unwrap().unwrap();
+        assert_eq!(read, r);
+        let json = fs::read_to_string(data.join(RECORD_FILE)).unwrap();
+        assert!(json.contains("\"agent_in_container\": true"), "{json}");
+    }
+
+    #[test]
+    fn without_the_flag_nothing_is_stated() {
+        let data = tmp("data");
+        let r = install_core_elevated(&release("1.2.0"), &data, false, false, &ok("1.2.0"), at(1)).unwrap();
+        assert!(!r.agent_in_container);
+        assert_eq!(r.agent_in_container_at, None);
+    }
+
+    #[test]
+    fn a_later_install_without_the_flag_keeps_the_statement_and_its_date() {
+        let data = tmp("data");
+        install_core_elevated(&release("1.2.0"), &data, false, true, &ok("1.2.0"), at(1_000_000_000)).unwrap();
+        let r = install_core_elevated(&release("1.3.0"), &data, false, false, &ok("1.3.0"), at(2_000_000_000)).unwrap();
+        assert!(r.agent_in_container, "nothing removes the grant, so the record must not forget it");
+        assert_eq!(r.agent_in_container_at.as_deref(), Some("2001-09-09T01:46:40Z"));
+        // Stating it again moves the date.
+        let r = install_core_elevated(&release("1.4.0"), &data, false, true, &ok("1.4.0"), at(2_000_000_000)).unwrap();
+        assert_eq!(r.agent_in_container_at.as_deref(), Some("2033-05-18T03:33:20Z"));
+    }
+
+    #[test]
+    fn a_record_from_before_the_container_statement_still_reads() {
+        let data = tmp("data");
+        let old = r#"{"schema_version":1,"suite_version":"1.2.0","manifest_sha256":"x","identity":"i","issuer":"s",
+            "log_time":null,"binaries":{},"allow_downgrade":false,"downgraded":false,
+            "previous_suite_version":null,"staging":"release-staging/1","installed_at":"2026-11-25T00:00:00Z"}"#;
+        fs::write(data.join(RECORD_FILE), old).unwrap();
+        let r = read_record(&data).unwrap().unwrap();
+        assert!(!r.agent_in_container);
+        assert_eq!(r.agent_in_container_at, None);
+    }
+
+    #[test]
+    fn the_plan_says_whether_a_grant_will_be_written() {
+        let data = tmp("data");
+        let rel = release("1.2.0");
+        let without = Plan::build(&rel, &data, false, false).unwrap().render();
+        assert!(without.contains("no --agent-in-container"), "{without}");
+        let with = Plan::build(&rel, &data, false, true).unwrap().render();
+        assert!(with.contains("--agent-in-container: the engineer's account will be allowed"), "{with}");
+    }
+
+    #[test]
     fn a_release_without_core_records_an_empty_binary_sha256() {
         let (rel, data) = (release("1.2.0"), tmp("data"));
         fs::remove_file(rel.join(locate::native_name("embarch-core"))).unwrap();
-        let r = install_core_elevated(&rel, &data, false, &ok("1.2.0"), at(1)).unwrap();
+        let r = install_core_elevated(&rel, &data, false, false, &ok("1.2.0"), at(1)).unwrap();
         assert!(r.binary_sha256.is_empty());
     }
 
@@ -772,7 +873,7 @@ mod tests {
     fn a_failing_release_writes_nothing() {
         let (rel, data) = (release("1.2.0"), tmp("data"));
         let bad = |_: &Path| Err(VerifyError::FileMissing("embarch-core".into()));
-        let e = install_core_elevated(&rel, &data, false, &bad, at(0)).unwrap_err();
+        let e = install_core_elevated(&rel, &data, false, false, &bad, at(0)).unwrap_err();
         assert!(matches!(e, InstallCoreError::Verify(_)));
         assert!(!data.join(RECORD_FILE).exists());
         assert_eq!(fs::read_dir(data.join(STAGING_DIR)).unwrap().count(), 0);
@@ -781,19 +882,19 @@ mod tests {
     #[test]
     fn a_failure_leaves_an_existing_record_untouched() {
         let (rel, data) = (release("1.2.0"), tmp("data"));
-        install_core_elevated(&rel, &data, false, &ok("1.2.0"), at(1)).unwrap();
+        install_core_elevated(&rel, &data, false, false, &ok("1.2.0"), at(1)).unwrap();
         let before = fs::read(data.join(RECORD_FILE)).unwrap();
         let bad = |_: &Path| Err(VerifyError::Signature("no".into()));
-        assert!(install_core_elevated(&rel, &data, false, &bad, at(2)).is_err());
+        assert!(install_core_elevated(&rel, &data, false, false, &bad, at(2)).is_err());
         assert_eq!(fs::read(data.join(RECORD_FILE)).unwrap(), before);
     }
 
     #[test]
     fn an_older_suite_is_refused() {
         let data = tmp("data");
-        install_core_elevated(&release("1.2.0"), &data, false, &ok("1.2.0"), at(1)).unwrap();
+        install_core_elevated(&release("1.2.0"), &data, false, false, &ok("1.2.0"), at(1)).unwrap();
         let before = fs::read(data.join(RECORD_FILE)).unwrap();
-        let e = install_core_elevated(&release("1.1.9"), &data, false, &ok("1.1.9"), at(2)).unwrap_err();
+        let e = install_core_elevated(&release("1.1.9"), &data, false, false, &ok("1.1.9"), at(2)).unwrap_err();
         assert!(matches!(e, InstallCoreError::Downgrade { .. }), "{e}");
         assert_eq!(fs::read(data.join(RECORD_FILE)).unwrap(), before);
     }
@@ -801,8 +902,8 @@ mod tests {
     #[test]
     fn allow_downgrade_installs_and_records_it() {
         let data = tmp("data");
-        install_core_elevated(&release("1.2.0"), &data, false, &ok("1.2.0"), at(1)).unwrap();
-        let r = install_core_elevated(&release("1.1.9"), &data, true, &ok("1.1.9"), at(2)).unwrap();
+        install_core_elevated(&release("1.2.0"), &data, false, false, &ok("1.2.0"), at(1)).unwrap();
+        let r = install_core_elevated(&release("1.1.9"), &data, true, false, &ok("1.1.9"), at(2)).unwrap();
         assert!(r.allow_downgrade && r.downgraded);
         assert_eq!(r.previous_suite_version.as_deref(), Some("1.2.0"));
         assert_eq!(r.staging, "release-staging/2");
@@ -812,26 +913,26 @@ mod tests {
     #[test]
     fn a_newer_or_equal_suite_is_not_a_downgrade() {
         let data = tmp("data");
-        install_core_elevated(&release("1.2.0"), &data, false, &ok("1.2.0"), at(1)).unwrap();
-        let r = install_core_elevated(&release("1.2.0"), &data, false, &ok("1.2.0"), at(2)).unwrap();
+        install_core_elevated(&release("1.2.0"), &data, false, false, &ok("1.2.0"), at(1)).unwrap();
+        let r = install_core_elevated(&release("1.2.0"), &data, false, false, &ok("1.2.0"), at(2)).unwrap();
         assert!(!r.downgraded);
-        let r = install_core_elevated(&release("1.10.0"), &data, false, &ok("1.10.0"), at(3)).unwrap();
+        let r = install_core_elevated(&release("1.10.0"), &data, false, false, &ok("1.10.0"), at(3)).unwrap();
         assert!(!r.downgraded);
     }
 
     #[test]
     fn an_unorderable_version_is_refused_without_the_flag() {
         let data = tmp("data");
-        install_core_elevated(&release("1.2.0"), &data, false, &ok("1.2.0"), at(1)).unwrap();
-        let e = install_core_elevated(&release("weird"), &data, false, &ok("weird"), at(2)).unwrap_err();
+        install_core_elevated(&release("1.2.0"), &data, false, false, &ok("1.2.0"), at(1)).unwrap();
+        let e = install_core_elevated(&release("weird"), &data, false, false, &ok("weird"), at(2)).unwrap_err();
         assert!(matches!(e, InstallCoreError::UnorderedVersion { .. }));
-        assert!(install_core_elevated(&release("weird"), &data, true, &ok("weird"), at(2)).is_ok());
+        assert!(install_core_elevated(&release("weird"), &data, true, false, &ok("weird"), at(2)).is_ok());
     }
 
     #[test]
     fn dry_run_plan_touches_nothing() {
         let (rel, data) = (release("1.2.0"), tmp("data"));
-        let plan = Plan::build(&rel, &data, false).unwrap();
+        let plan = Plan::build(&rel, &data, false, false).unwrap();
         let text = plan.render();
         assert!(text.contains("release-staging") && text.contains("installed-release.json"));
         assert_eq!(fs::read_dir(&data).unwrap().count(), 0);
@@ -852,7 +953,7 @@ mod tests {
             .status().unwrap();
         assert!(st.success());
         let data = tmp("data");
-        let r = install_core_elevated(&archive, &data, false, &ok("1.2.0"), at(1)).unwrap();
+        let r = install_core_elevated(&archive, &data, false, false, &ok("1.2.0"), at(1)).unwrap();
         assert_eq!(r.binaries.len(), 2);
     }
 
@@ -861,7 +962,7 @@ mod tests {
     fn staging_is_owner_only() {
         use std::os::unix::fs::PermissionsExt;
         let (rel, data) = (release("1.2.0"), tmp("data"));
-        install_core_elevated(&rel, &data, false, &ok("1.2.0"), at(1)).unwrap();
+        install_core_elevated(&rel, &data, false, false, &ok("1.2.0"), at(1)).unwrap();
         let mode = fs::metadata(data.join(STAGING_DIR)).unwrap().permissions().mode();
         assert_eq!(mode & 0o777, 0o700);
     }

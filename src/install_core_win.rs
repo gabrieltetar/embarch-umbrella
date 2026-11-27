@@ -28,6 +28,13 @@ pub const STEPS: [(u8, &str); 7] = [
     (6, "start-and-fingerprint"),
 ];
 
+/// The grant step, which only `--agent-in-container` adds (decision 72).
+pub const GRANT_STEP: (u8, &str) = (7, "grant");
+/// The service rights the grant gives the engineer, as SDDL letters
+/// (decision 72): `RP` start, `WP` stop, `LC` query status. Nothing else:
+/// no `DC` change config, no `WD` write DAC, no `WO` write owner.
+pub const GRANT_RIGHTS: &str = "RPWPLC";
+
 /// What the script is built from. Paths are Windows paths, as strings.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WinInputs {
@@ -47,6 +54,8 @@ pub struct WinInputs {
     pub bind: String,
     /// Where the elevated script logs.
     pub log: String,
+    /// `--agent-in-container`: add the start-and-stop grant (decision 72).
+    pub agent_in_container: bool,
 }
 
 /// Every folder and file the script writes, derived once so the plan and the
@@ -286,6 +295,62 @@ pub fn step_start_and_fingerprint(i: &WinInputs) -> String {
     )
 }
 
+/// The one ACE the grant adds: allow `sid` start, stop and query status.
+pub fn grant_ace(sid: &str) -> String {
+    format!("(A;;{GRANT_RIGHTS};;;{sid})")
+}
+
+/// The service's security descriptor with one ACE added for `sid`: start,
+/// stop and query status ([`GRANT_RIGHTS`]). Text in, text out. The ACE goes
+/// at the end of the DACL, before the SACL when there is one, so every other
+/// ACE stays where it was and in order. A descriptor that already holds this
+/// exact ACE comes back unchanged, so a second install adds nothing. A
+/// descriptor with no DACL is refused: it would read as "everyone", and
+/// adding an ACE would turn it into a restrictive one. The generated step 7
+/// makes the same edit in PowerShell and the transcript is checked against
+/// this function (decision 72).
+pub fn add_start_stop_ace(sddl: &str, sid: &str) -> Result<String, String> {
+    let sddl = sddl.trim();
+    let ok_sid = sid.starts_with("S-1-") && sid.chars().all(|c| c.is_ascii_digit() || c == 'S' || c == '-');
+    if !ok_sid {
+        return Err(format!("{sid:?} is not a SID"));
+    }
+    let Some(d) = sddl.find("D:") else {
+        return Err("the descriptor has no DACL".to_string());
+    };
+    let ace = grant_ace(sid);
+    if sddl.contains(&ace) {
+        return Ok(sddl.to_string());
+    }
+    let end = sddl[d..].find("S:").map_or(sddl.len(), |s| d + s);
+    Ok(format!("{}{}{}", &sddl[..end], ace, &sddl[end..]))
+}
+
+/// Step 7, only with `--agent-in-container`: add the grant to the service's
+/// descriptor (`sc sdshow`, edit, `sc sdset`) and print the descriptor before
+/// and after, for the caller to check against [`add_start_stop_ace`].
+pub fn step_grant(i: &WinInputs) -> String {
+    format!(
+        "  $step = '7 grant'\n\
+         \x20 $sd = ((& sc.exe sdshow {svc}) | ForEach-Object {{ $_.Trim() }} | Where-Object {{ $_ }}) -join ''\n\
+         \x20 if ($sd -notmatch '^D:') {{ throw ('cannot read the service descriptor: ' + $sd) }}\n\
+         \x20 $ace = '{ace}'\n\
+         \x20 $new = $sd\n\
+         \x20 if (-not $sd.Contains($ace)) {{\n\
+         \x20   $s = $sd.IndexOf('S:')\n\
+         \x20   if ($s -ge 0) {{ $new = $sd.Substring(0, $s) + $ace + $sd.Substring($s) }} else {{ $new = $sd + $ace }}\n\
+         \x20   & sc.exe sdset {svc} $new | Out-Null\n\
+         \x20   if ($LASTEXITCODE -ne 0) {{ throw ('sc sdset failed (' + $LASTEXITCODE + ')') }}\n\
+         \x20 }}\n\
+         \x20 $after = ((& sc.exe sdshow {svc}) | ForEach-Object {{ $_.Trim() }} | Where-Object {{ $_ }}) -join ''\n\
+         \x20 Say ('GRANT-BEFORE ' + $sd)\n\
+         \x20 Say ('GRANT-AFTER ' + $after)\n\
+         \x20 Say 'STEP 7 OK grant {svc}'\n",
+        svc = SERVICE,
+        ace = grant_ace(&i.engineer_sid),
+    )
+}
+
 /// The whole script, in step order.
 pub fn build_script(i: &WinInputs) -> String {
     let mut s = header(&i.log);
@@ -296,6 +361,9 @@ pub fn build_script(i: &WinInputs) -> String {
     s += &step_tokens(i);
     s += &step_register(i);
     s += &step_start_and_fingerprint(i);
+    if i.agent_in_container {
+        s += &step_grant(i);
+    }
     s += FOOTER;
     s
 }
@@ -303,7 +371,7 @@ pub fn build_script(i: &WinInputs) -> String {
 /// What `--dry-run` prints for the Windows half: the paths and the ACLs it
 /// would set. The version, SID and staging number are not known before a
 /// verified release exists, so they print as placeholders.
-pub fn render_plan(program_files: &str, data_dir: &str, bind: &str, engineer_sid: Option<&str>) -> String {
+pub fn render_plan(program_files: &str, data_dir: &str, bind: &str, engineer_sid: Option<&str>, agent_in_container: bool) -> String {
     let p = paths(program_files, data_dir, "<suite version>");
     let me = engineer_sid.unwrap_or("<your SID>");
     let mut s = String::from("  Windows half (one elevated PowerShell script, logged from inside it):\n");
@@ -314,6 +382,11 @@ pub fn render_plan(program_files: &str, data_dir: &str, bind: &str, engineer_sid
     let _ = writeln!(s, "    4. {} and {}: written when absent; {SERVICE_ACCOUNT} and Administrators full, {me} read", p.token, p.person_token);
     let _ = writeln!(s, "    5. {} install --service --bind {bind}: registers it under {SERVICE_ACCOUNT}", p.bin_exe);
     let _ = writeln!(s, "    6. start {SERVICE}, wait for RUNNING, write {} (SHA-256 of {}): Administrators write, Users read; print it", p.fingerprint, p.public_key);
+    if agent_in_container {
+        let _ = writeln!(s, "    7. (--agent-in-container) add one ACE to {SERVICE}'s security descriptor: {me} may start, stop and query status ({GRANT_RIGHTS}), never change its configuration or its security");
+    } else {
+        let _ = writeln!(s, "    (no --agent-in-container: {me} gets no right to start or stop {SERVICE}; both need elevation)");
+    }
     s
 }
 
@@ -321,22 +394,31 @@ pub fn render_plan(program_files: &str, data_dir: &str, bind: &str, engineer_sid
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Outcome {
     pub fingerprint: String,
+    /// The service descriptor before and after step 7, when the grant ran.
+    pub grant: Option<(String, String)>,
 }
 
 /// Reads the elevated script's transcript. `Ok` only when the script said it
 /// was done, every step reported OK, and a 64-hex fingerprint was printed;
-/// otherwise each failed or silent step is named.
-pub fn parse_transcript(text: &str) -> Result<Outcome, Vec<String>> {
+/// otherwise each failed or silent step is named. With `grant`, step 7 must
+/// also have reported OK (`--agent-in-container`); without it a step 7 line is
+/// not looked for.
+pub fn parse_transcript(text: &str, grant: bool) -> Result<Outcome, Vec<String>> {
     let mut problems: Vec<String> = Vec::new();
     let mut ok = [false; STEPS.len()];
     let mut failed = [false; STEPS.len()];
     let mut fingerprint = None;
     let mut done = false;
+    let (mut grant_ok, mut grant_failed) = (false, false);
+    let (mut before, mut after) = (None, None);
     for line in text.replace('\u{0}', "").lines().map(str::trim) {
         if let Some(rest) = line.strip_prefix("STEP ") {
             if let Some(n) = rest.split_whitespace().next().and_then(|n| n.parse::<usize>().ok()) {
                 if rest.split_whitespace().nth(1) == Some("OK") && n < ok.len() {
                     ok[n] = true;
+                }
+                if usize::from(GRANT_STEP.0) == n && rest.split_whitespace().nth(1) == Some("OK") {
+                    grant_ok = true;
                 }
             }
         } else if let Some(rest) = line.strip_prefix("FAILED: step ") {
@@ -345,8 +427,15 @@ pub fn parse_transcript(text: &str) -> Result<Outcome, Vec<String>> {
                 if n < failed.len() {
                     failed[n] = true;
                 }
+                if usize::from(GRANT_STEP.0) == n {
+                    grant_failed = true;
+                }
             }
             problems.push(format!("step {head} failed: {why}"));
+        } else if let Some(sd) = line.strip_prefix("GRANT-BEFORE ") {
+            before = Some(sd.trim().to_string());
+        } else if let Some(sd) = line.strip_prefix("GRANT-AFTER ") {
+            after = Some(sd.trim().to_string());
         } else if let Some(fp) = line.strip_prefix("FINGERPRINT ") {
             fingerprint = Some(fp.trim().to_string());
         } else if line == DONE_MARKER {
@@ -358,13 +447,17 @@ pub fn parse_transcript(text: &str) -> Result<Outcome, Vec<String>> {
             problems.push(format!("step {n} {name}: no result in the transcript"));
         }
     }
+    if grant && !grant_ok && !grant_failed {
+        problems.push(format!("step {} {}: no result in the transcript", GRANT_STEP.0, GRANT_STEP.1));
+    }
     if !done && problems.is_empty() {
         problems.push(format!("the transcript ends without '{DONE_MARKER}'"));
     }
     match fingerprint {
         Some(fp) if fp.len() == 64 && fp.chars().all(|c| matches!(c, '0'..='9' | 'a'..='f')) => {
             if problems.is_empty() {
-                return Ok(Outcome { fingerprint: fp });
+                let grant = if grant { before.zip(after) } else { None };
+                return Ok(Outcome { fingerprint: fp, grant });
             }
         }
         Some(_) => problems.push("the fingerprint line is not 64 lowercase hex".to_string()),
@@ -384,7 +477,20 @@ pub trait Host {
 pub fn run_windows_half<H: Host>(host: &H, inputs: &WinInputs) -> Result<String, Vec<String>> {
     inputs.validate().map_err(|e| vec![e])?;
     let transcript = host.run_script(&build_script(inputs)).map_err(|e| vec![e])?;
-    parse_transcript(&transcript).map(|o| o.fingerprint)
+    let outcome = parse_transcript(&transcript, inputs.agent_in_container)?;
+    if inputs.agent_in_container && outcome.grant.is_none() {
+        return Err(vec!["step 7 grant: the transcript does not show the descriptor before and after".to_string()]);
+    }
+    if let Some((before, after)) = &outcome.grant {
+        let want = add_start_stop_ace(before, &inputs.engineer_sid).map_err(|e| vec![e])?;
+        if want != *after {
+            return Err(vec![format!(
+                "step 7 grant: the service descriptor after the edit is not what was asked for.\n  before: {before}\n  wanted: {want}\n  found:  {after}\n\
+                 The grant may be wrong; inspect it with `sc sdshow {SERVICE}`"
+            )]);
+        }
+    }
+    Ok(outcome.fingerprint)
 }
 
 /// The engineer's SID out of `whoami /user /fo csv /nh`:
@@ -447,7 +553,12 @@ mod tests {
             engineer_sid: "S-1-5-21-1-2-3-1001".into(),
             bind: "127.0.0.1".into(),
             log: r"C:\Users\e\AppData\Local\Temp\embarch-install-core.log".into(),
+            agent_in_container: false,
         }
+    }
+
+    fn with_grant() -> WinInputs {
+        WinInputs { agent_in_container: true, ..inputs() }
     }
 
     #[test]
@@ -578,13 +689,13 @@ mod tests {
 
     #[test]
     fn a_complete_transcript_yields_the_fingerprint() {
-        assert_eq!(parse_transcript(&good_transcript()).unwrap().fingerprint, FP);
+        assert_eq!(parse_transcript(&good_transcript(), false).unwrap().fingerprint, FP);
     }
 
     #[test]
     fn a_failed_step_is_named_and_is_a_failure() {
         let t = "STEP 0 OK preflight\nSTEP 1 OK binary x\nFAILED: step 2 store: icacls failed on C:\\x (5)\n";
-        let e = parse_transcript(t).unwrap_err();
+        let e = parse_transcript(t, false).unwrap_err();
         assert!(e.iter().any(|m| m == r"step 2 store failed: icacls failed on C:\x (5)"), "{e:?}");
         assert!(e.iter().any(|m| m.starts_with("step 3 firmware-staging: no result")), "{e:?}");
         assert!(!e.iter().any(|m| m.starts_with("step 0") || m.starts_with("step 1 ")), "{e:?}");
@@ -593,29 +704,29 @@ mod tests {
     #[test]
     fn a_preflight_refusal_names_step_0() {
         let t = "FAILED: step 0 preflight: the store C:\\s exists and is owned by S-1-5-21-9, not Administrators\n";
-        let e = parse_transcript(t).unwrap_err();
+        let e = parse_transcript(t, false).unwrap_err();
         assert!(e[0].starts_with("step 0 preflight failed: the store"), "{e:?}");
     }
 
     #[test]
     fn a_transcript_without_the_done_marker_is_a_failure() {
         let t = good_transcript().replace(DONE_MARKER, "");
-        let e = parse_transcript(&t).unwrap_err();
+        let e = parse_transcript(&t, false).unwrap_err();
         assert!(e.iter().any(|m| m.contains("without '=== done ==='")), "{e:?}");
     }
 
     #[test]
     fn a_missing_or_malformed_fingerprint_is_a_failure() {
         let no_fp = good_transcript().replace(&format!("FINGERPRINT {FP}\n"), "");
-        assert!(parse_transcript(&no_fp).unwrap_err().iter().any(|m| m.contains("no FINGERPRINT")));
+        assert!(parse_transcript(&no_fp, false).unwrap_err().iter().any(|m| m.contains("no FINGERPRINT")));
         let bad = good_transcript().replace(FP, "xyz");
-        assert!(parse_transcript(&bad).unwrap_err().iter().any(|m| m.contains("not 64 lowercase hex")));
+        assert!(parse_transcript(&bad, false).unwrap_err().iter().any(|m| m.contains("not 64 lowercase hex")));
     }
 
     #[test]
     fn utf16_nuls_in_the_transcript_are_ignored() {
         let t: String = good_transcript().chars().flat_map(|c| [c, '\u{0}']).collect();
-        assert!(parse_transcript(&t).is_ok());
+        assert!(parse_transcript(&t, false).is_ok());
     }
 
     struct Fake {
@@ -652,6 +763,118 @@ mod tests {
         assert!(host.seen.borrow().is_empty());
     }
 
+    /// Windows' default service descriptor shape: a DACL, then a SACL.
+    const SD: &str = "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)";
+    const SID: &str = "S-1-5-21-1-2-3-1001";
+
+    #[test]
+    fn the_grant_gives_start_stop_and_query_status_and_nothing_else() {
+        assert_eq!(GRANT_RIGHTS, "RPWPLC");
+        assert_eq!(grant_ace(SID), "(A;;RPWPLC;;;S-1-5-21-1-2-3-1001)");
+        // None of change-config (DC), write-DAC (WD), write-owner (WO), delete (SD).
+        for forbidden in ["DC", "WD", "WO", "SD", "CC", "RC", "LO", "CR"] {
+            let rights = GRANT_RIGHTS.as_bytes().chunks(2).map(|c| std::str::from_utf8(c).unwrap());
+            assert!(!rights.clone().any(|r| r == forbidden), "{forbidden} must not be granted");
+        }
+    }
+
+    #[test]
+    fn the_descriptor_edit_adds_one_ace_before_the_sacl_and_keeps_the_rest_in_order() {
+        let out = add_start_stop_ace(SD, SID).unwrap();
+        assert_eq!(
+            out,
+            "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)(A;;CCLCSWLOCRRC;;;IU)(A;;CCLCSWLOCRRC;;;SU)(A;;RPWPLC;;;S-1-5-21-1-2-3-1001)S:(AU;FA;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;WD)"
+        );
+        // Removing the new ACE gives back the original text exactly.
+        assert_eq!(out.replace(&grant_ace(SID), ""), SD);
+        assert_eq!(out.matches(&grant_ace(SID)).count(), 1);
+    }
+
+    #[test]
+    fn the_descriptor_edit_without_a_sacl_appends_and_without_a_dacl_refuses() {
+        assert_eq!(
+            add_start_stop_ace("D:(A;;CCLCSWLOCRRC;;;IU)\r\n", SID).unwrap(),
+            "D:(A;;CCLCSWLOCRRC;;;IU)(A;;RPWPLC;;;S-1-5-21-1-2-3-1001)"
+        );
+        assert_eq!(
+            add_start_stop_ace("D:AI(A;;CCLCSWLOCRRC;;;IU)", SID).unwrap(),
+            "D:AI(A;;CCLCSWLOCRRC;;;IU)(A;;RPWPLC;;;S-1-5-21-1-2-3-1001)"
+        );
+        assert!(add_start_stop_ace("S:(AU;FA;CC;;;WD)", SID).is_err());
+        assert!(add_start_stop_ace(SD, "S-1-5-21'").is_err());
+    }
+
+    #[test]
+    fn a_second_install_adds_nothing() {
+        let once = add_start_stop_ace(SD, SID).unwrap();
+        assert_eq!(add_start_stop_ace(&once, SID).unwrap(), once);
+    }
+
+    #[test]
+    fn the_grant_step_makes_the_same_edit_and_names_nothing_else() {
+        let s = step_grant(&with_grant());
+        assert!(s.contains("& sc.exe sdshow com.embarch.core"));
+        assert!(s.contains("$ace = '(A;;RPWPLC;;;S-1-5-21-1-2-3-1001)'"));
+        assert!(s.contains("$sd.Substring(0, $s) + $ace + $sd.Substring($s)"));
+        assert!(s.contains("& sc.exe sdset com.embarch.core $new"));
+        assert!(s.contains("Say 'STEP 7 OK grant"));
+        for other in ["sc.exe config", "sc.exe create", "sc.exe delete", "sc.exe stop", "sc.exe start"] {
+            assert!(!s.contains(other), "{other}");
+        }
+        assert_eq!(s.matches("sc.exe sdset").count(), 1);
+    }
+
+    #[test]
+    fn without_the_flag_the_script_has_no_grant_step_at_all() {
+        let s = build_script(&inputs());
+        for gone in ["sdset", "sdshow", "GRANT-", "STEP 7", "RPWPLC"] {
+            assert!(!s.contains(gone), "{gone} in a script built without --agent-in-container");
+        }
+        let g = build_script(&with_grant());
+        assert!(g.find("STEP 6 OK").unwrap() < g.find("STEP 7 OK grant").unwrap());
+        assert!(g.find("STEP 7 OK grant").unwrap() < g.find("Say '=== done ==='").unwrap());
+        assert_eq!(g.matches("sc.exe sdset").count(), 1);
+    }
+
+    fn granted_transcript(before: &str, after: &str) -> String {
+        good_transcript().replace(
+            DONE_MARKER,
+            &format!("GRANT-BEFORE {before}\nGRANT-AFTER {after}\nSTEP 7 OK grant com.embarch.core\n{DONE_MARKER}"),
+        )
+    }
+
+    #[test]
+    fn a_grant_transcript_must_show_step_7_and_both_descriptors() {
+        let ok = granted_transcript(SD, &add_start_stop_ace(SD, SID).unwrap());
+        assert_eq!(parse_transcript(&ok, true).unwrap().grant.unwrap().0, SD);
+        // Asked for a grant, the plain transcript is a failure.
+        let e = parse_transcript(&good_transcript(), true).unwrap_err();
+        assert!(e.iter().any(|m| m.starts_with("step 7 grant: no result")), "{e:?}");
+        // Not asked for one, a step 7 line is not looked for.
+        assert!(parse_transcript(&good_transcript(), false).unwrap().grant.is_none());
+        let bare = good_transcript().replace(DONE_MARKER, &format!("STEP 7 OK grant\n{DONE_MARKER}"));
+        assert!(parse_transcript(&bare, true).unwrap().grant.is_none());
+        let host = Fake { reply: Ok(bare), seen: RefCell::new(vec![]) };
+        let e = run_windows_half(&host, &with_grant()).unwrap_err();
+        assert!(e[0].contains("before and after"), "{e:?}");
+        let failed = good_transcript().replace(DONE_MARKER, "FAILED: step 7 grant: sc sdset failed (5)");
+        let e = parse_transcript(&failed, true).unwrap_err();
+        assert!(e.iter().any(|m| m.contains("step 7 grant failed")), "{e:?}");
+    }
+
+    #[test]
+    fn the_sequence_checks_the_descriptor_against_the_pure_edit() {
+        let right = add_start_stop_ace(SD, SID).unwrap();
+        let host = Fake { reply: Ok(granted_transcript(SD, &right)), seen: RefCell::new(vec![]) };
+        assert_eq!(run_windows_half(&host, &with_grant()).unwrap(), FP);
+        assert_eq!(host.seen.borrow().as_slice(), [build_script(&with_grant())]);
+        // A descriptor that gained something else is a failure.
+        let wrong = format!("{right}(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;S-1-5-21-1-2-3-1001)");
+        let host = Fake { reply: Ok(granted_transcript(SD, &wrong)), seen: RefCell::new(vec![]) };
+        let e = run_windows_half(&host, &with_grant()).unwrap_err();
+        assert!(e[0].contains("not what was asked for"), "{e:?}");
+    }
+
     #[test]
     fn the_engineer_sid_comes_out_of_whoami_csv() {
         assert_eq!(
@@ -663,7 +886,7 @@ mod tests {
 
     #[test]
     fn the_dry_run_plan_names_every_path_and_acl() {
-        let s = render_plan(r"C:\Program Files", r"C:\ProgramData\embarch", "127.0.0.1", None);
+        let s = render_plan(r"C:\Program Files", r"C:\ProgramData\embarch", "127.0.0.1", None, false);
         for needle in [
             r"C:\Program Files\EmbArch\core\<suite version>",
             r"C:\ProgramData\embarch\store",
@@ -678,5 +901,8 @@ mod tests {
         ] {
             assert!(s.contains(needle), "missing {needle}");
         }
+        assert!(s.contains("no --agent-in-container") && !s.contains("7. (--agent-in-container)"));
+        let g = render_plan(r"C:\Program Files", r"C:\ProgramData\embarch", "127.0.0.1", None, true);
+        assert!(g.contains("7. (--agent-in-container)") && g.contains("RPWPLC"));
     }
 }

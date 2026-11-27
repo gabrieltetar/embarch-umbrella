@@ -104,6 +104,13 @@ enum Command {
         /// Fetch the Sigstore trust root through TUF for this run only.
         #[arg(long)]
         refresh_trust_root: bool,
+
+        /// The agent runs in a container: the elevated install also lets
+        /// your account start and stop the Core service, and nothing else
+        /// about it (decision 72). Recorded with its date; only a later
+        /// elevated install changes it.
+        #[arg(long)]
+        agent_in_container: bool,
     },
     /// One-time per-machine setup: detect the topology, install Core as a
     /// service that starts at boot, copy the suite's binaries to a
@@ -194,8 +201,13 @@ enum Command {
         foreground: bool,
     },
 
-    /// Fallback: stop the running Core service, leaving it installed.
-    Down,
+    /// Fallback: stop the running Core service, leaving it installed. Refuses
+    /// while a study is in flight (decision 72).
+    Down {
+        /// Cancel the study in flight first, then stop.
+        #[arg(long)]
+        cancel_run: bool,
+    },
 
     /// Get a local `embarch-core` change running beside the Windows service:
     /// sync, build natively, install a development Core in the engineer's
@@ -296,9 +308,18 @@ async fn main() {
             data_dir,
             trusted_root,
             refresh_trust_root,
+            agent_in_container,
         } => {
-            install_core::run(source, data_dir, allow_downgrade, dry_run, trusted_root, refresh_trust_root)
-                .await
+            install_core::run(
+                source,
+                data_dir,
+                allow_downgrade,
+                dry_run,
+                trusted_root,
+                refresh_trust_root,
+                agent_in_container,
+            )
+            .await
         }
         Command::Init { uninstall, dry_run, container, runtime } => {
             let runtime = container.then(|| if runtime == "podman" { agent::Runtime::Podman } else { agent::Runtime::Docker });
@@ -321,7 +342,7 @@ async fn main() {
         }
         Command::Doctor { json } => doctor::doctor(json).await,
         Command::Up { foreground } => setup::up(foreground),
-        Command::Down => setup::down(),
+        Command::Down { cancel_run } => setup::down(cancel_run).await,
         Command::DeployCore {
             source_root,
             windows_root,

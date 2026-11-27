@@ -706,12 +706,41 @@ pub fn up(foreground: bool) -> i32 {
     }
 }
 
-pub fn down() -> i32 {
+/// `down` refuses while Core's `/status` shows a study in flight, unless
+/// `cancel_run`, which cancels it first and waits for Core to say it is idle
+/// (`deploy_dev::clear_study`, as `deploy-core --cancel-run` does). A Core
+/// that does not answer has no study to protect: that is `Ok`, not a refusal
+/// (decision 72).
+pub async fn study_guard<A: crate::deploy_dev::CoreApi>(
+    api: &A,
+    cancel_run: bool,
+    waits: crate::deploy_dev::Waits,
+) -> Result<(), String> {
+    let Ok(status) = api.status().await else {
+        return Ok(());
+    };
+    if let Some(id) = &status.study_in_flight {
+        if !cancel_run {
+            return Err(format!(
+                "study {id} is in flight; stopping Core now would end it. Cancel it, or re-run \
+                 `embarch down --cancel-run`"
+            ));
+        }
+    }
+    crate::deploy_dev::clear_study(api, cancel_run, waits).await
+}
+
+pub async fn down(cancel_run: bool) -> i32 {
     let under_wsl2 = env::under_wsl2();
     let saved = state::load();
 
     if let Some(msg) = refuse_if_remote(&saved, "stop") {
         eprintln!("{msg}");
+        return 1;
+    }
+
+    if let Err(e) = study_guard(&crate::deploy::RealCore, cancel_run, crate::deploy::DEPLOY_WAITS).await {
+        eprintln!("{e}");
         return 1;
     }
 
@@ -760,6 +789,72 @@ pub fn down() -> i32 {
 
 #[cfg(test)]
 mod tests {
+    use crate::deploy_dev::{CoreApi, StatusView, Waits};
+    use std::cell::RefCell;
+    use std::time::Duration;
+
+    const WAITS: Waits = Waits { attempts: 3, interval: Duration::from_millis(1) };
+
+    /// Answers `/status` from a queue (the last answer repeats); `None` is a
+    /// Core that does not answer.
+    struct FakeCore {
+        statuses: RefCell<Vec<Option<StatusView>>>,
+        cancelled: RefCell<Vec<String>>,
+    }
+
+    impl FakeCore {
+        fn with(statuses: Vec<Option<StatusView>>) -> Self {
+            Self { statuses: RefCell::new(statuses), cancelled: RefCell::default() }
+        }
+    }
+
+    impl CoreApi for FakeCore {
+        async fn status(&self) -> Result<StatusView, String> {
+            let mut q = self.statuses.borrow_mut();
+            let next = if q.len() > 1 { q.remove(0) } else { q.first().cloned().flatten() };
+            next.ok_or_else(|| "no Core answered".to_string())
+        }
+        async fn cancel_study(&self, id: &str) -> Result<(), String> {
+            self.cancelled.borrow_mut().push(id.to_string());
+            Ok(())
+        }
+    }
+
+    fn st(study: Option<&str>) -> Option<StatusView> {
+        Some(StatusView { mode: Some("service".into()), study_in_flight: study.map(str::to_string), ..StatusView::default() })
+    }
+
+    #[tokio::test]
+    async fn down_refuses_while_a_study_is_in_flight() {
+        let core = FakeCore::with(vec![st(Some("run-7"))]);
+        let e = super::study_guard(&core, false, WAITS).await.unwrap_err();
+        assert!(e.contains("run-7") && e.contains("--cancel-run"), "{e}");
+        assert!(core.cancelled.borrow().is_empty(), "a refusal cancels nothing");
+    }
+
+    #[tokio::test]
+    async fn down_with_cancel_run_cancels_the_study_then_goes_ahead() {
+        let core = FakeCore::with(vec![st(Some("run-7")), st(Some("run-7")), st(None)]);
+        super::study_guard(&core, true, WAITS).await.unwrap();
+        assert_eq!(core.cancelled.borrow().as_slice(), ["run-7".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn down_with_no_study_or_no_core_is_not_refused() {
+        let idle = FakeCore::with(vec![st(None)]);
+        super::study_guard(&idle, false, WAITS).await.unwrap();
+        assert!(idle.cancelled.borrow().is_empty());
+        let absent = FakeCore::with(vec![None]);
+        super::study_guard(&absent, false, WAITS).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn down_with_cancel_run_fails_if_the_study_will_not_end() {
+        let core = FakeCore::with(vec![st(Some("run-7"))]);
+        let e = super::study_guard(&core, true, WAITS).await.unwrap_err();
+        assert!(e.contains("still in flight"), "{e}");
+    }
+
     /// Decision 71: a plain `install` registers nothing, so `setup`'s `local`
     /// arm never says it installed or started anything, and never names
     /// `install --bind` as a step.
