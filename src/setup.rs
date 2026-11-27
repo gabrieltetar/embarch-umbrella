@@ -18,13 +18,14 @@ use crate::locate::{self, FoundBy, Located};
 use crate::state::{self, State};
 
 /// Where `embarch-core` writes its machine-wide token file, as seen from
-/// here (embarch-token.md §3.1). Pure so the WSL2 translation is testable.
+/// here (embarch-token.md §3.1). `None` for a `Remote` class, and also when
+/// the data directory cannot be resolved (see [`data_dir_for`]).
 ///
 /// This is an existence check only, not token discovery — reading and
 /// validating the value is `doctor`'s job (embarch-umbrella spec.md §5), and needs
 /// the discovery logic `embarch-api` already has.
-pub fn token_path_for(class: TopologyClass, windows: bool) -> Option<PathBuf> {
-    Some(data_dir_for(class, windows)?.join("token"))
+pub fn token_path_for(class: TopologyClass) -> Option<PathBuf> {
+    Some(data_dir_for(class)?.join("token"))
 }
 
 /// `embarch-core`'s machine-wide data directory, as seen from here — the one
@@ -32,31 +33,19 @@ pub fn token_path_for(class: TopologyClass, windows: bool) -> Option<PathBuf> {
 /// `study_results/`, `logs/` and `embarch-topology`'s `enrollment.toml`
 /// ([embarch-core/interfaces/constants.md](../../embarch-doc/embarch-core/interfaces/constants.md)).
 ///
-/// Pure, and **class-aware rather than host-aware**, which is the whole
-/// reason `doctor`'s check 16 uses this and not
-/// `embarch_core_client::token_discovery`'s discovery: a
-/// `Remote` Core's data directory is not on this filesystem at all, and a
-/// measurement of a directory that happens to exist locally would be a
-/// confident report about the wrong machine.
-pub fn data_dir_for(class: TopologyClass, windows: bool) -> Option<PathBuf> {
-    match class {
-        // A Windows-hosted Core from a WSL2 guest: same files, reached
-        // through the /mnt mount. Assumes the standard %ProgramData%
-        // location, which embarch-token.md §5's last gap records as an
-        // unexercised edge case for relocated ProgramData — and note the
-        // assumption is *stronger* here than there: that doc's mitigation is
-        // resolving the real value from the Windows side, which token
-        // discovery does and this does not. `doctor`'s check 16 says so in
-        // its output when this directory turns out not to exist (decision 39).
-        TopologyClass::WslHost => Some(PathBuf::from("/mnt/c/ProgramData/embarch")),
-        TopologyClass::Local if windows => {
-            std::env::var_os("ProgramData").map(|pd| PathBuf::from(pd).join("embarch"))
-        }
-        TopologyClass::Local => Some(PathBuf::from("/var/lib/embarch")),
-        // No shared filesystem — the token has to be copied by hand
-        // (embarch-umbrella spec.md §6), so there is no local path to check.
-        TopologyClass::Remote => None,
-    }
+/// **Resolved by `embarch-topology`'s `machine_data_dir`**, the one resolver
+/// for every class (its decision 52): `Local` is this machine's own
+/// directory, `WslHost` is the Windows host's real `%ProgramData%` reached
+/// through `/mnt`, and `Remote` has no path — no shared filesystem, so the
+/// token has to be copied by hand (embarch-umbrella spec.md §6). A resolver
+/// error reads as `None` here for the callers that can only act on a path;
+/// `doctor`'s check 16 calls the resolver itself and reports the error.
+///
+/// **Class-aware rather than host-aware**, which is why check 16 uses this
+/// and not `embarch_core_client::token_discovery`'s discovery: a `Remote`
+/// Core's data directory is not on this filesystem at all.
+pub fn data_dir_for(class: TopologyClass) -> Option<PathBuf> {
+    embarch_topology::machine_data_dir(class).ok().flatten()
 }
 
 /// What `setup` concluded it should do, before doing any of it.
@@ -360,7 +349,7 @@ fn apply_plan(
     // The token file is Core's to create on first start; all we can usefully
     // say is whether it's there yet. A read either way, so `--dry-run`
     // reports exactly what a real run would.
-    if let Some(token) = token_path_for(plan.class, cfg!(windows)) {
+    if let Some(token) = token_path_for(plan.class) {
         if token.exists() {
             println!("\nToken file: {} (present)", token.display());
         } else {
@@ -474,7 +463,7 @@ pub fn uninstall() -> i32 {
     }
 
     let class = saved.topology.as_deref().and_then(topology_class_from_str).unwrap_or(TopologyClass::Local);
-    if let Some(token) = token_path_for(class, cfg!(windows)) {
+    if let Some(token) = token_path_for(class) {
         match std::fs::remove_file(&token) {
             Ok(()) => println!("Removed token file: {}", token.display()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
@@ -894,7 +883,7 @@ mod tests {
     #[test]
     fn token_path_translates_for_a_windows_core_seen_from_wsl2() {
         assert_eq!(
-            token_path_for(TopologyClass::WslHost, false),
+            token_path_for(TopologyClass::WslHost),
             Some(PathBuf::from("/mnt/c/ProgramData/embarch/token"))
         );
     }
@@ -902,7 +891,7 @@ mod tests {
     #[test]
     fn token_path_on_a_unix_local_core() {
         assert_eq!(
-            token_path_for(TopologyClass::Local, false),
+            token_path_for(TopologyClass::Local),
             Some(PathBuf::from("/var/lib/embarch/token"))
         );
     }
@@ -911,7 +900,7 @@ mod tests {
     fn a_remote_core_has_no_local_token_path() {
         // Not an oversight: there's no shared filesystem, so the token is
         // copied by hand (embarch-umbrella spec.md §6).
-        assert_eq!(token_path_for(TopologyClass::Remote, false), None);
+        assert_eq!(token_path_for(TopologyClass::Remote), None);
     }
 
     #[test]

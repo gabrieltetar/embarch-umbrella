@@ -122,31 +122,9 @@ pub fn windows_conventional_core_paths() -> Vec<PathBuf> {
 /// caller falls through to `windows_conventional_core_paths` either way.
 #[cfg(unix)]
 pub fn windows_localappdata_core_path() -> Option<PathBuf> {
-    let local_appdata = windows_env_var_via_shellout("LOCALAPPDATA")?;
-    let mnt_root = translate_windows_path_to_wsl(&local_appdata)?;
+    let local_appdata = embarch_topology::windows_env_var("LOCALAPPDATA").ok()?;
+    let mnt_root = embarch_topology::windows_path_to_wsl(&local_appdata).ok()?;
     Some(mnt_root.join("embarch").join("bin").join("embarch-core.exe"))
-}
-
-#[cfg(unix)]
-fn windows_env_var_via_shellout(name: &str) -> Option<String> {
-    let output = std::process::Command::new("cmd.exe").args(["/C", "echo", &format!("%{name}%")]).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(output.stdout).ok()?;
-    let trimmed = text.trim();
-    (!trimmed.is_empty() && !trimmed.contains('%')).then(|| trimmed.to_string())
-}
-
-#[cfg(unix)]
-fn translate_windows_path_to_wsl(win_path: &str) -> Option<PathBuf> {
-    let output = std::process::Command::new("wslpath").args(["-u", win_path]).output().ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(output.stdout).ok()?;
-    let trimmed = text.trim();
-    trimmed.starts_with('/').then(|| PathBuf::from(trimmed))
 }
 
 /// Split a `PATH` value into directories, honoring the platform separator.
@@ -405,7 +383,7 @@ pub fn windows_core_service_binary_path() -> Option<PathBuf> {
         return None;
     }
     let win_path = parse_sc_qc_binary_path(&String::from_utf8_lossy(&output.stdout))?;
-    translate_windows_path_to_wsl(&win_path)
+    embarch_topology::windows_path_to_wsl(&win_path).ok()
 }
 
 #[cfg(not(unix))]

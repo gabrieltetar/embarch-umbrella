@@ -2862,45 +2862,43 @@ fn check_growth(
     fallback: TopologyClass,
     projects: &[ProjectConfig],
 ) -> Check {
+    check_growth_via(winner, fallback, projects, &embarch_topology::machine_data_dir)
+}
+
+/// [`check_growth`] with the data-directory resolver passed in, the seam a
+/// test drives to stand in for a relocated `%ProgramData%` or a resolver
+/// failure without touching the machine.
+fn check_growth_via(
+    winner: Option<TopologyClass>,
+    fallback: TopologyClass,
+    projects: &[ProjectConfig],
+    resolver: &dyn Fn(TopologyClass) -> anyhow::Result<Option<PathBuf>>,
+) -> Check {
     let (class, assumed) = match winner {
         Some(c) => (c, false),
         None => (fallback, true),
     };
-    let dir = setup::data_dir_for(class, cfg!(windows)).map(|d| d.join("study_results"));
-    let note = match (class, &dir) {
-        (TopologyClass::Remote, _) => {
+    let (dir, resolve_error) = match resolver(class) {
+        Ok(d) => (d.map(|d| d.join("study_results")), None),
+        Err(e) => (None, Some(format!("{e:#}"))),
+    };
+    let note = match (class, &dir, &resolve_error) {
+        (TopologyClass::Remote, _, _) => {
             "study_results/ is on the remote Core's machine and can't be measured from here"
                 .to_string()
         }
-        (_, None) => format!("no data directory resolves for a {} Core here", class.as_str()),
-        (_, Some(_)) if assumed => format!(
+        (_, _, Some(err)) => format!(
+            "the data directory of a {} Core could not be resolved: {err}",
+            class.as_str()
+        ),
+        (_, None, None) => format!("no data directory resolves for a {} Core here", class.as_str()),
+        (_, Some(_), None) if assumed => format!(
             "assuming a {} Core — check 3 found no winner to ask",
             class.as_str()
         ),
         _ => String::new(),
     };
-    judge_growth(dir.as_deref(), &note, absent_note(class), projects)
-}
-
-/// The extra sentence check 16 owes a reader **only when the directory it
-/// resolved is not there** (decision 39).
-///
-/// On `wsl-host` the path is `setup::data_dir_for`'s hardcoded
-/// `/mnt/c/ProgramData/embarch` — an *assumed* standard `%ProgramData%`,
-/// where `embarch-api`'s token discovery resolves the real value from the
-/// Windows side ([embarch-token.md](../../embarch-doc/embarch-token.md) §5's
-/// last gap). So a relocated `ProgramData` reads here as "no studies yet"
-/// rather than as "wrong directory", and those are the two states a reader
-/// has to tell apart. When the directory *does* exist and holds runs, it is
-/// self-evidently the right one and the sentence is noise.
-fn absent_note(class: TopologyClass) -> &'static str {
-    match class {
-        TopologyClass::WslHost => {
-            "that path assumes the standard %ProgramData% rather than resolving it, so a \
-             relocated one would look exactly like this"
-        }
-        _ => "",
-    }
+    judge_growth(dir.as_deref(), &note, projects)
 }
 
 /// The pure half of check 16, so every test can hand it a temp directory.
@@ -2909,7 +2907,6 @@ fn absent_note(class: TopologyClass) -> &'static str {
 fn judge_growth(
     results_dir: Option<&Path>,
     note: &str,
-    absent_note: &str,
     projects: &[ProjectConfig],
 ) -> Check {
     const NAME: &str = "Result and build-directory growth";
@@ -2932,12 +2929,7 @@ fn judge_growth(
             }
             None => {
                 measured = true;
-                let mut absent = format!("study_results/: nothing yet at {}", dir.display());
-                if !absent_note.is_empty() {
-                    absent.push_str(" — ");
-                    absent.push_str(absent_note);
-                }
-                parts.push(absent);
+                parts.push(format!("study_results/: nothing yet at {}", dir.display()));
             }
         }
     }
@@ -5671,7 +5663,7 @@ mod tests {
             std::fs::write(results.join(id).join("events.json"), vec![b'x'; 100]).unwrap();
             std::fs::write(streams.join("tap.bin"), vec![b'y'; 900]).unwrap();
         }
-        let c = judge_growth(Some(&results), "", "", &[]);
+        let c = judge_growth(Some(&results), "", &[]);
         assert_eq!(c.status, Status::Pass);
         assert!(c.detail.contains("2 entries"), "{}", c.detail);
         assert!(c.detail.contains("2.0 KiB"), "{}", c.detail);
@@ -5683,7 +5675,7 @@ mod tests {
     #[test]
     fn check_16_reports_a_machine_that_has_never_run_a_study() {
         let dir = tempdir();
-        let c = judge_growth(Some(&dir.path().join("study_results")), "", "", &[]);
+        let c = judge_growth(Some(&dir.path().join("study_results")), "", &[]);
         assert_eq!(c.status, Status::Pass);
         assert!(c.detail.contains("nothing yet"), "{}", c.detail);
     }
@@ -5693,7 +5685,7 @@ mod tests {
         let dir = tempdir();
         let results = dir.path().join("study_results");
         std::fs::create_dir_all(results.join("s1")).unwrap();
-        let c = judge_growth(Some(&results), "", "", &[]);
+        let c = judge_growth(Some(&results), "", &[]);
         let shown = results.display().to_string();
         // Both halves, because the human line and the machine field are read
         // by different readers and only one of them can parse a sentence.
@@ -5708,13 +5700,13 @@ mod tests {
     fn check_16_carries_the_path_even_when_no_study_has_ever_run() {
         let dir = tempdir();
         let results = dir.path().join("study_results");
-        let c = judge_growth(Some(&results), "", "", &[]);
+        let c = judge_growth(Some(&results), "", &[]);
         assert_eq!(c.path.as_deref(), Some(results.display().to_string().as_str()));
     }
 
     #[test]
     fn check_16_has_no_path_when_no_data_directory_resolves() {
-        let c = judge_growth(None, "study_results/ is on the remote Core's machine", "", &[]);
+        let c = judge_growth(None, "study_results/ is on the remote Core's machine", &[]);
         assert_eq!(c.path, None);
         let v: serde_json::Value =
             serde_json::from_str(&render_json(std::slice::from_ref(&c), false)).unwrap();
@@ -5725,28 +5717,24 @@ mod tests {
     }
 
     #[test]
-    fn check_16_warns_about_an_assumed_program_data_only_when_the_directory_is_missing() {
+    fn check_16_measures_a_relocated_program_data_through_the_resolver() {
         let dir = tempdir();
-        let results = dir.path().join("study_results");
-        let note = absent_note(TopologyClass::WslHost);
-        assert!(!note.is_empty());
-
-        let missing = judge_growth(Some(&results), "", note, &[]);
-        assert!(missing.detail.contains("relocated one"), "{}", missing.detail);
-
-        std::fs::create_dir_all(results.join("s1")).unwrap();
-        let present = judge_growth(Some(&results), "", note, &[]);
-        assert!(!present.detail.contains("relocated one"), "{}", present.detail);
+        let relocated = dir.path().join("D").join("ProgramData").join("embarch");
+        std::fs::create_dir_all(relocated.join("study_results").join("s1")).unwrap();
+        let resolver = |_: TopologyClass| Ok(Some(relocated.clone()));
+        let c = check_growth_via(Some(TopologyClass::WslHost), TopologyClass::Local, &[], &resolver);
+        assert_eq!(c.status, Status::Pass);
+        assert!(c.detail.contains("1 entry"), "{}", c.detail);
+        assert!(c.detail.contains("D/ProgramData/embarch/study_results"), "{}", c.detail);
     }
 
     #[test]
-    fn only_a_wsl_host_core_owes_the_program_data_caveat() {
-        // `Local` resolves %ProgramData% or /var/lib for real; `Remote` has no
-        // local path at all. Only `WslHost` hardcodes the assumption.
-        assert!(absent_note(TopologyClass::WslHost).contains("%ProgramData%"));
-        for class in [TopologyClass::Local, TopologyClass::Remote] {
-            assert_eq!(absent_note(class), "");
-        }
+    fn check_16_reports_a_resolver_error_rather_than_nothing_yet() {
+        let resolver = |_: TopologyClass| Err(anyhow::anyhow!("neither cmd.exe nor powershell.exe returned a usable %ProgramData% value"));
+        let c = check_growth_via(Some(TopologyClass::WslHost), TopologyClass::Local, &[], &resolver);
+        assert!(c.detail.contains("could not be resolved"), "{}", c.detail);
+        assert!(c.detail.contains("%ProgramData%"), "{}", c.detail);
+        assert!(!c.detail.contains("nothing yet"), "{}", c.detail);
     }
 
     #[test]
@@ -5759,7 +5747,7 @@ mod tests {
         // A stray file beside them is not a build directory.
         std::fs::write(root.join("notes.txt"), "x").unwrap();
         let project = zephyr_west_project("fw", dir.path(), Some("embarch/build"));
-        let c = judge_growth(None, "", "", std::slice::from_ref(&project));
+        let c = judge_growth(None, "", std::slice::from_ref(&project));
         assert_eq!(c.status, Status::Pass);
         assert!(c.detail.contains("fw: 2 build directories"), "{}", c.detail);
         assert!(c.detail.contains("nothing prunes these"), "{}", c.detail);
@@ -5774,20 +5762,20 @@ mod tests {
             project.resolved_build_dir_root(),
             Some(dir.path().join("embarch").join("build"))
         );
-        let c = judge_growth(None, "", "", std::slice::from_ref(&project));
+        let c = judge_growth(None, "", std::slice::from_ref(&project));
         assert!(c.detail.contains("fw: 1 build directory"), "{}", c.detail);
     }
 
     #[test]
     fn check_16_says_a_static_project_has_one_build_directory_by_construction() {
-        let c = judge_growth(None, "", "", &[sample_project("legacy", "nRF54L15")]);
+        let c = judge_growth(None, "", &[sample_project("legacy", "nRF54L15")]);
         assert_eq!(c.status, Status::Warn);
         assert!(c.detail.contains("by construction"), "{}", c.detail);
     }
 
     #[test]
     fn check_16_never_fails_the_run_even_with_nothing_to_measure() {
-        let c = judge_growth(None, "study_results/ is on the remote Core's machine", "", &[]);
+        let c = judge_growth(None, "study_results/ is on the remote Core's machine", &[]);
         assert_eq!(c.status, Status::Warn);
         assert_ne!(c.status, Status::Fail);
         assert!(c.detail.contains("remote Core"), "{}", c.detail);
@@ -5798,7 +5786,7 @@ mod tests {
         let dir = tempdir();
         let results = dir.path().join("study_results");
         std::fs::create_dir_all(results.join("s1")).unwrap();
-        let c = judge_growth(Some(&results), "assuming a wsl-host Core — check 3 found no winner to ask", "", &[]);
+        let c = judge_growth(Some(&results), "assuming a wsl-host Core — check 3 found no winner to ask", &[]);
         assert_eq!(c.status, Status::Pass);
         assert!(c.detail.contains("check 3 found no winner"), "{}", c.detail);
     }
@@ -5809,11 +5797,7 @@ mod tests {
         // `embarch_core_client::token_discovery`: a Remote Core's results are on another machine, and a
         // local directory that happens to exist would be the wrong answer
         // reported confidently.
-        assert_eq!(setup::data_dir_for(TopologyClass::Remote, false), None);
-        assert_eq!(
-            setup::data_dir_for(TopologyClass::WslHost, false),
-            Some(PathBuf::from("/mnt/c/ProgramData/embarch"))
-        );
+        assert_eq!(setup::data_dir_for(TopologyClass::Remote), None);
     }
 
     #[test]
@@ -6522,35 +6506,27 @@ mod tests {
         let results = tempdir();
         let empty_dir = results.path().join("study_results");
         std::fs::create_dir_all(&empty_dir).unwrap();
-        for class in classes {
-            out.push(judge_growth(None, "", absent_note(class), &projects));
-            out.push(judge_growth(Some(&empty_dir), "", absent_note(class), &[]));
-            out.push(judge_growth(
-                Some(&results.path().join("never-created")),
-                "",
-                absent_note(class),
-                &[],
-            ));
+        for _class in classes {
+            out.push(judge_growth(None, "", &projects));
+            out.push(judge_growth(Some(&empty_dir), "", &[]));
+            out.push(judge_growth(Some(&results.path().join("never-created")), "", &[]));
         }
         // The three notes `check_growth` composes, which it cannot be asked
         // for here without resolving a real data directory.
         out.push(judge_growth(
             None,
             "study_results/ is on the remote Core's machine and can't be measured from here",
-            "",
             &[],
         ));
         for class in classes {
             out.push(judge_growth(
                 None,
                 &format!("no data directory resolves for a {} Core here", class.as_str()),
-                "",
                 &[],
             ));
             out.push(judge_growth(
                 Some(&empty_dir),
                 &format!("assuming a {} Core — check 3 found no winner to ask", class.as_str()),
-                absent_note(class),
                 &projects,
             ));
         }

@@ -508,7 +508,7 @@ pub async fn run(
     agent_in_container: bool,
 ) -> i32 {
     let data_dir = match data_dir
-        .or_else(|| crate::setup::data_dir_for(embarch_topology::software::TopologyClass::Local, cfg!(windows)))
+        .or_else(|| crate::setup::data_dir_for(embarch_topology::software::TopologyClass::Local))
     {
         Some(d) => d,
         None => {
@@ -588,7 +588,7 @@ fn platform_plan(data_dir: &Path, bind: &str, agent_in_container: bool) -> Strin
 
 /// `(%ProgramFiles%, data dir)` when `data_dir` is the default one.
 fn windows_dirs(data_dir: &Path) -> Option<(String, String)> {
-    let default = crate::setup::data_dir_for(embarch_topology::software::TopologyClass::Local, cfg!(windows))?;
+    let default = crate::setup::data_dir_for(embarch_topology::software::TopologyClass::Local)?;
     let pf = std::env::var("ProgramFiles").ok()?;
     (default == data_dir).then(|| (pf, data_dir.to_string_lossy().into_owned()))
 }

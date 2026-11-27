@@ -430,7 +430,7 @@ pub fn host_from_env(repo: &Path, state_path: PathBuf) -> Result<Host> {
         .topology
         .as_deref()
         .and_then(crate::setup::topology_class_from_str)
-        .and_then(|c| crate::setup::data_dir_for(c, cfg!(windows)));
+        .and_then(crate::setup::data_dir_for);
     let west_list = Command::new("west")
         .args(["list", "-f", crate::agent::WEST_LIST_FORMAT])
         .current_dir(repo)

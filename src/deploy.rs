@@ -481,7 +481,7 @@ async fn restore_service_cmd(service: Option<String>) -> i32 {
         return EXIT_FAILURE;
     };
     let layout = deploy_dev::dev_layout(&local_appdata);
-    let Some(data_dir) = crate::setup::data_dir_for(embarch_topology::software::TopologyClass::WslHost, false) else {
+    let Some(data_dir) = crate::setup::data_dir_for(embarch_topology::software::TopologyClass::WslHost) else {
         return EXIT_FAILURE;
     };
     let fingerprint = match std::fs::read_to_string(data_dir.join(crate::agent_run::FINGERPRINT_FILE)) {
