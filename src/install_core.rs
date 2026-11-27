@@ -5,7 +5,7 @@
 //! only the elevated step can write, checked **there** by
 //! [`verify_release`](crate::verify_release), compared against the suite
 //! version already installed, and recorded in `installed-release.json`. A
-//! failed check writes no record. Registering the service is a later unit.
+//! failed check writes no record. Registering the service is `install_core_linux` and `install_core_win`.
 //!
 //! The elevated half, [`install_core_elevated`], takes its folders and a
 //! verifier as arguments, so tests run it as an ordinary user in temp dirs
@@ -460,7 +460,7 @@ fn rfc3339_utc(t: SystemTime) -> String {
 
 /// The verb. Builds the plan, prints it, and with `dry_run` stops there. The
 /// elevated half runs in this process, so it needs the privileges to create
-/// the staging folder; re-launching itself elevated is a later unit.
+/// the staging folder; re-launching itself elevated is a later unit (Linux: run under `sudo`).
 pub async fn run(
     source: PathBuf,
     data_dir: Option<PathBuf>,
@@ -487,7 +487,7 @@ pub async fn run(
     };
     print!("{}", plan.render());
     let bind = embarch_topology::software::recommended_bind_address(embarch_topology::software::TopologyClass::Local);
-    print!("{}", windows_plan(&data_dir, bind));
+    print!("{}", platform_plan(&data_dir, bind));
     if dry_run {
         println!("Dry run: nothing was changed.");
         return 0;
@@ -524,20 +524,28 @@ pub async fn run(
     }
 }
 
-/// The Windows half's plan, for the default data dir on Windows; the other
-/// cases say why nothing follows the record.
-fn windows_plan(data_dir: &Path, bind: &str) -> String {
-    if !cfg!(windows) {
-        return "  Not done here: installing and registering Core. The Windows half runs only on Windows; \
-                the Linux half is a later unit.\n"
-            .to_string();
+/// The platform half's plan, for the default data dir; the other cases say
+/// why nothing follows the record.
+fn platform_plan(data_dir: &Path, bind: &str) -> String {
+    if cfg!(windows) {
+        return match windows_dirs(data_dir) {
+            Some((pf, dd)) => crate::install_core_win::render_plan(&pf, &dd, bind, None),
+            None => "  Not done here: installing and registering Core, because --data-dir is not the \
+                     default %ProgramData%\\embarch (Core reads its record from the default only).\n"
+                .to_string(),
+        };
     }
-    match windows_dirs(data_dir) {
-        Some((pf, dd)) => crate::install_core_win::render_plan(&pf, &dd, bind, None),
-        None => "  Not done here: installing and registering Core, because --data-dir is not the \
-                 default %ProgramData%\\embarch (Core reads its record from the default only).\n"
-            .to_string(),
+    if !cfg!(target_os = "linux") {
+        return "  Not done here: installing and registering Core. Only Windows and Linux have that half.\n".to_string();
     }
+    if data_dir != Path::new(crate::install_core_linux::DATA_DIR) {
+        return format!(
+            "  Not done here: installing and registering Core, because --data-dir is not the default {} \
+             (Core reads its record from the default only).\n",
+            crate::install_core_linux::DATA_DIR
+        );
+    }
+    crate::install_core_linux::render_plan(bind, std::env::var("SUDO_USER").ok().as_deref())
 }
 
 /// `(%ProgramFiles%, data dir)` when `data_dir` is the default one.
@@ -607,7 +615,55 @@ fn windows_half(data_dir: &Path, r: &InstalledRelease, bind: &str) -> i32 {
     }
 }
 
-#[cfg(not(windows))]
+/// After the record is written, on Linux with the default data dir: run the
+/// generated script as this (root) process. Returns the exit code.
+#[cfg(target_os = "linux")]
+fn windows_half(data_dir: &Path, r: &InstalledRelease, bind: &str) -> i32 {
+    use crate::install_core_linux as lin;
+    if data_dir != Path::new(lin::DATA_DIR) {
+        println!("  Core was not installed or registered: --data-dir is not the default {}.", lin::DATA_DIR);
+        return 0;
+    }
+    let core_name = locate::native_name("embarch-core");
+    let Some(sha) = r.binary_sha256.first() else {
+        eprintln!("install-core: the release holds no {core_name}; nothing to register");
+        return 1;
+    };
+    let root = match release_root(&data_dir.join(&r.staging)) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("install-core: {e}");
+            return 1;
+        }
+    };
+    let Some(engineer) = std::env::var("SUDO_USER").ok() else {
+        eprintln!("install-core: SUDO_USER is not set; run `sudo embarch install-core` from your own login, so the script knows whom to give the token to");
+        return 1;
+    };
+    let inputs = lin::LinInputs {
+        version: r.suite_version.clone(),
+        staged_bin: root.join(&core_name).to_string_lossy().into_owned(),
+        binary_sha256: sha.clone(),
+        engineer,
+        bind: bind.to_string(),
+    };
+    match lin::run_linux_half(&lin::RealHost, &inputs) {
+        Ok(fp) => {
+            println!("CORE INSTALLED as user {} (service {})", lin::SERVICE_USER, lin::SERVICE);
+            println!("  fingerprint: {fp}");
+            println!("  log out and in (or `newgrp {}`) before reading the token file: your group membership is new", lin::USERS_GROUP);
+            0
+        }
+        Err(problems) => {
+            for p in problems {
+                eprintln!("install-core: {p}");
+            }
+            1
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "linux")))]
 fn windows_half(_data_dir: &Path, _r: &InstalledRelease, _bind: &str) -> i32 {
     0
 }

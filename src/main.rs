@@ -17,6 +17,7 @@ mod agent_init;
 mod init;
 mod install;
 mod install_core;
+mod install_core_linux;
 mod install_core_win;
 mod locate;
 mod manifest;
